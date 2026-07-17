@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gentech",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2025-03-25",
+  // nodejs_compat  -> lets Prisma (@prisma/adapter-pg / pg) open TCP+TLS to Neon.
+  // global_fetch_strictly_public -> required by OpenNext for its fetch handling.
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  // Self-reference is used by OpenNext for cache revalidation / ISR.
+  "services": [
+    {
+      "binding": "WORKER_SELF_REFERENCE",
+      "service": "gentech"
+    }
+  ],
+  // Enables Cloudflare image resizing for next/image.
+  "images": {
+    "binding": "IMAGES"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

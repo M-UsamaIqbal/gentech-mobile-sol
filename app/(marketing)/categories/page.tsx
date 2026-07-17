@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 
-import { DEMO_CATEGORIES } from "@/features/marketplace/data/fixtures";
+import { getCategoriesWithCounts } from "@/features/marketplace/services/category.service";
 import { CategoryGrid } from "@/features/marketplace/components/category-grid";
 
 export const metadata: Metadata = {
@@ -8,7 +8,9 @@ export const metadata: Metadata = {
   description: "Browse all phone and accessory categories.",
 };
 
-export default function CategoriesPage() {
+export default async function CategoriesPage() {
+  const categories = await getCategoriesWithCounts();
+
   return (
     <div className="mx-auto max-w-6xl px-4 py-10">
       <header className="mb-8">
@@ -17,7 +19,7 @@ export default function CategoriesPage() {
           Pick a category to start browsing listings near you.
         </p>
       </header>
-      <CategoryGrid categories={DEMO_CATEGORIES} />
+      <CategoryGrid categories={categories} />
     </div>
   );
 }

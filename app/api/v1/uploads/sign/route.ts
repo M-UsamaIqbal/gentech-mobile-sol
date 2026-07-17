@@ -4,7 +4,7 @@ import { getCurrentUser } from "@/lib/session";
 import { createUploadSignature, isCloudinaryConfigured } from "@/lib/cloudinary";
 
 /** Folders the app is allowed to upload into (the signature is bound to one of these). */
-const ALLOWED_FOLDERS = ["listings", "messages"] as const;
+const ALLOWED_FOLDERS = ["listings", "messages", "inspections"] as const;
 type UploadFolder = (typeof ALLOWED_FOLDERS)[number];
 
 function parseFolder(value: unknown): UploadFolder {

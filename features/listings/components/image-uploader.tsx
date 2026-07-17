@@ -11,6 +11,8 @@ interface Props {
   value: UploadedImage[];
   onChange: (images: UploadedImage[]) => void;
   max?: number;
+  /** Cloudinary folder to upload into (must be allowlisted server-side). */
+  folder?: "listings" | "messages" | "inspections";
 }
 
 interface SignResponse {
@@ -21,7 +23,7 @@ interface SignResponse {
   signature: string;
 }
 
-export function ImageUploader({ value, onChange, max = 10 }: Props) {
+export function ImageUploader({ value, onChange, max = 10, folder }: Props) {
   const [uploading, setUploading] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
 
@@ -36,7 +38,12 @@ export function ImageUploader({ value, onChange, max = 10 }: Props) {
     setUploading(true);
 
     try {
-      const signRes = await fetch("/api/v1/uploads/sign", { method: "POST" });
+      const signRes = await fetch("/api/v1/uploads/sign", {
+        method: "POST",
+        ...(folder
+          ? { headers: { "content-type": "application/json" }, body: JSON.stringify({ folder }) }
+          : {}),
+      });
       if (!signRes.ok) {
         const data = (await signRes.json().catch(() => null)) as { error?: string } | null;
         toast.error(data?.error ?? "Image uploads are not available right now.");

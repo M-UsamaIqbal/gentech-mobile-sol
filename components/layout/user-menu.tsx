@@ -5,10 +5,12 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   Bookmark,
+  ClipboardCheck,
   LayoutDashboard,
   LogOut,
   MessageSquare,
   Package,
+  ShieldCheck,
   User as UserIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -106,10 +108,20 @@ export function UserMenu({ name, email, image, role }: UserMenuProps) {
           <Bookmark className="size-4" />
           Saved Searches
         </DropdownMenuItem>
+        <DropdownMenuItem render={<Link href={ROUTES.inspections} />}>
+          <ShieldCheck className="size-4" />
+          My Inspections
+        </DropdownMenuItem>
         <DropdownMenuItem render={<Link href={ROUTES.account} />}>
           <UserIcon className="size-4" />
           Profile
         </DropdownMenuItem>
+        {role === USER_ROLES.INSPECTOR || role === USER_ROLES.ADMIN ? (
+          <DropdownMenuItem render={<Link href={ROUTES.inspector} />}>
+            <ClipboardCheck className="size-4" />
+            Inspector
+          </DropdownMenuItem>
+        ) : null}
         {role === USER_ROLES.ADMIN ? (
           <DropdownMenuItem render={<Link href={ROUTES.admin} />}>
             <LayoutDashboard className="size-4" />

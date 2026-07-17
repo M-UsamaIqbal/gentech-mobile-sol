@@ -8,6 +8,12 @@ import { APP, LISTING_CONDITION_LABELS, ROUTES } from "@/lib/constants";
 import { formatPrice, formatRelativeTime } from "@/utils/format";
 import { getCurrentUser } from "@/lib/session";
 import { getListingDetail } from "@/features/listings/services/listing.service";
+import {
+  getInspectionPlans,
+  getListingInspectionReport,
+} from "@/features/inspections/services/inspection.service";
+import { ListingInspectionCta } from "@/features/inspections/components/listing-inspection-cta";
+import { PublishedReportPanel } from "@/features/inspections/components/published-report-panel";
 import { ListingGallery } from "@/features/listings/components/listing-gallery";
 import { ListingSpecs } from "@/features/listings/components/listing-specs";
 import { SellerCard } from "@/features/listings/components/seller-card";
@@ -51,6 +57,12 @@ export default async function ListingDetailPage({ params }: PageProps) {
   if (!result) notFound();
 
   const { detail, related } = result;
+
+  // Inspection service data (fail-soft): pricing packages + any published report.
+  const [inspectionPlans, publishedReport] = await Promise.all([
+    getInspectionPlans(),
+    getListingInspectionReport(detail.id),
+  ]);
 
   const jsonLd = {
     "@context": "https://schema.org",
@@ -129,6 +141,8 @@ export default async function ListingDetailPage({ params }: PageProps) {
             </div>
           </div>
 
+          {publishedReport ? <PublishedReportPanel report={publishedReport} /> : null}
+
           <ListingSpecs attributes={detail.attributes} />
 
           <section>
@@ -165,6 +179,13 @@ export default async function ListingDetailPage({ params }: PageProps) {
             seller={detail.seller}
             listingId={detail.id}
             isAuthenticated={Boolean(user)}
+          />
+
+          <ListingInspectionCta
+            listingId={detail.id}
+            plans={inspectionPlans}
+            isAuthenticated={Boolean(user)}
+            defaultCity={detail.city}
           />
         </aside>
       </div>

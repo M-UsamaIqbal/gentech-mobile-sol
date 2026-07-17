@@ -2,6 +2,7 @@ import {
   Bell,
   Clock,
   MessageSquare,
+  ShieldCheck,
   ShoppingBag,
   Star,
   TrendingDown,
@@ -17,6 +18,9 @@ const ICONS: Record<NotificationType, LucideIcon> = {
   [NOTIFICATION_TYPES.NEW_REVIEW]: Star,
   [NOTIFICATION_TYPES.PRICE_DROP]: TrendingDown,
   [NOTIFICATION_TYPES.SYSTEM]: Bell,
+  [NOTIFICATION_TYPES.INSPECTION_REQUESTED]: ShieldCheck,
+  [NOTIFICATION_TYPES.INSPECTION_SCHEDULED]: ShieldCheck,
+  [NOTIFICATION_TYPES.INSPECTION_COMPLETED]: ShieldCheck,
 };
 
 export function NotificationIcon({

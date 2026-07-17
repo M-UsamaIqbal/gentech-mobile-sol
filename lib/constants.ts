@@ -28,6 +28,7 @@ export const APP = {
  */
 export const USER_ROLES = {
   USER: "USER",
+  INSPECTOR: "INSPECTOR",
   ADMIN: "ADMIN",
 } as const;
 
@@ -51,17 +52,29 @@ export const ROUTES = {
   savedSearches: "/dashboard/saved-searches",
   messages: "/dashboard/messages",
   notifications: "/dashboard/notifications",
+  inspections: "/dashboard/inspections",
   account: "/account",
+  // Inspection service (public)
+  inspectionService: "/inspection",
+  // Inspector workspace
+  inspector: "/inspector",
   // Admin
   admin: "/admin",
   adminUsers: "/admin/users",
   adminListings: "/admin/listings",
   adminReports: "/admin/reports",
   adminCategories: "/admin/categories",
+  adminInspections: "/admin/inspections",
 } as const;
 
 /** Routes a signed-out user may not visit (redirected to sign-in). */
-export const PROTECTED_ROUTE_PREFIXES = ["/dashboard", "/account", "/admin", "/sell"] as const;
+export const PROTECTED_ROUTE_PREFIXES = [
+  "/dashboard",
+  "/account",
+  "/admin",
+  "/inspector",
+  "/sell",
+] as const;
 
 /** Routes a signed-in user should be bounced away from (e.g. back to dashboard). */
 export const AUTH_ROUTE_PREFIXES = ["/sign-in", "/sign-up"] as const;
@@ -120,6 +133,9 @@ export const NOTIFICATION_TYPES = {
   NEW_REVIEW: "NEW_REVIEW",
   PRICE_DROP: "PRICE_DROP",
   SYSTEM: "SYSTEM",
+  INSPECTION_REQUESTED: "INSPECTION_REQUESTED",
+  INSPECTION_SCHEDULED: "INSPECTION_SCHEDULED",
+  INSPECTION_COMPLETED: "INSPECTION_COMPLETED",
 } as const;
 
 export type NotificationType = (typeof NOTIFICATION_TYPES)[keyof typeof NOTIFICATION_TYPES];
@@ -169,3 +185,110 @@ export const PK_CITIES = [
 ] as const;
 
 export type PkCity = (typeof PK_CITIES)[number];
+
+// ---------------------------------------------------------------------------
+// Inspection service — kept in sync with the Prisma inspection enums.
+// ---------------------------------------------------------------------------
+
+/** Inspection request lifecycle — Prisma `InspectionStatus` enum. */
+export const INSPECTION_STATUSES = {
+  REQUESTED: "REQUESTED",
+  PAYMENT_PENDING: "PAYMENT_PENDING",
+  SCHEDULED: "SCHEDULED",
+  IN_PROGRESS: "IN_PROGRESS",
+  COMPLETED: "COMPLETED",
+  CANCELLED: "CANCELLED",
+  EXPIRED: "EXPIRED",
+} as const;
+
+export type InspectionStatus = (typeof INSPECTION_STATUSES)[keyof typeof INSPECTION_STATUSES];
+
+export const INSPECTION_STATUS_LABELS: Record<InspectionStatus, string> = {
+  REQUESTED: "Requested",
+  PAYMENT_PENDING: "Payment pending",
+  SCHEDULED: "Scheduled",
+  IN_PROGRESS: "In progress",
+  COMPLETED: "Completed",
+  CANCELLED: "Cancelled",
+  EXPIRED: "Expired",
+};
+
+/** Payment state of an inspection fee — Prisma `InspectionPaymentStatus` enum. */
+export const INSPECTION_PAYMENT_STATUSES = {
+  UNPAID: "UNPAID",
+  PAID: "PAID",
+  REFUNDED: "REFUNDED",
+  FAILED: "FAILED",
+} as const;
+
+export type InspectionPaymentStatus =
+  (typeof INSPECTION_PAYMENT_STATUSES)[keyof typeof INSPECTION_PAYMENT_STATUSES];
+
+export const INSPECTION_PAYMENT_STATUS_LABELS: Record<InspectionPaymentStatus, string> = {
+  UNPAID: "Unpaid",
+  PAID: "Paid",
+  REFUNDED: "Refunded",
+  FAILED: "Failed",
+};
+
+/** Supported payment methods (via the aggregator gateway). */
+export const PAYMENT_METHODS = {
+  JAZZCASH: "jazzcash",
+  EASYPAISA: "easypaisa",
+  CARD: "card",
+} as const;
+
+export type PaymentMethod = (typeof PAYMENT_METHODS)[keyof typeof PAYMENT_METHODS];
+
+export const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string> = {
+  jazzcash: "JazzCash",
+  easypaisa: "Easypaisa",
+  card: "Debit / Credit Card",
+};
+
+/** Report buy recommendation — Prisma `InspectionVerdict` enum. */
+export const INSPECTION_VERDICTS = {
+  RECOMMENDED: "RECOMMENDED",
+  RECOMMENDED_WITH_NOTES: "RECOMMENDED_WITH_NOTES",
+  NOT_RECOMMENDED: "NOT_RECOMMENDED",
+} as const;
+
+export type InspectionVerdict = (typeof INSPECTION_VERDICTS)[keyof typeof INSPECTION_VERDICTS];
+
+export const INSPECTION_VERDICT_LABELS: Record<InspectionVerdict, string> = {
+  RECOMMENDED: "Recommended",
+  RECOMMENDED_WITH_NOTES: "Recommended with notes",
+  NOT_RECOMMENDED: "Not recommended",
+};
+
+/** Result for a single checklist line — Prisma `InspectionItemResult` enum. */
+export const INSPECTION_ITEM_RESULTS = {
+  PASS: "PASS",
+  MINOR_ISSUE: "MINOR_ISSUE",
+  MAJOR_ISSUE: "MAJOR_ISSUE",
+  NOT_APPLICABLE: "NOT_APPLICABLE",
+} as const;
+
+export type InspectionItemResult =
+  (typeof INSPECTION_ITEM_RESULTS)[keyof typeof INSPECTION_ITEM_RESULTS];
+
+export const INSPECTION_ITEM_RESULT_LABELS: Record<InspectionItemResult, string> = {
+  PASS: "Pass",
+  MINOR_ISSUE: "Minor issue",
+  MAJOR_ISSUE: "Major issue",
+  NOT_APPLICABLE: "N/A",
+};
+
+/**
+ * Default checklist scaffold an inspector fills in per request. Grouped by the
+ * phone component being inspected. Reused to pre-populate a blank report form.
+ */
+export const INSPECTION_CHECKLIST: ReadonlyArray<{ category: string; items: readonly string[] }> = [
+  { category: "Display", items: ["Screen scratches", "Touch response", "Dead pixels / burn-in", "True Tone / brightness"] },
+  { category: "Body & Frame", items: ["Dents & scratches", "Bent frame", "Buttons", "SIM tray"] },
+  { category: "Battery", items: ["Battery health %", "Charging (wired)", "Charging (wireless)", "Drain under load"] },
+  { category: "Cameras", items: ["Rear camera", "Front camera", "Flash", "Autofocus"] },
+  { category: "Connectivity", items: ["Wi-Fi", "Bluetooth", "Mobile data / signal", "GPS"] },
+  { category: "Biometrics & Sensors", items: ["Face ID / fingerprint", "Proximity sensor", "Gyroscope", "Speakers & mics"] },
+  { category: "Software & Identity", items: ["IMEI check", "PTA approval", "iCloud / account lock", "OS version"] },
+] as const;

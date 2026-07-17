@@ -3,7 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { AnimatePresence, motion } from "framer-motion";
-import { Menu, Plus, X } from "lucide-react";
+import { Menu, Plus, ShieldCheck, X } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { APP, ROUTES } from "@/lib/constants";
@@ -87,6 +87,13 @@ export function MobileNav({ categories, isAuthenticated }: MobileNavProps) {
                   className="hover:bg-accent block rounded-md px-3 py-2 text-sm font-medium"
                 >
                   Browse all listings
+                </Link>
+                <Link
+                  href={ROUTES.inspectionService}
+                  className="hover:bg-accent flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium"
+                >
+                  <ShieldCheck className="text-muted-foreground size-4" />
+                  Phone Inspection
                 </Link>
 
                 <p className="text-muted-foreground mt-4 px-3 text-xs font-semibold uppercase">

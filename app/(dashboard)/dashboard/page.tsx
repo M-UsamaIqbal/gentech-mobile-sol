@@ -7,6 +7,7 @@ import { ROUTES, USER_ROLES, type UserRole } from "@/lib/constants";
 import { getCurrentSession } from "@/lib/session";
 import { getUnreadCount } from "@/features/messaging/services/conversation.service";
 import { getStats } from "@/features/seller/services/seller.service";
+import { getMyInspectionCount } from "@/features/inspections/services/inspection.service";
 import { SellerStatsCards } from "@/features/seller/components/seller-stats";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -19,7 +20,11 @@ export default async function DashboardPage() {
 
   const { user } = session;
   const role = (user.role as UserRole | undefined) ?? USER_ROLES.USER;
-  const [unread, sellerStats] = await Promise.all([getUnreadCount(user.id), getStats(user.id)]);
+  const [unread, sellerStats, inspectionCount] = await Promise.all([
+    getUnreadCount(user.id),
+    getStats(user.id),
+    getMyInspectionCount(user.id),
+  ]);
 
   const stats = [
     {
@@ -42,6 +47,13 @@ export default async function DashboardPage() {
       value: "—",
       hint: "Your saved filters",
       href: ROUTES.savedSearches,
+    },
+    {
+      icon: ShieldCheck,
+      label: "Inspections",
+      value: inspectionCount > 0 ? String(inspectionCount) : "—",
+      hint: inspectionCount > 0 ? "Track your requests" : "Get a phone inspected",
+      href: ROUTES.inspections,
     },
   ];
 

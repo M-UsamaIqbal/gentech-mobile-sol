@@ -1,5 +1,9 @@
 import type { NextConfig } from "next";
 
+// OpenNext dev shim: makes Cloudflare bindings available when running `next dev`.
+// Harmless no-op in production builds.
+import { initOpenNextCloudflareForDev } from "@opennextjs/cloudflare";
+
 const nextConfig: NextConfig = {
   images: {
     remotePatterns: [
@@ -13,3 +17,6 @@ const nextConfig: NextConfig = {
 };
 
 export default nextConfig;
+
+// Must be called after the config is defined; enables `getCloudflareContext()` in dev.
+void initOpenNextCloudflareForDev();

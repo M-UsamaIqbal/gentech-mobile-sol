@@ -44,6 +44,13 @@ export const env = createEnv({
     CLOUDINARY_CLOUD_NAME: z.string().min(1).optional(),
     CLOUDINARY_API_KEY: z.string().min(1).optional(),
     CLOUDINARY_API_SECRET: z.string().min(1).optional(),
+
+    // --- Payment aggregator (PayFast/Safepay — JazzCash + Easypaisa + cards) ---
+    // Optional: when unset the app uses the built-in SANDBOX provider (no real
+    // charges) so the whole payment flow is clickable in development.
+    PAYFAST_MERCHANT_ID: z.string().min(1).optional(),
+    PAYFAST_SECURED_KEY: z.string().min(1).optional(),
+    PAYFAST_API_BASE: z.url().optional(),
   },
 
   client: {

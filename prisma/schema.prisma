@@ -18,6 +18,7 @@ datasource db {
 /// ADMIN is a privileged superset. Kept in sync with `USER_ROLES` in lib/constants.ts.
 enum Role {
   USER
+  INSPECTOR
   ADMIN
 }
 
@@ -57,6 +58,10 @@ model User {
   reportsFiled          Report[]       @relation("ReportReporter")
   reportsAgainst        Report[]       @relation("ReportTargetUser")
   notifications         Notification[]
+
+  // Relations — inspections
+  inspectionRequests  InspectionRequest[] @relation("InspectionRequester")
+  inspectionsAssigned InspectionRequest[] @relation("InspectionInspector")
 
   @@index([role])
   @@map("user")
@@ -249,6 +254,7 @@ model Listing {
   conversations Conversation[]
   reports       Report[]
   reviews       Review[]
+  inspections   InspectionRequest[]
 
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
@@ -444,6 +450,9 @@ enum NotificationType {
   NEW_REVIEW
   PRICE_DROP
   SYSTEM
+  INSPECTION_REQUESTED
+  INSPECTION_SCHEDULED
+  INSPECTION_COMPLETED
 }
 
 model Notification {
@@ -462,4 +471,201 @@ model Notification {
 
   @@index([userId, readAt])
   @@map("notification")
+}
+
+// ---------------------------------------------------------------------------
+// Inspection: professional pre-purchase checks (PakWheels-style) for a listing.
+// An in-house inspector (User with role INSPECTOR) physically verifies a phone
+// and publishes a graded report the buyer can trust.
+// ---------------------------------------------------------------------------
+
+/// Lifecycle of an inspection request.
+enum InspectionStatus {
+  REQUESTED
+  PAYMENT_PENDING
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  EXPIRED
+}
+
+/// Payment state of the inspection fee.
+enum InspectionPaymentStatus {
+  UNPAID
+  PAID
+  REFUNDED
+  FAILED
+}
+
+/// Inspector's overall buy recommendation on the finished report.
+enum InspectionVerdict {
+  RECOMMENDED
+  RECOMMENDED_WITH_NOTES
+  NOT_RECOMMENDED
+}
+
+/// Result for a single checklist line (screen, battery, camera, ...).
+enum InspectionItemResult {
+  PASS
+  MINOR_ISSUE
+  MAJOR_ISSUE
+  NOT_APPLICABLE
+}
+
+/// A priced inspection package (Basic / Comprehensive / ...). Admin-managed.
+model InspectionPlan {
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  description String?
+  /// Fee — ALWAYS Decimal, never Float.
+  price       Decimal @db.Decimal(12, 2)
+  currency    String  @default("PKR")
+  /// How many checkpoints this tier covers (for marketing copy).
+  checkpoints Int     @default(0)
+  /// Ordered list of what's included, for the pricing page.
+  features    Json?
+  position    Int     @default(0)
+  isActive    Boolean @default(true)
+
+  requests InspectionRequest[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive])
+  @@map("inspection_plan")
+}
+
+/// A buyer's request to have a specific listing physically inspected.
+model InspectionRequest {
+  id     String           @id @default(cuid())
+  status InspectionStatus @default(REQUESTED)
+
+  // Who + what
+  listingId String?
+  listing   Listing? @relation(fields: [listingId], references: [id], onDelete: SetNull)
+
+  requesterId String
+  requester   User   @relation("InspectionRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+
+  // Assigned in-house inspector (User with role INSPECTOR)
+  inspectorId String?
+  inspector   User?   @relation("InspectionInspector", fields: [inspectorId], references: [id], onDelete: SetNull)
+
+  // Chosen package + fee snapshot (plan may change/deactivate later)
+  planId    String?
+  plan      InspectionPlan? @relation(fields: [planId], references: [id], onDelete: SetNull)
+  planName  String?
+  feeAmount Decimal         @db.Decimal(12, 2)
+  currency  String          @default("PKR")
+
+  paymentStatus InspectionPaymentStatus @default(UNPAID)
+  /// Gateway transaction reference (aggregator order id).
+  paymentRef    String?
+  /// Method the buyer chose: jazzcash | easypaisa | card.
+  paymentMethod String?
+  paidAt        DateTime?
+
+  // Free-text phone being inspected when the request isn't tied to a listing
+  // (e.g. a buyer booking an inspection for a phone found off-platform).
+  deviceInfo String?
+
+  // Where the inspection happens + how to reach the requester
+  contactName  String?
+  contactPhone String?
+  city         String?
+  area         String?
+  address      String?
+  latitude     Float?
+  longitude    Float?
+  notes        String?
+
+  // Scheduling
+  preferredAt  DateTime?
+  scheduledAt  DateTime?
+  completedAt  DateTime?
+  cancelledAt  DateTime?
+  cancelReason String?
+
+  report InspectionReport?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([requesterId, status])
+  @@index([inspectorId, status])
+  @@index([listingId])
+  @@index([status, scheduledAt])
+  @@map("inspection_request")
+}
+
+/// The report produced for one request. Private to the requester until published.
+model InspectionReport {
+  id String @id @default(cuid())
+
+  requestId String            @unique
+  request   InspectionRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  // 0..100 aggregate, plus a human grade + buy recommendation.
+  overallScore Int
+  grade        String?
+  verdict      InspectionVerdict
+  summary      String?
+
+  // First-class phone trust signals (Pakistan market).
+  imei          String?
+  ptaApproved   Boolean?
+  batteryHealth Int?
+
+  // Trust/visibility: buyer-only by default, publishable onto the listing.
+  isPublished Boolean   @default(false)
+  publishedAt DateTime?
+
+  items  InspectionReportItem[]
+  photos InspectionPhoto[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([verdict])
+  @@map("inspection_report")
+}
+
+/// One graded checklist line (Display, Battery, Camera, Body, Ports, ...).
+model InspectionReportItem {
+  id       String               @id @default(cuid())
+  category String
+  label    String
+  result   InspectionItemResult @default(PASS)
+  score    Int?
+  comment  String?
+  position Int                  @default(0)
+
+  reportId String
+  report   InspectionReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  @@index([reportId])
+  @@map("inspection_report_item")
+}
+
+/// Photo captured during the inspection (reuses the Cloudinary pattern).
+model InspectionPhoto {
+  id          String  @id @default(cuid())
+  url         String
+  publicId    String?
+  width       Int?
+  height      Int?
+  blurDataUrl String?
+  caption     String?
+  position    Int     @default(0)
+
+  reportId String
+  report   InspectionReport @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([reportId])
+  @@map("inspection_photo")
 }

@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Plus } from "lucide-react";
+import { Plus, ShieldCheck } from "lucide-react";
 
 import { APP, ROUTES, USER_ROLES, type UserRole } from "@/lib/constants";
 import { cn } from "@/lib/utils";
@@ -49,6 +49,17 @@ export async function SiteHeader() {
         </div>
 
         <nav className="ml-auto flex items-center gap-1.5 md:ml-0">
+          <Link
+            href={ROUTES.inspectionService}
+            className={cn(
+              buttonVariants({ variant: "ghost", size: "sm" }),
+              "hidden lg:inline-flex",
+            )}
+          >
+            <ShieldCheck className="size-4" />
+            Inspection
+          </Link>
+
           <Link
             href={ROUTES.sell}
             className={cn(buttonVariants({ size: "sm" }), "hidden rounded-full sm:inline-flex")}

@@ -72,7 +72,16 @@ export interface ListingDetailResult {
 export async function getListingDetail(slug: string): Promise<ListingDetailResult | null> {
   try {
     const detail = await getListingBySlug(slug);
-    if (!detail) return null;
+    if (!detail) {
+      // Reachable DB but no such listing. It may still be a demo/preview card
+      // (e.g. shown while the catalog is being populated) — resolve it to the
+      // demo detail instead of 404ing. Unknown slugs still return null → 404.
+      const demo = getDemoListingDetail(slug);
+      if (demo) {
+        return { detail: demo, related: getDemoRelated(demo.categorySlug, demo.id), source: "demo" };
+      }
+      return null;
+    }
     const related = await getRelatedListings(detail.categorySlug, detail.id);
     return { detail, related, source: "db" };
   } catch (error) {
