@@ -231,6 +231,32 @@ export const INSPECTION_PAYMENT_STATUS_LABELS: Record<InspectionPaymentStatus, s
   FAILED: "Failed",
 };
 
+/**
+ * Phone OTP verification policy. A buyer must verify the number they enter on a
+ * booking via a one-time code sent over WhatsApp/SMS. Kept here as the single
+ * source of truth for the service, actions and UI copy.
+ */
+export const OTP = {
+  /** Number of digits in the generated code. */
+  length: 6,
+  /** How long a freshly sent code stays usable. */
+  ttlMinutes: 10,
+  /** Max failed check attempts before the code is burned and a resend is needed. */
+  maxAttempts: 5,
+  /** Minimum gap between resends to the same number. */
+  resendCooldownSeconds: 30,
+  /** How long a successful verification counts toward a booking. */
+  validForMinutes: 30,
+} as const;
+
+/** Channels a one-time code can be delivered over. */
+export const OTP_CHANNELS = {
+  SMS: "sms",
+  WHATSAPP: "whatsapp",
+} as const;
+
+export type OtpChannel = (typeof OTP_CHANNELS)[keyof typeof OTP_CHANNELS];
+
 /** Supported payment methods (via the aggregator gateway). */
 export const PAYMENT_METHODS = {
   JAZZCASH: "jazzcash",

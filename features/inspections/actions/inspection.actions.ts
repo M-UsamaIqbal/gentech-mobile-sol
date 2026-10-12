@@ -17,6 +17,7 @@ import {
   type BookInspectionInput,
   type RequestInspectionInput,
 } from "@/features/inspections/schemas/inspection";
+import { isPhoneVerifiedForBooking } from "@/features/inspections/otp/otp.service";
 
 type ActionResult = { ok: boolean; error?: string; id?: string };
 
@@ -36,6 +37,11 @@ export async function requestInspectionAction(
   const parsed = requestInspectionSchema.safeParse(input);
   if (!parsed.success) {
     return { ok: false, error: "Please fix the highlighted fields and try again." };
+  }
+
+  const phoneVerified = await isPhoneVerifiedForBooking(user.id, parsed.data.contactPhone);
+  if (!phoneVerified) {
+    return { ok: false, error: "Please verify your phone number before requesting." };
   }
 
   try {
@@ -62,6 +68,11 @@ export async function bookInspectionAction(input: BookInspectionInput): Promise<
   const parsed = bookInspectionSchema.safeParse(input);
   if (!parsed.success) {
     return { ok: false, error: "Please fix the highlighted fields and try again." };
+  }
+
+  const phoneVerified = await isPhoneVerifiedForBooking(user.id, parsed.data.contactPhone);
+  if (!phoneVerified) {
+    return { ok: false, error: "Please verify your phone number before booking." };
   }
 
   try {

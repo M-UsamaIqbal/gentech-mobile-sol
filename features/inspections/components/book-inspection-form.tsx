@@ -14,6 +14,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { bookInspectionAction } from "@/features/inspections/actions/inspection.actions";
+import { PhoneVerificationField } from "@/features/inspections/components/phone-verification-field";
 import type { InspectionPlanDto } from "@/features/inspections/types";
 
 interface Props {
@@ -29,8 +30,16 @@ export function BookInspectionForm({ plans, isAuthenticated, initialPlanId }: Pr
   const [planId, setPlanId] = React.useState(initialPlanId ?? plans[0]?.id ?? "");
   const [pending, setPending] = React.useState(false);
 
+  // Phone (WhatsApp/SMS) OTP verification — required before booking.
+  const [phone, setPhone] = React.useState("");
+  const [phoneVerified, setPhoneVerified] = React.useState(false);
+
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!phoneVerified) {
+      toast.error("Please verify your phone number before booking.");
+      return;
+    }
     const form = new FormData(event.currentTarget);
     setPending(true);
     const result = await bookInspectionAction({
@@ -146,15 +155,12 @@ export function BookInspectionForm({ plans, isAuthenticated, initialPlanId }: Pr
             <Label htmlFor="contactName">Full name</Label>
             <Input id="contactName" name="contactName" required maxLength={80} />
           </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="contactPhone">Phone number</Label>
-            <Input
-              id="contactPhone"
-              name="contactPhone"
-              required
-              inputMode="tel"
-              placeholder="03xx-xxxxxxx"
-              maxLength={20}
+          <div className="sm:col-span-2">
+            <PhoneVerificationField
+              phone={phone}
+              onPhoneChange={setPhone}
+              verified={phoneVerified}
+              onVerifiedChange={setPhoneVerified}
             />
           </div>
           <div className="space-y-1.5">
@@ -202,10 +208,15 @@ export function BookInspectionForm({ plans, isAuthenticated, initialPlanId }: Pr
         </div>
       </fieldset>
 
-      <Button type="submit" disabled={pending} className="w-full sm:w-auto">
+      <Button type="submit" disabled={pending || !phoneVerified} className="w-full sm:w-auto">
         {pending ? <Loader2 className="size-4 animate-spin" /> : <ShieldCheck className="size-4" />}
         {pending ? "Booking…" : "Book inspection"}
       </Button>
+      {!phoneVerified ? (
+        <p className="text-muted-foreground text-xs">
+          Verify your phone number above to enable booking.
+        </p>
+      ) : null}
       <p className="text-muted-foreground text-xs">
         No payment now — we confirm your slot first, then collect the fee at inspection.
       </p>

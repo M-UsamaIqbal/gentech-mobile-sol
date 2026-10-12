@@ -51,6 +51,17 @@ export const env = createEnv({
     PAYFAST_MERCHANT_ID: z.string().min(1).optional(),
     PAYFAST_SECURED_KEY: z.string().min(1).optional(),
     PAYFAST_API_BASE: z.url().optional(),
+
+    // --- Twilio (phone OTP over WhatsApp/SMS) ---
+    // Optional: when unset, phone OTP falls back to a DEV provider that logs the
+    // code to the server console instead of sending it, so the flow is testable
+    // without a Twilio account. Set all three (+ optional channel) to send for real.
+    TWILIO_ACCOUNT_SID: z.string().min(1).optional(),
+    TWILIO_AUTH_TOKEN: z.string().min(1).optional(),
+    /** Sender: a Twilio number ("+1..."), or for WhatsApp a "whatsapp:+1..." sender. */
+    TWILIO_FROM_NUMBER: z.string().min(1).optional(),
+    /** Delivery channel for the OTP. Defaults to SMS. */
+    TWILIO_OTP_CHANNEL: z.enum(["sms", "whatsapp"]).optional(),
   },
 
   client: {

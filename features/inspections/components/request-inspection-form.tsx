@@ -13,6 +13,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { requestInspectionAction } from "@/features/inspections/actions/inspection.actions";
+import { PhoneVerificationField } from "@/features/inspections/components/phone-verification-field";
 import type { InspectionPlanDto } from "@/features/inspections/types";
 
 interface Props {
@@ -26,8 +27,16 @@ export function RequestInspectionForm({ listingId, plans, defaultCity }: Props) 
   const [planId, setPlanId] = React.useState(plans[0]?.id ?? "");
   const [pending, setPending] = React.useState(false);
 
+  // Phone (WhatsApp/SMS) OTP verification — required before requesting.
+  const [phone, setPhone] = React.useState("");
+  const [phoneVerified, setPhoneVerified] = React.useState(false);
+
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!phoneVerified) {
+      toast.error("Please verify your phone number before requesting.");
+      return;
+    }
     const form = new FormData(event.currentTarget);
     setPending(true);
     const result = await requestInspectionAction({
@@ -101,15 +110,12 @@ export function RequestInspectionForm({ listingId, plans, defaultCity }: Props) 
           <Label htmlFor="contactName">Your name</Label>
           <Input id="contactName" name="contactName" required maxLength={80} />
         </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="contactPhone">Phone number</Label>
-          <Input
-            id="contactPhone"
-            name="contactPhone"
-            required
-            inputMode="tel"
-            placeholder="03xx-xxxxxxx"
-            maxLength={20}
+        <div className="sm:col-span-2">
+          <PhoneVerificationField
+            phone={phone}
+            onPhoneChange={setPhone}
+            verified={phoneVerified}
+            onVerifiedChange={setPhoneVerified}
           />
         </div>
         <div className="space-y-1.5">
@@ -152,10 +158,15 @@ export function RequestInspectionForm({ listingId, plans, defaultCity }: Props) 
         <Textarea id="notes" name="notes" rows={3} maxLength={1000} />
       </div>
 
-      <Button type="submit" disabled={pending} className="w-full">
+      <Button type="submit" disabled={pending || !phoneVerified} className="w-full">
         {pending ? <Loader2 className="size-4 animate-spin" /> : <ShieldCheck className="size-4" />}
         {pending ? "Submitting…" : "Request inspection"}
       </Button>
+      {!phoneVerified ? (
+        <p className="text-muted-foreground text-center text-xs">
+          Verify your phone number above to enable this.
+        </p>
+      ) : null}
       <p className="text-muted-foreground text-center text-xs">
         Payment is collected after we confirm your slot. You can cancel any time before the visit.
       </p>
