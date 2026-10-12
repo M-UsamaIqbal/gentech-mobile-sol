@@ -12,7 +12,12 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Dummy values so env.ts validates during build (real values set in deploy)
+      # Skip env-var validation for CI lint/typecheck/build — no DB is touched at
+      # build time (all routes are dynamic); real values are set in deploy. This is
+      # the escape hatch documented in lib/env.ts. Keeps CI green without needing
+      # every secret populated.
+      SKIP_ENV_VALIDATION: "1"
+      # Values below are still passed through for any step that reads them.
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       DIRECT_URL: ${{ secrets.DIRECT_URL }}
       BETTER_AUTH_SECRET: ${{ secrets.BETTER_AUTH_SECRET }}
