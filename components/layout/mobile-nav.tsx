@@ -6,9 +6,10 @@ import { AnimatePresence, motion } from "framer-motion";
 import { Menu, Plus, ShieldCheck, X } from "lucide-react";
 
 import { cn } from "@/lib/utils";
-import { APP, ROUTES } from "@/lib/constants";
+import { ROUTES } from "@/lib/constants";
 import type { CategoryItem } from "@/types/marketplace";
 import { Button, buttonVariants } from "@/components/ui/button";
+import { Logo } from "@/components/layout/logo";
 import { CategoryIcon } from "@/features/marketplace/components/category-icon";
 
 interface MobileNavProps {
@@ -65,12 +66,7 @@ export function MobileNav({ categories, isAuthenticated }: MobileNavProps) {
               }}
             >
               <div className="flex items-center justify-between border-b p-4">
-                <Link href={ROUTES.home} className="flex items-center gap-2 font-semibold">
-                  <span className="bg-primary text-primary-foreground grid size-7 place-items-center rounded-md text-sm font-bold">
-                    {APP.name.charAt(0)}
-                  </span>
-                  {APP.name}
-                </Link>
+                <Logo />
                 <Button
                   variant="ghost"
                   size="icon"

@@ -14,6 +14,7 @@ import { signUpSchema, type SignUpInput } from "@/features/auth/schemas";
 import { SocialButtons, type EnabledSocialProviders } from "./social-buttons";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PasswordInput } from "@/components/ui/password-input";
 import {
   Form,
   FormControl,
@@ -95,8 +96,7 @@ export function SignUpForm({ providers }: { providers: EnabledSocialProviders })
               <FormItem>
                 <FormLabel>Password</FormLabel>
                 <FormControl>
-                  <Input
-                    type="password"
+                  <PasswordInput
                     autoComplete="new-password"
                     placeholder="••••••••"
                     {...field}
@@ -113,8 +113,7 @@ export function SignUpForm({ providers }: { providers: EnabledSocialProviders })
               <FormItem>
                 <FormLabel>Confirm password</FormLabel>
                 <FormControl>
-                  <Input
-                    type="password"
+                  <PasswordInput
                     autoComplete="new-password"
                     placeholder="••••••••"
                     {...field}

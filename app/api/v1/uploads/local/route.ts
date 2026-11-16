@@ -65,9 +65,10 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Could not save the file." }, { status: 500 });
   }
 
-  // Absolute URL so it satisfies the quote schema's z.url() and renders anywhere.
+  // Root-relative path: next/image serves it as a same-origin local image (no host
+  // config, works on any dev port). The schemas accept local paths as well as URLs.
   return NextResponse.json({
-    secure_url: `${request.nextUrl.origin}/uploads/${folder}/${id}.${ext}`,
+    secure_url: `/uploads/${folder}/${id}.${ext}`,
     public_id: `${folder}/${id}`,
   });
 }

@@ -27,18 +27,21 @@ export function ListingCard({ listing }: { listing: ListingCardData }) {
   const href = `/listings/${listing.slug}`;
 
   return (
-    <article className="group bg-card relative overflow-hidden rounded-xl border transition-shadow hover:shadow-md">
+    <article className="group bg-card relative overflow-hidden rounded-xl border transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-lg hover:shadow-primary/5">
       <Link href={href} className="block">
         {/* Thumbnail */}
         <div
-          className={cn("relative aspect-4/3 w-full bg-gradient-to-br", gradientFor(listing.id))}
+          className={cn(
+            "relative aspect-4/3 w-full overflow-hidden bg-gradient-to-br",
+            gradientFor(listing.id),
+          )}
         >
           {listing.imageUrl ? (
             // eslint-disable-next-line @next/next/no-img-element
             <img
               src={listing.imageUrl}
               alt={listing.title}
-              className="h-full w-full object-cover"
+              className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
             />
           ) : (
             <div className="text-foreground/30 flex h-full flex-col items-center justify-center gap-2">
@@ -61,7 +64,9 @@ export function ListingCard({ listing }: { listing: ListingCardData }) {
           <p className="text-primary text-base font-bold">
             {formatPrice(listing.price, { currency: listing.currency })}
           </p>
-          <h3 className="line-clamp-2 text-sm leading-snug font-medium">{listing.title}</h3>
+          <h3 className="group-hover:text-primary line-clamp-2 text-sm leading-snug font-medium transition-colors">
+            {listing.title}
+          </h3>
 
           <div className="text-muted-foreground flex items-center gap-2 text-xs">
             <Badge variant="secondary" className="font-normal">

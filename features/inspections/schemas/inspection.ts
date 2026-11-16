@@ -18,7 +18,11 @@ const VERDICT_VALUES = Object.values(INSPECTION_VERDICTS) as [
 
 /** An image uploaded to Cloudinary (mirrors the listing uploader payload). */
 export const uploadedImageSchema = z.object({
-  url: z.url(),
+  // Absolute URL (Cloudinary) or a root-relative local-upload path (dev fallback).
+  url: z
+    .string()
+    .min(1)
+    .refine((v) => /^https?:\/\//i.test(v) || v.startsWith("/"), "Enter a valid image URL."),
   publicId: z.string().optional(),
   width: z.number().int().positive().optional(),
   height: z.number().int().positive().optional(),

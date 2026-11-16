@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { Plus, ShieldCheck, Smartphone } from "lucide-react";
 
-import { APP, ROUTES, USER_ROLES, type UserRole } from "@/lib/constants";
+import { ROUTES, USER_ROLES, type UserRole } from "@/lib/constants";
 import { cn } from "@/lib/utils";
 import { getCurrentSession } from "@/lib/session";
 import {
@@ -9,12 +9,13 @@ import {
   getUnreadNotificationCount,
 } from "@/features/notifications/services/notification.service";
 import { buttonVariants } from "@/components/ui/button";
+import { Logo } from "@/components/layout/logo";
 import { ThemeToggle } from "@/components/layout/theme-toggle";
 import { UserMenu } from "@/components/layout/user-menu";
 import { MobileNav } from "@/components/layout/mobile-nav";
 import { NotificationBell } from "@/features/notifications/components/notification-bell";
 import { SearchBar } from "@/features/marketplace/components/search-bar";
-import { DEMO_CATEGORIES } from "@/features/marketplace/data/fixtures";
+import { getCategoriesWithCounts } from "@/features/marketplace/services/category.service";
 
 /**
  * Global marketplace header. Server component — reads the session once and renders
@@ -24,24 +25,19 @@ export async function SiteHeader() {
   const session = await getCurrentSession();
   const user = session?.user;
 
-  const [unreadNotifications, recentNotifications] = user
-    ? await Promise.all([getUnreadNotificationCount(user.id), getNotifications(user.id, 6)])
-    : [0, []];
+  const [categories, [unreadNotifications, recentNotifications]] = await Promise.all([
+    getCategoriesWithCounts(),
+    user
+      ? Promise.all([getUnreadNotificationCount(user.id), getNotifications(user.id, 6)])
+      : Promise.resolve([0, []] as [number, Awaited<ReturnType<typeof getNotifications>>]),
+  ]);
 
   return (
     <header className="bg-background/80 supports-[backdrop-filter]:bg-background/60 sticky top-0 z-40 w-full border-b backdrop-blur">
       <div className="mx-auto flex h-14 max-w-6xl items-center gap-3 px-4">
-        <MobileNav categories={DEMO_CATEGORIES} isAuthenticated={Boolean(user)} />
+        <MobileNav categories={categories} isAuthenticated={Boolean(user)} />
 
-        <Link
-          href={ROUTES.home}
-          className="flex shrink-0 items-center gap-2 font-semibold tracking-tight"
-        >
-          <span className="bg-primary text-primary-foreground grid size-7 place-items-center rounded-md text-sm font-bold">
-            {APP.name.charAt(0)}
-          </span>
-          <span className="hidden sm:inline">{APP.name}</span>
-        </Link>
+        <Logo className="shrink-0" />
 
         {/* Desktop search */}
         <div className="mx-2 hidden flex-1 md:block">

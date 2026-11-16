@@ -41,7 +41,11 @@ export type QuoteAnswers = z.infer<typeof quoteAnswersSchema>;
 
 export const quotePhotoSchema = z.object({
   slot: z.number().int().min(1).max(PHOTO_SLOT_COUNT),
-  url: z.url(),
+  // Absolute URL (Cloudinary) or a root-relative local-upload path (dev fallback).
+  url: z
+    .string()
+    .min(1)
+    .refine((v) => /^https?:\/\//i.test(v) || v.startsWith("/"), "Enter a valid image URL."),
   publicId: z.string().optional(),
   width: z.number().int().positive().optional(),
   height: z.number().int().positive().optional(),

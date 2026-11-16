@@ -13,7 +13,7 @@ import { ROUTES } from "@/lib/constants";
 import { resetPasswordSchema, type ResetPasswordInput } from "@/features/auth/schemas";
 import { cn } from "@/lib/utils";
 import { Button, buttonVariants } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import { PasswordInput } from "@/components/ui/password-input";
 import {
   Form,
   FormControl,
@@ -70,8 +70,7 @@ export function ResetPasswordForm({ token }: { token: string | null }) {
             <FormItem>
               <FormLabel>New password</FormLabel>
               <FormControl>
-                <Input
-                  type="password"
+                <PasswordInput
                   autoComplete="new-password"
                   placeholder="••••••••"
                   {...field}
@@ -88,8 +87,7 @@ export function ResetPasswordForm({ token }: { token: string | null }) {
             <FormItem>
               <FormLabel>Confirm new password</FormLabel>
               <FormControl>
-                <Input
-                  type="password"
+                <PasswordInput
                   autoComplete="new-password"
                   placeholder="••••••••"
                   {...field}

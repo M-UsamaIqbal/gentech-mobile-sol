@@ -3,7 +3,8 @@ import type { Metadata } from "next";
 import { parseListingFilters } from "@/features/listings/schemas/filters";
 import { getListingFeed } from "@/features/listings/services/listing.service";
 import { getCurrentUser } from "@/lib/session";
-import { DEMO_BRANDS, DEMO_CATEGORIES } from "@/features/marketplace/data/fixtures";
+import { getCategoriesWithCounts } from "@/features/marketplace/services/category.service";
+import { getActiveBrands } from "@/features/marketplace/services/brand.service";
 import { ListingsGrid } from "@/features/marketplace/components/listings-grid";
 import { MarketplaceFilters } from "@/features/listings/components/marketplace-filters";
 import { FilterDrawer } from "@/features/listings/components/filter-drawer";
@@ -38,7 +39,12 @@ export default async function MarketplacePage({
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const filters = parseListingFilters(await searchParams);
-  const [feed, user] = await Promise.all([getListingFeed(filters), getCurrentUser()]);
+  const [feed, user, categories, brands] = await Promise.all([
+    getListingFeed(filters),
+    getCurrentUser(),
+    getCategoriesWithCounts(),
+    getActiveBrands(),
+  ]);
   const canSaveSearch = hasActiveFilters(filters);
 
   return (
@@ -58,7 +64,7 @@ export default async function MarketplacePage({
         </div>
         <div className="flex items-center gap-2">
           {canSaveSearch ? <SaveSearchButton isAuthenticated={Boolean(user)} /> : null}
-          <FilterDrawer categories={DEMO_CATEGORIES} brands={DEMO_BRANDS} filters={filters} />
+          <FilterDrawer categories={categories} brands={brands} filters={filters} />
           <SortSelect value={filters.sort} />
         </div>
       </div>
@@ -70,18 +76,14 @@ export default async function MarketplacePage({
       ) : null}
 
       <div className="mb-4">
-        <ActiveFilters filters={filters} categories={DEMO_CATEGORIES} brands={DEMO_BRANDS} />
+        <ActiveFilters filters={filters} categories={categories} brands={brands} />
       </div>
 
       <div className="flex gap-6">
         {/* Desktop sidebar */}
         <aside className="hidden w-60 shrink-0 lg:block">
           <div className="bg-card sticky top-20 rounded-xl border p-4">
-            <MarketplaceFilters
-              categories={DEMO_CATEGORIES}
-              brands={DEMO_BRANDS}
-              filters={filters}
-            />
+            <MarketplaceFilters categories={categories} brands={brands} filters={filters} />
           </div>
         </aside>
 

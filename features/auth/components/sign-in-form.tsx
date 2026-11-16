@@ -15,6 +15,7 @@ import { SocialButtons, type EnabledSocialProviders } from "./social-buttons";
 import { AuthDivider } from "./auth-divider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PasswordInput } from "@/components/ui/password-input";
 import {
   Form,
   FormControl,
@@ -96,8 +97,7 @@ export function SignInForm({ providers }: { providers: EnabledSocialProviders })
                   </Link>
                 </div>
                 <FormControl>
-                  <Input
-                    type="password"
+                  <PasswordInput
                     autoComplete="current-password"
                     placeholder="••••••••"
                     {...field}

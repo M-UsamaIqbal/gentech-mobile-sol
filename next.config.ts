@@ -13,6 +13,8 @@ const nextConfig: NextConfig = {
       { protocol: "https", hostname: "lh3.googleusercontent.com" },
       { protocol: "https", hostname: "platform-lookaside.fbsbx.com" },
     ],
+    // Note: dev-only local uploads are stored as same-origin, root-relative paths
+    // (/uploads/...), which next/image serves as local images — no host config needed.
   },
 };
 
