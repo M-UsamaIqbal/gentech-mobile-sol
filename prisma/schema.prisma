@@ -722,11 +722,13 @@ enum PtaStatus {
 
 /// Lifecycle of a buy-back quote.
 enum QuoteStatus {
+  PENDING
   ACTIVE
   EXPIRED
   ACCEPTED
   INSPECTED
   PAID
+  DECLINED
 }
 
 /// Outcome recorded by the admin/inspector when the phone is physically checked.
@@ -829,6 +831,9 @@ model Quote {
   pickupAddress String?
   pickupSlot    String?
   acceptedAt    DateTime?
+
+  // Admin review (manual quote): reason shown to the seller when a request is declined.
+  declineReason String?
 
   // Physical inspection outcome (admin/inspector).
   inspectionResult QuoteInspectionResult?

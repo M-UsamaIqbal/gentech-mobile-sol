@@ -86,6 +86,8 @@ export interface QuoteDto {
   pickupAddress: string | null;
   pickupSlot: string | null;
   acceptedAt: string | null;
+  /** Reason shown to the seller when an admin declines a pending request. */
+  declineReason: string | null;
   inspectionResult: QuoteInspectionResult | null;
   inspectionReason: string | null;
   adjustedPricePkr: number | null;

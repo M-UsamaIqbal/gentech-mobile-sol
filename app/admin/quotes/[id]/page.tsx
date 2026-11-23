@@ -3,10 +3,11 @@ import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 
-import { ROUTES } from "@/lib/constants";
+import { QUOTE_STATUSES, ROUTES } from "@/lib/constants";
 import { requireAdmin } from "@/features/admin/lib/require-admin";
 import { getQuote } from "@/features/quotes/services/quote.service";
 import { QuoteResult } from "@/features/quotes/components/quote-result";
+import { AdminQuoteReview } from "@/features/quotes/components/admin-quote-review";
 import { AdminQuoteInspection } from "@/features/quotes/components/admin-quote-inspection";
 
 export const metadata: Metadata = { title: "Quote · Admin" };
@@ -45,7 +46,8 @@ export default async function AdminQuoteDetailPage({
             <p className="text-muted-foreground text-xs">{quote.user?.email ?? ""}</p>
           </div>
 
-          {/* Raw AI output */}
+          {/* Raw AI output (legacy auto-quotes only; manual requests have none) */}
+          {flags ? (
           <div className="bg-card rounded-xl border p-5">
             <h2 className="text-sm font-semibold">AI output</h2>
             <dl className="mt-2 space-y-1 text-sm">
@@ -80,6 +82,7 @@ export default async function AdminQuoteDetailPage({
               </p>
             ) : null}
           </div>
+          ) : null}
 
           {/* Answers */}
           <div className="bg-card rounded-xl border p-5">
@@ -89,7 +92,12 @@ export default async function AdminQuoteDetailPage({
             </pre>
           </div>
 
-          <AdminQuoteInspection quote={quote} />
+          {quote.status === QUOTE_STATUSES.PENDING ? (
+            <AdminQuoteReview quote={quote} />
+          ) : quote.status === QUOTE_STATUSES.ACCEPTED ||
+            quote.status === QUOTE_STATUSES.INSPECTED ? (
+            <AdminQuoteInspection quote={quote} />
+          ) : null}
         </div>
       </div>
     </div>

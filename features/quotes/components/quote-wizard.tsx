@@ -3,7 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ChevronLeft, ChevronRight, Loader2, Smartphone, Sparkles } from "lucide-react";
+import { ChevronLeft, ChevronRight, Loader2, MailCheck, Smartphone } from "lucide-react";
 import { toast } from "sonner";
 
 import { PTA_STATUS_LABELS, ROUTES, type PtaStatus } from "@/lib/constants";
@@ -47,7 +47,6 @@ export function QuoteWizard({ catalog, isAuthenticated }: Props) {
   const router = useRouter();
   const [step, setStep] = React.useState(0);
   const [submitting, setSubmitting] = React.useState(false);
-  const [retakeSlots, setRetakeSlots] = React.useState<number[]>([]);
 
   const [brand, setBrand] = React.useState("");
   const [model, setModel] = React.useState("");
@@ -133,13 +132,7 @@ export function QuoteWizard({ catalog, isAuthenticated }: Props) {
       toast.error(result.error);
       return;
     }
-    if (result.outcome === "retake") {
-      setRetakeSlots(result.retakeSlots);
-      setStep(6);
-      toast.warning(result.reason);
-      return;
-    }
-    toast.success("Your instant quote is ready!");
+    toast.success("Request sent — we'll review it and email you an offer.");
     router.push(`${ROUTES.sellPhone}/${result.id}`);
   }
 
@@ -372,7 +365,7 @@ export function QuoteWizard({ catalog, isAuthenticated }: Props) {
             labelUr="5 تصاویر اپ لوڈ کریں"
             hintEn="Follow each sample. Good light, in focus."
           >
-            <QuotePhotoUpload value={photos} onChange={setPhotos} retakeSlots={retakeSlots} />
+            <QuotePhotoUpload value={photos} onChange={setPhotos} />
           </Field>
         )}
 
@@ -401,8 +394,8 @@ export function QuoteWizard({ catalog, isAuthenticated }: Props) {
             />
             <ReviewRow label="Photos" value={`${photos.length} / 5 uploaded`} />
             <div className="bg-muted/50 text-muted-foreground rounded-lg p-3 text-xs">
-              <Sparkles className="text-primary mb-1 inline size-3.5" /> Our AI reviews your photos
-              and answers to grade the phone and calculate a fair price range instantly.
+              <MailCheck className="text-primary mb-1 inline size-3.5" /> Our team reviews your
+              details and photos, then emails you a firm offer — usually within a day.
             </div>
           </div>
         )}
@@ -423,8 +416,8 @@ export function QuoteWizard({ catalog, isAuthenticated }: Props) {
           </Button>
         ) : (
           <Button disabled={submitting || photos.length !== 5} onClick={submit}>
-            {submitting ? <Loader2 className="size-4 animate-spin" /> : <Sparkles className="size-4" />}
-            {submitting ? "Grading…" : "Get my quote"}
+            {submitting ? <Loader2 className="size-4 animate-spin" /> : <MailCheck className="size-4" />}
+            {submitting ? "Sending…" : "Submit request"}
           </Button>
         )}
       </div>

@@ -25,12 +25,12 @@ export function MyQuotesList({ quotes }: { quotes: QuoteDto[] }) {
     return (
       <div className="bg-card rounded-xl border p-8 text-center">
         <Smartphone className="text-muted-foreground mx-auto size-8" />
-        <p className="mt-3 font-medium">No quotes yet</p>
+        <p className="mt-3 font-medium">No requests yet</p>
         <p className="text-muted-foreground mt-1 text-sm">
-          Get an instant price for a phone you want to sell.
+          Send us your phone&apos;s details and photos — we&apos;ll email you a firm offer.
         </p>
         <Link href={ROUTES.sellPhone} className={cn(buttonVariants(), "mt-4")}>
-          Get an instant quote
+          Request a quote
         </Link>
       </div>
     );
@@ -54,15 +54,23 @@ export function MyQuotesList({ quotes }: { quotes: QuoteDto[] }) {
                 </Badge>
               </div>
               <p className="text-muted-foreground mt-0.5 truncate text-sm">
-                {q.brand} {q.model} · {q.storage} · Grade {q.aiGrade ?? "—"}
+                {q.brand} {q.model} · {q.storage}
               </p>
               <p className="text-muted-foreground text-xs">Created {formatDate(q.createdAt)}</p>
             </div>
             <div className="flex items-center gap-2 text-right">
               <div>
-                <p className="font-semibold">
-                  {formatPrice(q.priceMin)} – {formatPrice(q.priceMax)}
-                </p>
+                {q.status === QUOTE_STATUSES.PENDING ? (
+                  <p className="text-muted-foreground text-sm">Under review</p>
+                ) : q.status === QUOTE_STATUSES.DECLINED ? (
+                  <p className="text-muted-foreground text-sm">Declined</p>
+                ) : (
+                  <p className="font-semibold">
+                    {q.priceMin === q.priceMax
+                      ? formatPrice(q.priceMax)
+                      : `${formatPrice(q.priceMin)} – ${formatPrice(q.priceMax)}`}
+                  </p>
+                )}
               </div>
               <ChevronRight className="text-muted-foreground size-4 shrink-0" />
             </div>

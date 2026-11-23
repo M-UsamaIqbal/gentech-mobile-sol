@@ -307,6 +307,7 @@ const quoteSelect = {
   pickupAddress: true,
   pickupSlot: true,
   acceptedAt: true,
+  declineReason: true,
   inspectionResult: true,
   inspectionReason: true,
   adjustedPricePkr: true,
@@ -349,6 +350,7 @@ function toQuoteDto(row: QuoteRow, includeUser = false): QuoteDto {
     pickupAddress: row.pickupAddress,
     pickupSlot: row.pickupSlot,
     acceptedAt: iso(row.acceptedAt),
+    declineReason: row.declineReason,
     inspectionResult: (row.inspectionResult as QuoteInspectionResult | null) ?? null,
     inspectionReason: row.inspectionReason,
     adjustedPricePkr: row.adjustedPricePkr == null ? null : Number(row.adjustedPricePkr),
@@ -380,9 +382,34 @@ export interface CreateQuoteData {
   validUntil: Date;
 }
 
-/** Persists a fully-computed quote, retrying on the (rare) code collision. */
+/** Inserts a quote row with a generated code, retrying on the (rare) id collision. */
+async function insertQuoteWithRetry(
+  base: Omit<Prisma.QuoteUncheckedCreateInput, "id">,
+): Promise<QuoteDto> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const row = await prisma.quote.create({
+        data: { id: generateQuoteId(), ...base },
+        select: quoteWithUserSelect,
+      });
+      return toQuoteDto(row);
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === "P2002" &&
+        attempt < 4
+      ) {
+        continue; // id collision — try a fresh code
+      }
+      throw error;
+    }
+  }
+  throw new Error("Could not allocate a unique quote id.");
+}
+
+/** Persists a fully-computed quote (legacy instant-pricing path; kept for reuse). */
 export async function createQuote(data: CreateQuoteData): Promise<QuoteDto> {
-  const base = {
+  return insertQuoteWithRetry({
     userId: data.userId,
     modelId: data.modelId,
     brand: data.brand,
@@ -408,27 +435,73 @@ export async function createQuote(data: CreateQuoteData): Promise<QuoteDto> {
     priceMax: new Prisma.Decimal(data.priceMax),
     status: QUOTE_STATUSES.ACTIVE,
     validUntil: data.validUntil,
-  };
+  });
+}
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      const row = await prisma.quote.create({
-        data: { id: generateQuoteId(), ...base },
-        select: quoteWithUserSelect,
-      });
-      return toQuoteDto(row);
-    } catch (error) {
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === "P2002" &&
-        attempt < 4
-      ) {
-        continue; // id collision — try a fresh code
-      }
-      throw error;
-    }
-  }
-  throw new Error("Could not allocate a unique quote id.");
+export interface CreatePendingQuoteData {
+  userId: string;
+  brand: string;
+  model: string;
+  storage: string;
+  ptaStatus: PtaStatus;
+  answers: QuoteAnswers;
+  photos: QuotePhoto[];
+}
+
+/**
+ * Persists a submitted buy-back request awaiting manual admin review. No price is
+ * computed yet — the price fields hold neutral placeholders until an admin approves.
+ */
+export async function createPendingQuote(data: CreatePendingQuoteData): Promise<QuoteDto> {
+  return insertQuoteWithRetry({
+    userId: data.userId,
+    modelId: null,
+    brand: data.brand,
+    model: data.model,
+    storage: data.storage,
+    ptaStatus: data.ptaStatus,
+    basePricePkr: new Prisma.Decimal(0),
+    answers: data.answers as unknown as Prisma.InputJsonValue,
+    photoUrls: data.photos as unknown as Prisma.InputJsonValue,
+    gradeMultiplier: new Prisma.Decimal(1),
+    deductions: [] as unknown as Prisma.InputJsonValue,
+    priceMin: new Prisma.Decimal(0),
+    priceMax: new Prisma.Decimal(0),
+    status: QUOTE_STATUSES.PENDING,
+    // Placeholder; reset when the admin approves. Pending quotes are never auto-expired.
+    validUntil: new Date(Date.now() + QUOTE_PRICING.validityHours * 3_600_000),
+  });
+}
+
+/**
+ * Admin approves a pending request with a single firm offer price → ACTIVE.
+ * Guarded to only transition from PENDING; returns the updated quote or null.
+ */
+export async function approveQuote(id: string, offerPricePkr: number): Promise<QuoteDto | null> {
+  const price = new Prisma.Decimal(offerPricePkr);
+  const res = await prisma.quote.updateMany({
+    where: { id, status: QUOTE_STATUSES.PENDING },
+    data: {
+      status: QUOTE_STATUSES.ACTIVE,
+      basePricePkr: price,
+      priceMin: price,
+      priceMax: price,
+      declineReason: null,
+      validUntil: new Date(Date.now() + QUOTE_PRICING.validityHours * 3_600_000),
+    },
+  });
+  if (res.count === 0) return null;
+  return getQuoteById(id);
+}
+
+/** Admin declines a pending request with a reason → DECLINED. */
+export async function declineQuote(id: string, reason: string): Promise<QuoteDto | null> {
+  const res = await prisma.quote.updateMany({
+    where: { id, status: QUOTE_STATUSES.PENDING },
+    data: { status: QUOTE_STATUSES.DECLINED, declineReason: reason },
+  });
+  if (res.count === 0) return null;
+  return getQuoteById(id);
 }
 
 /** A single quote with its owner (callers enforce authorization). */

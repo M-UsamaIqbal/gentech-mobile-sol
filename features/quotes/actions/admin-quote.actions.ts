@@ -5,10 +5,14 @@ import { revalidatePath } from "next/cache";
 import { ROUTES } from "@/lib/constants";
 import { requireAdmin } from "@/features/admin/lib/require-admin";
 import {
+  approveQuoteSchema,
+  declineQuoteSchema,
   deductionRuleSchema,
   gradeMultipliersSchema,
   inspectQuoteSchema,
   phoneModelSchema,
+  type ApproveQuoteInput,
+  type DeclineQuoteInput,
   type DeductionRuleInput,
   type GradeMultipliersInput,
   type InspectQuoteInput,
@@ -16,6 +20,8 @@ import {
 } from "@/features/quotes/schemas/quote";
 import {
   addPhoneModel,
+  approveQuote,
+  declineQuote,
   editPhoneModel,
   recordQuoteInspection,
   removeDeductionRule,
@@ -140,6 +146,46 @@ export async function saveMultipliersAction(input: GradeMultipliersInput): Promi
     return { ok: true };
   } catch (error) {
     console.error("[quotes] save multipliers failed:", error);
+    return { ok: false, error: GENERIC_ERROR };
+  }
+}
+
+// --- Manual review: approve / decline a pending request --------------------
+
+export async function approveQuoteAction(input: ApproveQuoteInput): Promise<ActionResult> {
+  if (!(await requireAdmin())) return { ok: false, error: FORBIDDEN };
+  const parsed = approveQuoteSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? invalid().error };
+  }
+  try {
+    const quote = await approveQuote(parsed.data.id, parsed.data.offerPricePkr);
+    if (!quote) return { ok: false, error: "This request can no longer be reviewed." };
+    revalidatePath(ROUTES.adminQuotes);
+    revalidatePath(`${ROUTES.adminQuotes}/${parsed.data.id}`);
+    revalidatePath(`${ROUTES.sellPhone}/${parsed.data.id}`);
+    return { ok: true };
+  } catch (error) {
+    console.error("[quotes] approve failed:", error);
+    return { ok: false, error: GENERIC_ERROR };
+  }
+}
+
+export async function declineQuoteAction(input: DeclineQuoteInput): Promise<ActionResult> {
+  if (!(await requireAdmin())) return { ok: false, error: FORBIDDEN };
+  const parsed = declineQuoteSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? invalid().error };
+  }
+  try {
+    const quote = await declineQuote(parsed.data.id, parsed.data.reason);
+    if (!quote) return { ok: false, error: "This request can no longer be reviewed." };
+    revalidatePath(ROUTES.adminQuotes);
+    revalidatePath(`${ROUTES.adminQuotes}/${parsed.data.id}`);
+    revalidatePath(`${ROUTES.sellPhone}/${parsed.data.id}`);
+    return { ok: true };
+  } catch (error) {
+    console.error("[quotes] decline failed:", error);
     return { ok: false, error: GENERIC_ERROR };
   }
 }

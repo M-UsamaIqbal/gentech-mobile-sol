@@ -1,8 +1,11 @@
 import "server-only";
 
 import {
+  APP,
+  NOTIFICATION_TYPES,
   QUOTE_PRICING,
   QUOTE_STATUSES,
+  ROUTES,
   type QuoteInspectionResult,
 } from "@/lib/constants";
 import type {
@@ -12,30 +15,28 @@ import type {
   GradeMultipliersInput,
   PhoneModelInput,
 } from "@/features/quotes/schemas/quote";
-import { applyMismatchGradePenalty, computeQuotePricing } from "@/features/quotes/lib/pricing";
-import { gradeDevice, type Grader } from "@/features/quotes/lib/grading";
 import type {
   CatalogDto,
-  CreateQuoteResult,
   DeductionRuleDto,
   GradeMultipliers,
   PhoneModelDto,
   QuoteDto,
 } from "@/features/quotes/types";
+import { dispatchNotification } from "@/features/notifications/services/notification.service";
 import {
   acceptQuote,
+  approveQuote as approveQuoteRecord,
   countQuotesForUser,
+  createPendingQuote as persistPendingQuote,
   createPhoneModel,
-  createQuote as persistQuote,
+  declineQuote as declineQuoteRecord,
   deleteDeductionRule,
   deletePhoneModel,
   expireDueQuotes,
   expireQuoteIfDue,
-  findPhoneModel,
   getActiveCatalog,
   getGradeMultipliers,
   getQuoteById,
-  listActiveDeductionRules,
   listAllDeductionRules,
   listAllPhoneModels,
   listAllQuotes,
@@ -46,6 +47,41 @@ import {
   updatePhoneModel,
   upsertDeductionRule,
 } from "@/features/quotes/repositories/quote.repository";
+
+/** Formats a PKR amount for emails, e.g. 150000 → "Rs 150,000". */
+function formatPkr(amount: number): string {
+  return `Rs ${Math.round(amount).toLocaleString("en-PK")}`;
+}
+
+/** Emails the seller the admin's decision (offer or decline) + an in-app notification. */
+async function notifyQuoteDecision(quote: QuoteDto, kind: "approved" | "declined"): Promise<void> {
+  const user = quote.user;
+  if (!user) return;
+  const device = `${quote.brand} ${quote.model} ${quote.storage}`.trim();
+  const url = `${ROUTES.sellPhone}/${quote.id}`;
+
+  if (kind === "approved") {
+    await dispatchNotification({
+      userId: user.id,
+      type: NOTIFICATION_TYPES.SYSTEM,
+      title: `${APP.name}: your offer for the ${quote.brand} ${quote.model}`,
+      body: `Good news — we can offer ${formatPkr(quote.priceMax)} for your ${device}. Review and accept to schedule a free pickup.`,
+      url,
+      email: true,
+    });
+  } else {
+    await dispatchNotification({
+      userId: user.id,
+      type: NOTIFICATION_TYPES.SYSTEM,
+      title: `${APP.name}: update on your ${quote.brand} ${quote.model} request`,
+      body: quote.declineReason
+        ? `We're unable to make an offer for your ${device}. Reason: ${quote.declineReason}`
+        : `We're unable to make an offer for your ${device} at this time.`,
+      url,
+      email: true,
+    });
+  }
+}
 
 function warn(scope: string, error: unknown): void {
   console.warn(`[quotes] ${scope}:`, error instanceof Error ? error.message : error);
@@ -66,130 +102,24 @@ export async function getCatalog(): Promise<CatalogDto> {
 }
 
 // ---------------------------------------------------------------------------
-// Create a quote (Steps 4 + 5) — the heart of the feature.
+// Submit a request (manual review) — the heart of the feature.
 // ---------------------------------------------------------------------------
 
 /**
- * Reconciles the AI's screenshot reading with the seller's selection. When the
- * screenshot reports a different storage that *also* exists in the price book, we
- * trust the screenshot (per spec) and note it as a mismatch the seller will see.
+ * Submits a buy-back request for manual admin review. No price is computed — the
+ * admin reviews the details + photos and sets a firm offer price (or declines),
+ * which is then emailed to the seller. Returns the newly-created PENDING quote.
  */
-async function resolvePriceModel(
-  input: CreateQuoteInput,
-  mismatches: string[],
-  screenshot: { model: string; storage: string },
-): Promise<PhoneModelDto | null> {
-  const pta = input.answers.ptaStatus;
-  const selected = await findPhoneModel(input.brand, input.model, input.storage, pta);
-
-  const shotStorage = screenshot.storage.trim();
-  if (shotStorage && shotStorage.toLowerCase() !== input.storage.toLowerCase()) {
-    const fromShot = await findPhoneModel(input.brand, input.model, shotStorage, pta);
-    if (fromShot) {
-      mismatches.push(
-        `You selected ${input.storage} but the screenshot shows ${shotStorage} — using ${shotStorage}.`,
-      );
-      return fromShot;
-    }
-  }
-  return selected;
-}
-
-/**
- * Runs AI grading, reconciles screenshot data, prices the device and persists the
- * quote. Returns a `retake` outcome instead when the photos aren't gradeable.
- * `grader` is injectable so tests can drive clean / mismatch / retake scenarios.
- */
-export async function createQuote(
-  input: CreateQuoteInput,
-  userId: string,
-  opts?: { grader?: Grader },
-): Promise<CreateQuoteResult> {
-  const grader = opts?.grader ?? gradeDevice;
-
-  const ai = await grader({
+export async function createQuote(input: CreateQuoteInput, userId: string): Promise<QuoteDto> {
+  return persistPendingQuote({
+    userId,
     brand: input.brand,
     model: input.model,
     storage: input.storage,
+    ptaStatus: input.answers.ptaStatus,
     answers: input.answers,
     photos: input.photos,
   });
-
-  // Gate on photo quality / confidence before we price anything (Step 4 rule).
-  if (ai.retake_needed.length > 0 || ai.confidence < QUOTE_PRICING.minConfidence) {
-    return {
-      kind: "retake",
-      retakeSlots: ai.retake_needed,
-      confidence: ai.confidence,
-      reason:
-        ai.retake_needed.length > 0
-          ? "Some photos need to be retaken before we can price your phone."
-          : "We couldn't read the photos clearly enough. Please retake them in good light.",
-    };
-  }
-
-  const mismatches = [...ai.mismatches];
-
-  // Reconcile the About/Battery screenshot with the seller's selection.
-  const resolved = await resolvePriceModel(input, mismatches, ai.screenshot_data);
-  if (!resolved) {
-    throw new Error("This exact model/storage/PTA combination isn't in our price book yet.");
-  }
-
-  // Trust the screenshot's battery health when it conflicts (affects a deduction).
-  const answers = { ...input.answers };
-  const shotBattery = Number(ai.screenshot_data.battery_health);
-  if (
-    Number.isFinite(shotBattery) &&
-    shotBattery > 0 &&
-    shotBattery <= 100 &&
-    answers.batteryHealth != null &&
-    Math.abs(shotBattery - answers.batteryHealth) > 2
-  ) {
-    mismatches.push(
-      `You entered ${answers.batteryHealth}% battery health but the screenshot shows ${shotBattery}% — using ${shotBattery}%.`,
-    );
-    answers.batteryHealth = Math.round(shotBattery);
-  }
-
-  const effectiveGrade = applyMismatchGradePenalty(ai.grade, mismatches.length);
-
-  const [multipliers, rules] = await Promise.all([
-    getGradeMultipliers(),
-    listActiveDeductionRules(),
-  ]);
-
-  const pricing = computeQuotePricing({
-    basePrice: resolved.basePricePkr,
-    grade: effectiveGrade,
-    gradeMultipliers: multipliers,
-    answers,
-    rules,
-  });
-
-  const validUntil = new Date(Date.now() + QUOTE_PRICING.validityHours * 3_600_000);
-
-  const quote = await persistQuote({
-    userId,
-    modelId: resolved.id,
-    brand: resolved.brand,
-    model: resolved.model,
-    storage: resolved.storage,
-    ptaStatus: answers.ptaStatus,
-    basePricePkr: resolved.basePricePkr,
-    answers,
-    photos: input.photos,
-    aiGrade: ai.grade,
-    aiResult: { ...ai, mismatches },
-    effectiveGrade,
-    gradeMultiplier: pricing.gradeMultiplier,
-    deductions: pricing.deductions,
-    priceMin: pricing.priceMin,
-    priceMax: pricing.priceMax,
-    validUntil,
-  });
-
-  return { kind: "quote", quote };
 }
 
 // ---------------------------------------------------------------------------
@@ -230,29 +160,27 @@ export async function acceptMyQuote(input: AcceptQuoteInput, userId: string): Pr
   return acceptQuote(input.id, userId, input.pickupAddress, input.pickupSlot);
 }
 
-/**
- * Re-quote an expired quote: reuse its answers + photos but price against today's
- * price book, deductions and multipliers (Step 7). Owner-scoped.
- */
-export async function requote(
-  id: string,
-  userId: string,
-  opts?: { grader?: Grader },
-): Promise<CreateQuoteResult | null> {
-  const prev = await getQuoteById(id);
-  if (!prev || prev.user?.id !== userId) return null;
+// ---------------------------------------------------------------------------
+// Admin review (manual quote): approve with a price, or decline with a reason.
+// ---------------------------------------------------------------------------
 
-  return createQuote(
-    {
-      brand: prev.brand,
-      model: prev.model,
-      storage: prev.storage,
-      answers: prev.answers,
-      photos: prev.photos,
-    },
-    userId,
-    opts,
-  );
+/**
+ * Admin approves a pending request with a firm offer price → ACTIVE, then emails
+ * the seller the offer. Returns the updated quote, or null if it wasn't pending.
+ */
+export async function approveQuote(id: string, offerPricePkr: number): Promise<QuoteDto | null> {
+  const quote = await approveQuoteRecord(id, offerPricePkr);
+  if (!quote) return null;
+  await notifyQuoteDecision(quote, "approved");
+  return quote;
+}
+
+/** Admin declines a pending request with a reason → DECLINED, then emails the seller. */
+export async function declineQuote(id: string, reason: string): Promise<QuoteDto | null> {
+  const quote = await declineQuoteRecord(id, reason);
+  if (!quote) return null;
+  await notifyQuoteDecision(quote, "declined");
+  return quote;
 }
 
 // ---------------------------------------------------------------------------

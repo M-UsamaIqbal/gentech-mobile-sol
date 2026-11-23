@@ -162,3 +162,24 @@ export const inspectQuoteSchema = z
   );
 
 export type InspectQuoteInput = z.infer<typeof inspectQuoteSchema>;
+
+// ---------------------------------------------------------------------------
+// Admin review of a submitted (pending) request: approve with a price, or decline.
+// ---------------------------------------------------------------------------
+
+export const approveQuoteSchema = z.object({
+  id: z.string().trim().min(1),
+  offerPricePkr: z
+    .number({ message: "Enter an offer price" })
+    .positive("Offer must be greater than 0")
+    .max(100_000_000),
+});
+
+export type ApproveQuoteInput = z.infer<typeof approveQuoteSchema>;
+
+export const declineQuoteSchema = z.object({
+  id: z.string().trim().min(1),
+  reason: z.string().trim().min(3, "Add a short reason").max(500),
+});
+
+export type DeclineQuoteInput = z.infer<typeof declineQuoteSchema>;
