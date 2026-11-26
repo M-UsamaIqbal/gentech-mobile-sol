@@ -4,7 +4,8 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { Clock, Eye, MapPin } from "lucide-react";
 
-import { APP, LISTING_CONDITION_LABELS, ROUTES } from "@/lib/constants";
+import { APP_URL } from "@/lib/app-url";
+import { LISTING_CONDITION_LABELS, ROUTES } from "@/lib/constants";
 import { formatPrice, formatRelativeTime } from "@/utils/format";
 import { getCurrentUser } from "@/lib/session";
 import { getListingDetail } from "@/features/listings/services/listing.service";
@@ -12,6 +13,8 @@ import {
   getInspectionPlans,
   getListingInspectionReport,
 } from "@/features/inspections/services/inspection.service";
+import { getPhoneHistory } from "@/features/phone-history/services/phone-history.service";
+import type { PhoneHistoryEvent } from "@/features/phone-history/types";
 import { ListingInspectionCta } from "@/features/inspections/components/listing-inspection-cta";
 import { PublishedReportPanel } from "@/features/inspections/components/published-report-panel";
 import { ListingGallery } from "@/features/listings/components/listing-gallery";
@@ -24,6 +27,15 @@ import { ListingsGrid } from "@/features/marketplace/components/listings-grid";
 import { SectionHeader } from "@/features/marketplace/components/section-header";
 import { ViewListingTracker } from "@/features/analytics/components/view-listing-tracker";
 import { Badge } from "@/components/ui/badge";
+import { CheckCircle2, ShieldCheck } from "lucide-react";
+import { getActiveLocationTree } from "@/features/locations/services/location.service";
+import { getFavoriteListingIds } from "@/features/favorites/services/favorite.service";
+import { JsonLd } from "@/components/seo/json-ld";
+import { absoluteUrl, truncateDescription } from "@/lib/seo/metadata";
+import {
+  buildBreadcrumbStructuredData,
+  buildListingStructuredData,
+} from "@/lib/seo/structured-data";
 
 /** Shared per-request loader → metadata + page reuse one fetch (one view increment). */
 const loadListing = cache((slug: string) => getListingDetail(slug));
@@ -36,7 +48,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   if (!result) return { title: "Listing not found" };
 
   const { detail } = result;
-  const description = detail.description.slice(0, 160);
+  const description = truncateDescription(detail.description);
   const images = detail.images[0]?.url ? [detail.images[0].url] : undefined;
 
   return {
@@ -57,28 +69,40 @@ export default async function ListingDetailPage({ params }: PageProps) {
   if (!result) notFound();
 
   const { detail, related } = result;
+  const isAuthenticated = Boolean(user);
 
   // Inspection service data (fail-soft): pricing packages + any published report.
-  const [inspectionPlans, publishedReport] = await Promise.all([
-    getInspectionPlans(),
-    getListingInspectionReport(detail.id),
-  ]);
+  const [inspectionPlans, publishedReport, phoneHistory, locations, favoriteIds] =
+    await Promise.all([
+      getInspectionPlans(),
+      getListingInspectionReport(detail.id),
+      getPhoneHistory(detail.id, 10),
+      getActiveLocationTree(),
+      isAuthenticated && user
+        ? getFavoriteListingIds(user.id, [detail.id, ...related.map((listing) => listing.id)])
+        : Promise.resolve([]),
+    ]);
 
-  const jsonLd = {
-    "@context": "https://schema.org",
-    "@type": "Product",
-    name: detail.title,
-    description: detail.description,
-    image: detail.images.map((i) => i.url),
-    brand: detail.brand ? { "@type": "Brand", name: detail.brand } : undefined,
-    offers: {
-      "@type": "Offer",
-      price: detail.price,
-      priceCurrency: detail.currency,
-      availability: "https://schema.org/InStock",
-      url: `${APP.url}/listings/${detail.slug}`,
-    },
-  };
+  const listingPath = `/listings/${detail.slug}`;
+  const jsonLd = [
+    buildListingStructuredData(detail, absoluteUrl(listingPath, APP_URL)),
+    buildBreadcrumbStructuredData(
+      [
+        { name: "Home", path: ROUTES.home },
+        { name: "Marketplace", path: ROUTES.marketplace },
+        ...(detail.categorySlug
+          ? [
+              {
+                name: detail.categoryName ?? detail.categorySlug,
+                path: `${ROUTES.marketplace}?category=${encodeURIComponent(detail.categorySlug)}`,
+              },
+            ]
+          : []),
+        { name: detail.title, path: listingPath },
+      ],
+      APP_URL,
+    ),
+  ];
 
   return (
     <div className="mx-auto max-w-6xl px-4 py-6">
@@ -114,13 +138,23 @@ export default async function ListingDetailPage({ params }: PageProps) {
       <div className="grid gap-6 lg:grid-cols-3">
         {/* Main column */}
         <div className="space-y-6 lg:col-span-2">
-          <ListingGallery images={detail.images} title={detail.title} brand={detail.brand} />
+          <ListingGallery
+            images={detail.images}
+            title={detail.title}
+            brand={detail.brand}
+            model3d={detail.model3d}
+          />
 
           <div>
             <div className="flex items-start justify-between gap-3">
               <h1 className="text-2xl font-bold tracking-tight">{detail.title}</h1>
               <div className="flex shrink-0 items-center gap-2">
-                <FavoriteButton className="border" />
+                <FavoriteButton
+                  listingId={detail.id}
+                  initialIsFavorite={favoriteIds.includes(detail.id)}
+                  isAuthenticated={isAuthenticated}
+                  className="border"
+                />
                 <ShareButton title={detail.title} />
               </div>
             </div>
@@ -143,6 +177,38 @@ export default async function ListingDetailPage({ params }: PageProps) {
 
           {publishedReport ? <PublishedReportPanel report={publishedReport} /> : null}
 
+          {/* Trust Badges */}
+          <section className="flex flex-wrap gap-2">
+            {detail.attributes.find(
+              (a) => a.label === "PTA Status" && a.value === "PTA_APPROVED",
+            ) && (
+              <Badge variant="outline" className="border-green-500 bg-green-50 text-green-700">
+                <CheckCircle2 className="mr-1 size-3" />
+                PTA Approved
+              </Badge>
+            )}
+            {detail.attributes.find(
+              (a) => a.label === "CPID Status" && a.value === "CPID_APPROVED",
+            ) && (
+              <Badge variant="outline" className="border-blue-500 bg-blue-50 text-blue-700">
+                <CheckCircle2 className="mr-1 size-3" />
+                CPID Verified
+              </Badge>
+            )}
+            {publishedReport && (
+              <Badge variant="outline" className="border-purple-500 bg-purple-50 text-purple-700">
+                <ShieldCheck className="mr-1 size-3" />
+                Inspected
+              </Badge>
+            )}
+            {detail.attributes.find((a) => a.label === "Warranty" && a.value !== "NO_WARRANTY") && (
+              <Badge variant="outline" className="border-orange-500 bg-orange-50 text-orange-700">
+                <CheckCircle2 className="mr-1 size-3" />
+                Warranty
+              </Badge>
+            )}
+          </section>
+
           <ListingSpecs attributes={detail.attributes} />
 
           <section>
@@ -151,6 +217,27 @@ export default async function ListingDetailPage({ params }: PageProps) {
               {detail.description}
             </p>
           </section>
+
+          {phoneHistory.length > 0 ? (
+            <section>
+              <h2 className="mb-3 text-lg font-semibold">Phone History</h2>
+              <div className="space-y-2">
+                {phoneHistory.map((event: PhoneHistoryEvent) => (
+                  <div key={event.id} className="border-b pb-2 last:border-b-0">
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-medium">{event.eventType}</span>
+                      <span className="text-muted-foreground text-xs">
+                        {new Date(event.occurredAt).toLocaleDateString()}
+                      </span>
+                    </div>
+                    {event.title && (
+                      <p className="text-muted-foreground mt-1 text-sm">{event.title}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
 
           <LocationMap
             city={detail.city}
@@ -178,6 +265,7 @@ export default async function ListingDetailPage({ params }: PageProps) {
           <SellerCard
             seller={detail.seller}
             listingId={detail.id}
+            listingTitle={detail.title}
             isAuthenticated={Boolean(user)}
           />
 
@@ -186,6 +274,9 @@ export default async function ListingDetailPage({ params }: PageProps) {
             plans={inspectionPlans}
             isAuthenticated={Boolean(user)}
             defaultCity={detail.city}
+            locations={locations}
+            showPakistanSignals
+            categorySlug={detail.categorySlug}
           />
         </aside>
       </div>
@@ -193,14 +284,15 @@ export default async function ListingDetailPage({ params }: PageProps) {
       {related.length > 0 ? (
         <section className="mt-12">
           <SectionHeader title="Related listings" />
-          <ListingsGrid listings={related} />
+          <ListingsGrid
+            listings={related}
+            favoriteIds={favoriteIds}
+            isAuthenticated={isAuthenticated}
+          />
         </section>
       ) : null}
 
-      <script
-        type="application/ld+json"
-        dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd) }}
-      />
+      <JsonLd data={jsonLd} />
     </div>
   );
 }

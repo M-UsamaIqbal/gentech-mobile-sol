@@ -3,16 +3,18 @@
 import { useSearchParams } from "next/navigation";
 
 import { ROUTES } from "@/lib/constants";
+import { useLocalizedRouteInfo, withLocalizedPrefix } from "@/lib/localized-routing";
 
 type Patch = Record<string, string | null | undefined>;
 
 /**
- * Returns a builder that produces a `/marketplace` URL from the current params plus
- * a patch. Empty/null values remove the key. Changing any filter resets pagination
- * to page 1 unless `resetPage: false` is passed (used by the pager itself).
+ * Builds a marketplace URL from current params plus a patch, preserving the active
+ * `/{country}/{locale}` prefix. Empty/null values remove a key; changing any filter
+ * resets pagination unless `resetPage: false` is passed by the pager itself.
  */
 export function useListingHref() {
   const searchParams = useSearchParams();
+  const { prefix } = useLocalizedRouteInfo();
 
   return (patch: Patch, opts?: { resetPage?: boolean }) => {
     const params = new URLSearchParams(searchParams.toString());
@@ -25,6 +27,9 @@ export function useListingHref() {
     if (opts?.resetPage !== false) params.delete("page");
 
     const qs = params.toString();
-    return `${ROUTES.marketplace}${qs ? `?${qs}` : ""}`;
+    return withLocalizedPrefix(
+      `${ROUTES.marketplace}${qs ? `?${qs}` : ""}`,
+      prefix,
+    );
   };
 }

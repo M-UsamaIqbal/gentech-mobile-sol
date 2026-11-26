@@ -10,7 +10,10 @@ import { getConversations } from "@/features/messaging/services/conversation.ser
 import { ConversationList } from "@/features/messaging/components/conversation-list";
 import { buttonVariants } from "@/components/ui/button";
 
-export const metadata: Metadata = { title: "Messages" };
+export const metadata: Metadata = { 
+  title: "Messages",
+  robots: { index: false, follow: false },
+};
 
 export default async function MessagesPage() {
   const user = await getCurrentUser();

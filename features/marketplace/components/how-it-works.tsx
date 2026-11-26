@@ -1,40 +1,36 @@
 import { MessagesSquare, Search, Tag } from "lucide-react";
 
-const STEPS = [
-  {
-    icon: Search,
-    title: "Discover",
-    body: "Browse thousands of phones and accessories, filtered by brand, price, and city.",
-  },
-  {
-    icon: MessagesSquare,
-    title: "Chat",
-    body: "Message sellers directly, ask questions, and agree on a fair price.",
-  },
-  {
-    icon: Tag,
-    title: "Deal",
-    body: "Meet safely, inspect the device, and close the deal with confidence.",
-  },
-];
+import { getServerTranslations } from "@/lib/i18n/get-server-translations";
 
-export function HowItWorks() {
+const STEPS = [
+  { icon: Search, key: "step1" },
+  { icon: MessagesSquare, key: "step2" },
+  { icon: Tag, key: "step3" },
+] as const;
+
+export async function HowItWorks() {
+  const t = await getServerTranslations("howItWorks");
+  const tHome = await getServerTranslations("homepage");
+
   return (
-    <section className="bg-muted/40 border-y">
-      <div className="mx-auto max-w-6xl px-4 py-14">
-        <h2 className="text-center text-2xl font-bold tracking-tight">How it works</h2>
-        <div className="mt-10 grid gap-6 sm:grid-cols-3">
-          {STEPS.map(({ icon: Icon, title, body }, i) => (
-            <div key={title} className="flex flex-col items-center text-center">
-              <span className="bg-primary text-primary-foreground grid size-12 place-items-center rounded-full">
-                <Icon className="size-6" />
-              </span>
-              <h3 className="mt-4 flex items-center gap-2 text-lg font-semibold">
-                <span className="text-muted-foreground">{i + 1}.</span>
-                {title}
-              </h3>
-              <p className="text-muted-foreground mt-1 max-w-xs text-sm">{body}</p>
-            </div>
+    <section className="border-y border-brand/10 bg-brand-soft/60">
+      <div className="mx-auto max-w-7xl px-4 py-14">
+        <div className="mx-auto max-w-[680px] text-center">
+          <h2 className="heading-4">{t("title")}</h2>
+          <p className="text-muted-foreground mt-3 text-sm">{tHome("howItWorksLead")}</p>
+        </div>
+        <div className="mt-10 grid gap-4 sm:grid-cols-3">
+          {STEPS.map(({ icon: Icon, key }, i) => (
+            <article key={key} className="bg-card rounded-xl border p-5">
+              <div className="flex items-center gap-3">
+                <span className="bg-brand text-brand-foreground grid size-10 place-items-center rounded-lg">
+                  <Icon className="size-5" />
+                </span>
+                <span className="text-brand text-xs font-semibold">0{i + 1}</span>
+              </div>
+              <h3 className="title-3 mt-4">{t(`${key}Title`)}</h3>
+              <p className="text-muted-foreground mt-2 text-sm">{t(`${key}Body`)}</p>
+            </article>
           ))}
         </div>
       </div>

@@ -1,0 +1,16540 @@
+/**
+ * WebGPU initialization and device management.
+ */
+
+let activeBufferAllocationSink = null;
+
+function recordBufferAllocation(buffer, size, label) {
+  if (activeBufferAllocationSink) {
+    activeBufferAllocationSink.push({
+      buffer,
+      size: Math.ceil(size / 4) * 4,
+      label: label || buffer.label || '',
+    });
+  }
+  return buffer;
+}
+
+/**
+ * Capture buffers allocated synchronously through this module while `fn` runs.
+ * A caller-owned inventory receives allocations before `fn` can reject, so
+ * terminal drain/recovery retains custody independently of the thrown value.
+ * Without that inventory, the existing unsubmitted-failure cleanup applies.
+ * Nested scopes restore the outer sink afterward.
+ */
+function captureGpuBufferAllocations(fn, { ownedAllocations = null } = {}) {
+  if (typeof fn !== 'function') throw new TypeError('fn must be a function');
+  if (ownedAllocations !== null && !Array.isArray(ownedAllocations)) throw new TypeError('ownedAllocations must be an array');
+  const previous = activeBufferAllocationSink;
+  const allocations = ownedAllocations ?? [];
+  const start = allocations.length;
+  activeBufferAllocationSink = allocations;
+  try {
+    return { value: fn(), allocations: ownedAllocations ? allocations.slice(start) : allocations };
+  } catch (error) {
+    if (ownedAllocations) throw error;
+    const cleanupErrors = [];
+    for (const allocation of allocations) {
+      try {
+        allocation.buffer.destroy();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError.message);
+      }
+    }
+    const cleanup = Object.freeze({
+      retiredCount: allocations.length - cleanupErrors.length,
+      cleanupErrors: Object.freeze(cleanupErrors),
+    });
+    if ((typeof error === 'object' && error !== null) || typeof error === 'function') {
+      try {
+        Object.defineProperty(error, 'gpuAllocationCleanup', {
+          configurable: true,
+          enumerable: true,
+          value: cleanup,
+        });
+      } catch {
+        // Ownership/error handling must not depend on mutating a thrown value.
+      }
+    }
+    throw error;
+  } finally {
+    activeBufferAllocationSink = previous;
+  }
+}
+
+/** A duty-local uniform enters capture before mapping can fail. */
+function createUniformBuffer(device, data, label = '') {
+  const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  const size = Math.max(16, Math.ceil(bytes.byteLength / 4) * 4);
+  const buffer = device.createBuffer({
+    size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true, label,
+  });
+  recordBufferAllocation(buffer, size, label);
+  try {
+    new Uint8Array(buffer.getMappedRange()).set(bytes);
+    buffer.unmap();
+    return buffer;
+  } catch (error) {
+    if (!activeBufferAllocationSink) {
+      try { buffer.destroy(); }
+      catch (cleanup) { throw new AggregateError([error, cleanup], 'uniform initialization and cleanup failed', {cause:error}); }
+    }
+    throw error;
+  }
+}
+
+/**
+ * Acquire the GPU for SF3D.
+ *
+ * A host that already owns a live GPUDevice (the Kaminos kiln, whose renderer
+ * must share one device and queue with inference) injects it:
+ *   initGPU({ device, adapter })  → { device, adapter, injected: true }
+ * SF3D then never requests its own device, so its cooperative duties and the
+ * host's frames interleave on the same queue. Without injection SF3D requests
+ * a high-performance adapter/device as before.
+ */
+async function initGPU({ device: injectedDevice, adapter: injectedAdapter = null } = {}) {
+  if (injectedDevice != null) {
+    if (typeof injectedDevice !== 'object' || typeof injectedDevice.queue?.submit !== 'function') {
+      throw new Error('injected device must expose queue.submit (a live GPUDevice)');
+    }
+    return { adapter: injectedAdapter, device: injectedDevice, injected: true };
+  }
+  if (!globalThis.navigator?.gpu) {
+    throw new Error('WebGPU is not supported in this browser. Try Chrome 113+ or Edge 113+.');
+  }
+
+  const adapter = await navigator.gpu.requestAdapter({
+    powerPreference: 'high-performance',
+  });
+  if (!adapter) {
+    throw new Error('No WebGPU adapter found. Your GPU may not support WebGPU.');
+  }
+
+  // Request max limits for large model inference
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxBufferSize: adapter.limits.maxBufferSize,
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+      maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
+      maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
+      maxComputeWorkgroupSizeY: adapter.limits.maxComputeWorkgroupSizeY,
+    },
+  });
+
+  device.lost.then((info) => {
+    console.error('WebGPU device lost:', info.message);
+    if (info.reason !== 'destroyed') ;
+  });
+
+  return { adapter, device, injected: false };
+}
+
+/**
+ * Create a storage buffer initialized with data.
+ */
+function createStorageBuffer(device, data, usage = 0, label = '') {
+  if (data.byteLength % 4 !== 0) {
+    console.warn(`createStorageBuffer: non-4-aligned size ${data.byteLength} (label: ${label})`);
+  }
+  const size = Math.ceil(data.byteLength / 4) * 4;
+  const buffer = device.createBuffer({
+    size, // ensure 4-byte alignment
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | usage,
+    mappedAtCreation: true,
+    label: label || `storage_${data.byteLength}`,
+  });
+  try {
+    new (data.constructor)(buffer.getMappedRange()).set(data);
+    buffer.unmap();
+    return recordBufferAllocation(buffer, size, label);
+  } catch (error) {
+    // Allocation succeeded but no caller can own the buffer until return.
+    try { buffer.destroy(); }
+    catch (cleanupError) { throw new AggregateError([error,cleanupError],'storage buffer initialization and cleanup failed',{cause:error}); }
+    throw error;
+  }
+}
+
+/**
+ * Initialize mapped GPU-owned storage without a separate complete CPU payload.
+ */
+function createMappedStorageBuffer(device,size,initialize,{usage=0,label='',ownedBuffers=null}={}){
+  if(!Number.isSafeInteger(size)||size<=0||size%4||typeof initialize!=='function'||
+    (ownedBuffers!==null&&!(ownedBuffers instanceof Set)))
+    throw TypeError('aligned mapped storage size, initializer and optional owned inventory required');
+  const buffer=device.createBuffer({size,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|usage,
+    mappedAtCreation:true,label:label||`storage_${size}`});
+  ownedBuffers?.add(buffer);
+  try{
+    initialize(buffer.getMappedRange());buffer.unmap();
+    return recordBufferAllocation(buffer,size,label);
+  }catch(error){
+    try{buffer.destroy();ownedBuffers?.delete(buffer);}
+    catch(cleanup){
+      const failure=new AggregateError([error,cleanup],'mapped storage initialization and cleanup failed',{cause:error});
+      failure.unresolvedGpuBuffer=buffer;throw failure;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Create an empty storage buffer.
+ */
+function createEmptyBuffer(device, size, usage = 0, label = '') {
+  if (size % 4 !== 0) {
+    console.warn(`createEmptyBuffer: non-4-aligned size ${size} (label: ${label})`);
+  }
+  const alignedSize = Math.ceil(size / 4) * 4;
+  const buffer = device.createBuffer({
+    size: alignedSize,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST | usage,
+    mappedAtCreation: false,
+    label: label || `empty_${size}`,
+  });
+  return recordBufferAllocation(buffer, alignedSize, label);
+}
+
+/**
+ * Read back buffer contents to CPU.
+ */
+async function readBuffer(device, buffer, size) {
+  const staging = device.createBuffer({
+    size,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+  const encoder = device.createCommandEncoder();
+  encoder.copyBufferToBuffer(buffer, 0, staging, 0, size);
+  device.queue.submit([encoder.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const result = new Float32Array(staging.getMappedRange().slice(0));
+  staging.unmap();
+  staging.destroy();
+  return result;
+}
+
+// Device refusal/lifetime mechanism adapted from Kaminos models/trellis2/device-memory.js
+// at 5c9a2fc2939e0a28ac3560a1e9108e81ba245fa7. CPU reservations cover explicit
+// loader allocations, not released-but-uncollected JS backing, metadata, fetch,
+// driver-private memory, textures, or total physical RAM. No capacity is inferred.
+const authenticated = new WeakSet();
+const controllers = new WeakMap();
+const devices = new WeakSet();
+const bytes = (value, name) => {
+  if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be nonnegative safe-integer bytes`);
+  return value;
+};
+const isLoaderMemoryBudget = value => authenticated.has(value);
+
+function createLoaderMemoryBudget({cpuBytes, gpuBytes, totalBytes=cpuBytes+gpuBytes, parentBudget} = {}) {
+  bytes(cpuBytes, 'cpuBytes'); bytes(gpuBytes, 'gpuBytes');
+  bytes(totalBytes,'totalBytes');
+  if (parentBudget !== undefined && !authenticated.has(parentBudget)) throw new TypeError('authenticated parent loader budget required');
+  const parent = parentBudget === undefined ? null : controllers.get(parentBudget);
+  parent?.assertActive();
+  const cpu = {liveBytes:0, peakLiveBytes:0, maxBytes:cpuBytes}, gpu = {liveBytes:0, peakLiveBytes:0, maxBytes:gpuBytes};
+  let peakCombinedBytes=0;
+  const events = [], buffers = new Map(), unresolvedAllocations = new Set();
+  let phase = 'new', refusal = null, device, originalCreate, originalTexture, originalDestroy, wrappedCreate, wrappedTexture, wrappedDestroy, restored = false;
+  let acquiring = false, acquiredHere = false, unresolvedAcquisition = false;
+  const emit = (kind, details) => events.push({kind, phase, atMs:performance.now(), ...details});
+  const refuse = (ledger, size, label, scope) => {
+    bytes(size, 'requestedBytes');
+    if (size <= ledger.maxBytes - ledger.liveBytes) return;
+    refusal = {scope, phase, label, requestedBytes:size, liveBytes:ledger.liveBytes, maxBytes:ledger.maxBytes};
+    emit('allocation-refused', refusal);
+    const error = new Error(`SF3D ${scope} budget exceeded before allocation: ${ledger.liveBytes} + ${size} > ${ledger.maxBytes}`);
+    error.name = 'SF3DMemoryBudgetError'; error.memoryBudget = refusal; throw error;
+  };
+  const charge = (ledger, size, label, scope) => {
+    ledger.liveBytes += size; ledger.peakLiveBytes = Math.max(ledger.peakLiveBytes, ledger.liveBytes);
+    emit('reserved', {scope, label, bytes:size, liveBytes:ledger.liveBytes});
+    let released = false;
+    return Object.freeze({release() {
+      if (released) return; released = true; ledger.liveBytes -= size;
+      emit('retirement-requested', {scope, label, bytes:size, liveBytes:ledger.liveBytes});
+    }});
+  };
+  const assertActive = () => {
+    if (restored) throw new Error('loader budget is restored');
+    if (unresolvedAcquisition) throw new Error('device acquisition cleanup is unresolved');
+    parent?.assertActive();
+  };
+  const reserve = (scope, size, label) => {
+    assertActive();
+    const ledger = scope === 'cpu-loader' ? cpu : gpu;
+    refuse(ledger, size, label, scope);
+    refuse({liveBytes:cpu.liveBytes+gpu.liveBytes,maxBytes:totalBytes},size,label,'unified-explicit');
+    // No allocator runs until every ancestor has charged the same resource.
+    // These are nested views of one allowance, not additive RAM discovery.
+    const parentLease = parent?.reserve(scope, size, label);
+    const lease = charge(ledger, size, label, scope);
+    peakCombinedBytes=Math.max(peakCombinedBytes,cpu.liveBytes+gpu.liveBytes);
+    let released = false;
+    return Object.freeze({release() {
+      if (released) return; released = true;
+      lease.release(); parentLease?.release();
+    }});
+  };
+  const budget = Object.freeze({
+    events,
+    setPhase(value) { phase = String(value); },
+    reserveCpu(size, label) {
+      return reserve('cpu-loader', size, label);
+    },
+    // A host may reserve an explicitly sized non-buffer GPU store before its
+    // own allocator. It owns retirement of this lease; this is not automatic
+    // texture discovery or driver-backing measurement.
+    reserveGpu(size, label) {
+      return reserve('gpu-buffer', size, label);
+    },
+    assertDevice(value) {
+      if (!device || restored || value !== device || device.createBuffer !== wrappedCreate || device.destroy !== wrappedDestroy || (wrappedTexture && device.createTexture!==wrappedTexture))
+        throw new Error('loader budget must be installed on this exact owned device');
+    },
+    assertDeviceAcquiredHere(value) {
+      assertActive();
+      budget.assertDevice(value);
+      if (!acquiredHere) throw new Error('host device must be requested through the budget; earlier acquisition baseline is unaccounted');
+    },
+    // Request and install before exposing the fresh device to a host. Binding
+    // an existing device remains useful for owned loader tests, but cannot
+    // certify allocations that happened before the hook was installed.
+    async requestOwnedDevice(adapter, descriptor = {}, options = {}) {
+      assertActive();
+      if (device || acquiring) throw new Error('device already bound or acquisition in progress');
+      if (typeof adapter?.requestDevice !== 'function') throw new TypeError('adapter requestDevice required');
+      acquiring = true;
+      let acquired;
+      try {
+        acquired = await adapter.requestDevice(descriptor);
+        assertActive();
+        budget.bindOwnedDevice(acquired, options);
+        acquiredHere = true;
+        emit('device-acquired', {route:'adapter.requestDevice through loader budget'});
+        return acquired;
+      } catch (error) {
+        if (acquired) {
+          try { acquired.destroy(); }
+          catch (cleanupError) {
+            unresolvedAcquisition = true;
+            emit('device-acquisition-cleanup-unresolved', {message:String(cleanupError?.message ?? cleanupError)});
+            throw new AggregateError([error, cleanupError], 'device acquisition and cleanup failed', {cause:error});
+          }
+        }
+        throw error;
+      } finally { acquiring = false; }
+    },
+    bindOwnedDevice(value,{textureBytes=null}={}) {
+      assertActive();
+      if (device || restored || devices.has(value)) throw new Error('device already has a loader budget');
+      if (typeof value?.createBuffer !== 'function' || typeof value.destroy !== 'function') throw new TypeError('owned device createBuffer/destroy required');
+      if(textureBytes!==null&&(typeof textureBytes!=='function'||typeof value.createTexture!=='function'))throw new TypeError('host texture estimator and owned allocator required');
+      wrappedTexture=null;
+      originalCreate = value.createBuffer; originalDestroy = value.destroy;
+      originalTexture=value.createTexture;
+      wrappedCreate = function(descriptor) {
+        if (this !== value) throw new Error('budgeted allocator requires the exact owned device');
+        // Pin the authority-bearing size once, including accessor-bearing input.
+        const size = bytes(descriptor?.size, 'GPUBuffer.size'), label = descriptor?.label ?? '';
+        const lease = reserve('gpu-buffer', size, label);
+        let buffer;
+        try { buffer = Reflect.apply(originalCreate, value, [{...descriptor, size, label}]); }
+        catch (error) { lease.release(); throw error; }
+        if (buffers.has(buffer)) { lease.release(); return buffer; }
+        if (buffer?.size !== size || typeof buffer?.destroy !== 'function') {
+          const error = new Error('GPUBuffer size/destroy contract unavailable');
+          try {
+            if (typeof buffer?.destroy !== 'function') throw new Error('actual allocation retirement unavailable');
+            buffer.destroy(); lease.release();
+          } catch (cleanupError) {
+            unresolvedAllocations.add(lease);
+            throw new AggregateError([error,cleanupError],'GPUBuffer contract and cleanup failed',{cause:error});
+          }
+          throw error;
+        }
+        const destroy = buffer.destroy;
+        buffers.set(buffer, {lease, destroy});
+        try {
+          const wrapped = function(...args) {
+            const result = Reflect.apply(destroy, this, args), row = buffers.get(this);
+            if (row) {
+              // Already-destroyed objects keep an inert idempotent hook; only
+              // live/unresolved hooks need whole-budget restoration.
+              row.lease.release(); buffers.delete(this);
+            }
+            return result;
+          };
+          buffer.destroy = wrapped;
+          if (buffer.destroy !== wrapped) throw new Error('GPUBuffer retirement hook installation failed');
+        } catch (error) {
+          // createBuffer succeeded before instrumentation failed. Retire the
+          // actual buffer; if retirement fails, keep its charge until device
+          // destruction rather than inventing reclaimed backing.
+          try { Reflect.apply(destroy,buffer,[]); lease.release(); buffers.delete(buffer); }
+          catch (cleanupError) { throw new AggregateError([error,cleanupError],'GPUBuffer retirement hook and cleanup failed',{cause:error}); }
+          throw error;
+        }
+        return buffer;
+      };
+      if(textureBytes)wrappedTexture=function(descriptor){
+        if(this!==value)throw Error('budgeted texture allocator requires the exact owned device');
+        const plan=textureBytes(descriptor),size=bytes(plan?.bytes,'explicit GPUTexture bytes');
+        if(!plan?.descriptor||typeof plan.descriptor!=='object')throw Error('pinned host texture descriptor required');
+        const label=plan.descriptor.label??'',lease=reserve('gpu-buffer',size,label);
+        let texture;
+        try{texture=Reflect.apply(originalTexture,value,[plan.descriptor]);}catch(error){lease.release();throw error;}
+        if(buffers.has(texture)){lease.release();return texture;}
+        const destroy=texture?.destroy;
+        if(typeof destroy!=='function'){unresolvedAllocations.add(lease);throw Error('GPUTexture retirement contract unavailable');}
+        buffers.set(texture,{lease,destroy});
+        try{
+          const wrapped=function(...args){
+            const result=Reflect.apply(destroy,this,args),row=buffers.get(this);
+            if(row){
+              row.lease.release();buffers.delete(this);
+            }
+            return result;
+          };
+          texture.destroy=wrapped;if(texture.destroy!==wrapped)throw Error('GPUTexture retirement hook installation failed');
+        }catch(error){
+          try{Reflect.apply(destroy,texture,[]);lease.release();buffers.delete(texture);}
+          catch(cleanupError){throw new AggregateError([error,cleanupError],'GPUTexture hook and cleanup failed',{cause:error});}
+          throw error;
+        }
+        emit('host-texture-allocated',{label,bytes:size,descriptor:plan.descriptor,
+          effective:{width:texture.width,height:texture.height,depthOrArrayLayers:texture.depthOrArrayLayers,format:texture.format,mipLevelCount:texture.mipLevelCount,sampleCount:texture.sampleCount}});
+        return texture;
+      };
+      wrappedDestroy = function(...args) {
+        const result = Reflect.apply(originalDestroy, this, args);
+        if (this === value) {
+          for (const row of buffers.values()) row.lease.release();
+          for (const lease of unresolvedAllocations) lease.release();
+          unresolvedAllocations.clear();
+        }
+        return result;
+      };
+      try {
+        value.createBuffer = wrappedCreate; value.destroy = wrappedDestroy;if(wrappedTexture)value.createTexture=wrappedTexture;
+        if (value.createBuffer !== wrappedCreate || value.destroy !== wrappedDestroy || (wrappedTexture&&value.createTexture!==wrappedTexture)) throw new Error('device budget installation failed');
+      } catch (error) { value.createBuffer = originalCreate; value.destroy = originalDestroy;if(wrappedTexture)value.createTexture=originalTexture;throw error; }
+      device = value; devices.add(value); return budget;
+    },
+    snapshot() {
+      return {schema:'sf3d.loader-memory-budget.v0', phase, refusal,
+        deviceAcquisition:acquiredHere?'requested-through-budget':device?'bound-after-acquisition':'unbound',
+        unresolvedAcquisitionCleanup:unresolvedAcquisition,
+        accounting:'own and descendant explicit reservations; nested ledgers are not additive physical RAM',
+        parentAllowance:parent ? {cpuBytes:parent.cpuBytes,gpuBytes:parent.gpuBytes,totalBytes:parent.totalBytes} : null,
+        total:{liveBytes:cpu.liveBytes+gpu.liveBytes,peakLiveBytes:peakCombinedBytes,maxBytes:totalBytes,physicalMemoryMeasured:false,
+          meaning:'combined explicit CPU/GPU stores, not total unified physical memory'},
+        cpu:{...cpu, physicalMemoryMeasured:false, meaning:'explicit loader reservations; retirement is not proven GC'},
+        gpu:{...gpu, physicalMemoryMeasured:false, meaning:wrappedTexture?'API-visible buffers and declared logical texture stores; not reclaimed physical backing':'API-visible buffers; destruction request is not reclaimed physical backing'},
+        hostTextures:wrappedTexture?'explicit caller-estimated logical texture stores; not physical backing':'not tracked',
+        excludes:['JS/parse metadata', 'released JS backing before GC', 'network/browser/driver-private backing', ...(wrappedTexture?['texture padding/private backing']:['textures']), 'other processes']};
+    },
+    restore() {
+      if (restored) return;
+      if (unresolvedAcquisition) throw new Error('device acquisition cleanup is unresolved');
+      if (cpu.liveBytes || gpu.liveBytes) throw new Error('retire loader allocations before restoring the budget');
+      if (device) {
+        device.createBuffer = originalCreate; device.destroy = originalDestroy;
+        if(wrappedTexture)device.createTexture=originalTexture;
+        for (const [buffer, row] of buffers) buffer.destroy = row.destroy;
+        devices.delete(device); buffers.clear();
+      }
+      restored = true;
+    },
+  });
+  controllers.set(budget,{assertActive,reserve,cpuBytes,gpuBytes,totalBytes});
+  authenticated.add(budget); return budget;
+}
+
+// Flat-v1 source adapter. Kit 0.1.52 chunks upload unchanged bytes and its
+// verified custody does not expose a conversion hook. Keep SF3D's existing
+// mixed-F16/F32 conversion; do not mislabel packed F16 as an F32 kit bundle.
+// Explicit reservations are not a bound on network, GC or driver backing.
+const ENTRY_SIZE$1=160, MAGIC$1=0x33445346;
+
+function parseFlatWeightHeader(buffer, totalBytes=Infinity) {
+  const view=new DataView(buffer);
+  if(buffer.byteLength<16 || view.getUint32(0,true)!==MAGIC$1)throw Error('Invalid weight file magic/header');
+  if(view.getUint32(4,true)!==1)throw Error('Unsupported weight file version');
+  const count=view.getUint32(8,true),headerSize=view.getUint32(12,true);
+  if(headerSize!==16+count*ENTRY_SIZE$1 || headerSize!==buffer.byteLength || headerSize>totalBytes)
+    throw Error('weight header exceeds or contradicts received bytes');
+  const tensors=new Map(), intervals=[];
+  for(let i=0;i<count;i++){
+    const off=16+i*ENTRY_SIZE$1,bytes=new Uint8Array(buffer,off,128),end=bytes.indexOf(0);
+    const name=new TextDecoder('utf-8',{fatal:true}).decode(bytes.subarray(0,end<0?128:end));
+    const dtype=view.getUint32(off+128,true),rank=view.getUint32(off+132,true);
+    // The canonical converter records the full rank but stores four axes only.
+    // Never read the offset/size fields as axes or invent the omitted axes.
+    const shape=Array.from({length:Math.min(rank,4)},(_,d)=>view.getUint32(off+136+4*d,true));
+    const offset=headerSize+view.getUint32(off+152,true),size=view.getUint32(off+156,true),width=dtype===0?4:2;
+    if(!name || tensors.has(name) || (dtype!==0 && dtype!==1) || size===0 || size%width || offset%width || offset+size>totalBytes)
+      throw Error('invalid/duplicate/out-of-bounds flat tensor: '+name);
+    if(rank<=4 && shape.reduce((n,d)=>n*d,1)*width!==size)throw Error('tensor shape/size conflict: '+name);
+    tensors.set(name,{dtype,shape,declaredRank:rank,shapeComplete:rank<=4,offset,size});
+    intervals.push({name,offset,size});
+  }
+  intervals.sort((a,b)=>a.offset-b.offset);
+  for(let i=1;i<intervals.length;i++)if(intervals[i].offset<intervals[i-1].offset+intervals[i-1].size)
+    throw Error('overlapping flat tensors: '+intervals[i].name);
+  return {tensors,headerSize};
+}
+
+async function createFlatTensorRangeSource(url,{memoryBudget,expectedWeightBytes,expectedSourceETag,onProgress,onBeforeSourceIntake}={}) {
+  if(!Number.isSafeInteger(expectedWeightBytes) || expectedWeightBytes<16)throw TypeError('explicit expectedWeightBytes required');
+  if(typeof expectedSourceETag!=='string' || !/^"[^"\r\n]+"$/.test(expectedSourceETag))
+    throw TypeError('explicit strong expectedSourceETag required');
+  if(onBeforeSourceIntake!==undefined&&typeof onBeforeSourceIntake!=='function')
+    throw TypeError('source intake admission callback must be a function');
+  const report={mode:'tensor-ranges',sourceUrl:String(url),sourceETag:expectedSourceETag,expectedWeightBytes,
+    sourceIdentityAuthority:'HTTP strong ETag/If-Match plus exact ranges; not an independently verified whole-artifact digest',
+    maximumSourceUnitBytes:0,receivedBytes:0,ranges:[],physicalMemoryMeasured:false};
+  const read=async (offset,size,label,consume=null)=>{
+    if(label==='weight-header-prefix'||label==='weight-header')await onBeforeSourceIntake?.({
+      name:label,tensors:[],storageKind:'cpu-source',sourceOffset:offset,sourceUnitBytes:size,
+      rangeCpuBytes:2*size,workGpuBytes:0,requiredBytes:2*size,
+      authority:'identified destination plus response unit; not network/GC physical-fit authority'});
+    memoryBudget.setPhase(label);
+    // Own destination and allow an entire requested response unit concurrently.
+    // Reserve both BEFORE fetch; overlong server data is rejected, never appended.
+    let lease,receiveLease,reader;
+    try{
+      lease=memoryBudget.reserveCpu(size,label+':destination');
+      receiveLease=memoryBudget.reserveCpu(size,label+':response');
+      const bytes=consume?null:new Uint8Array(size),end=offset+size-1;
+      const response=await fetch(url,{headers:{Range:`bytes=${offset}-${end}`,'If-Match':expectedSourceETag},cache:'no-store'});
+      reader=response.body?.getReader();
+      if(response.status!==206 || response.headers.get('etag')!==expectedSourceETag ||
+        response.headers.get('content-range')!==`bytes ${offset}-${end}/${expectedWeightBytes}` ||
+        (response.headers.has('content-length') && Number(response.headers.get('content-length'))!==size) || !reader)
+        throw Error('weight range response/source identity mismatch (206, exact range/length and strong ETag required)');
+      let received=0;
+      while(true){
+        const {done,value}=await reader.read();if(done)break;
+        if(!(value instanceof Uint8Array) || value.length>size-received)throw Error('weight range bytes exceed requested unit');
+        if(consume)await consume(value,received);
+        else bytes.set(value,received);
+        received+=value.length;
+      }
+      if(received!==size)throw Error('weight range bytes truncated');
+      report.maximumSourceUnitBytes=Math.max(report.maximumSourceUnitBytes,size);
+      report.receivedBytes+=received;report.ranges.push({label,offset,size});
+      onProgress?.(report.receivedBytes,expectedWeightBytes);
+      const destinationLease=lease;
+      const result={bytes,release:()=>destinationLease.release()};lease=null;
+      return result;
+    }finally{
+      lease?.release();receiveLease?.release();
+      try{await reader?.cancel();}catch{}try{reader?.releaseLock();}catch{}
+    }
+  };
+  const prefix=await read(0,16,'weight-header-prefix');
+  let headerSize;
+  try{
+    const view=new DataView(prefix.bytes.buffer),count=view.getUint32(8,true);
+    headerSize=view.getUint32(12,true);
+    if(view.getUint32(0,true)!==MAGIC$1 || view.getUint32(4,true)!==1 || headerSize!==16+count*ENTRY_SIZE$1 || headerSize>expectedWeightBytes)
+      throw Error('invalid flat weight header prefix');
+  }finally{prefix.release();prefix.bytes=null;}
+  const header=await read(0,headerSize,'weight-header');
+  let tensors;
+  try{({tensors}=parseFlatWeightHeader(header.bytes.buffer,expectedWeightBytes));}
+  finally{header.release();header.bytes=null;}
+  report.headerBytes=headerSize;report.tensorCount=tensors.size;
+  report.incompleteShapeNames=[...tensors].filter(([,info])=>!info.shapeComplete).map(([name])=>name);
+  return {tensors,report,consumeTensor:async(name,consume)=>{
+    if(typeof consume!=='function')throw TypeError('complete tensor stream consumer required');
+    const info=tensors.get(name);if(!info)throw Error('Missing weight: '+name);
+    const unit=await read(info.offset,info.size,'weight-tensor:'+name,consume);
+    unit.release();
+  },readTensor:async name=>{
+    const info=tensors.get(name);if(!info)throw Error('Missing weight: '+name);
+    return read(info.offset,info.size,'weight-tensor:'+name);
+  }};
+}
+
+/**
+ * weights.js — Load SF3D weights from flat binary format.
+ *
+ * Binary format (from convert_weights.py):
+ *   Header: 4 (magic) + 4 (version) + 4 (num_tensors) + 4 (header_size) = 16 bytes
+ *   Tensor table: num_tensors × 160 bytes each
+ *     128 bytes: name (null-padded ASCII)
+ *     4 bytes: dtype (0=fp32, 1=fp16)
+ *     4 bytes: ndim
+ *     16 bytes: shape (4 x u32)
+ *     4 bytes: offset
+ *     4 bytes: size
+ *   Weight data: packed tensors
+ */
+
+
+const MAGIC = 0x33445346; // "SF3D" in little-endian
+const ENTRY_SIZE = 160;
+
+function parseHeader(buffer) {
+  const view = new DataView(buffer);
+  const magic = view.getUint32(0, true);
+  if (magic !== MAGIC) {
+    throw new Error(`Invalid weight file magic: 0x${magic.toString(16)} (expected 0x${MAGIC.toString(16)})`);
+  }
+  const version = view.getUint32(4, true);
+  if (version !== 1) throw new Error(`Unsupported weight file version: ${version}`);
+
+  const numTensors = view.getUint32(8, true);
+  const headerSize = view.getUint32(12, true);
+
+  const tensors = new Map();
+  for (let i = 0; i < numTensors; i++) {
+    const off = 16 + i * ENTRY_SIZE;
+    const nameBytes = new Uint8Array(buffer, off, 128);
+    let nameEnd = nameBytes.indexOf(0);
+    if (nameEnd === -1) nameEnd = 128;
+    const name = new TextDecoder().decode(nameBytes.slice(0, nameEnd));
+
+    const dtype = view.getUint32(off + 128, true);
+    const ndim = view.getUint32(off + 132, true);
+    const shape = [];
+    for (let d = 0; d < ndim; d++) {
+      shape.push(view.getUint32(off + 136 + d * 4, true));
+    }
+    const dataOffset = view.getUint32(off + 152, true);
+    const size = view.getUint32(off + 156, true);
+    tensors.set(name, { dtype, shape, offset: dataOffset + headerSize, size });
+  }
+
+  return { tensors, headerSize };
+}
+
+function fp16ToFp32(h) {
+  const sign = (h >> 15) & 1;
+  const exp = (h >> 10) & 0x1f;
+  const mant = h & 0x3ff;
+  if (exp === 0) {
+    if (mant === 0) return sign ? -0 : 0.0;
+    let val = mant / 1024.0 * Math.pow(2, -14);
+    return sign ? -val : val;
+  }
+  if (exp === 31) return mant === 0 ? (sign ? -Infinity : Infinity) : NaN;
+  const val = Math.pow(2, exp - 15) * (1 + mant / 1024.0);
+  return sign ? -val : val;
+}
+
+function allocateCpu(context, size, label, make, leases = context?.ownedCpu) {
+  const lease = context?.budget.reserveCpu(size, label);
+  try { const value = make(); if (lease) leases.add(lease); return value; }
+  catch (error) { lease?.release(); throw error; }
+}
+
+function cpuScope(context, work) {
+  const temporary = new Set();
+  try { return work(context ? {...context, temporary} : null); }
+  finally { for (const lease of temporary) lease.release(); }
+}
+
+function retireOwnedBuffers(buffers) {
+  const errors=[];
+  for(const buffer of buffers) {
+    try { buffer.destroy(); buffers.delete(buffer); }
+    catch(error) { errors.push(error); }
+  }
+  return errors;
+}
+
+function extractTensor(device, buffer, info, context) {
+  return cpuScope(context, scoped => {
+  const { dtype, offset, size } = info;
+  const raw = extractBytes(buffer, offset, size, scoped);
+  if (dtype === 0) {
+    // fp32 — raw bytes are already float32
+    const fp32 = new Float32Array(raw.buffer, raw.byteOffset, size / 4);
+    return createStorageBuffer(device, fp32);
+  } else {
+    const fp16 = new Uint16Array(raw.buffer, raw.byteOffset, size / 2);
+    // Keep the existing conversion/mapped-upload allowance and fresh physical
+    // guards, but initialize the actual mapped GPU destination directly.
+    // Do not materialize another full FP32 CPU array merely to copy it here.
+    const lease=scoped?.budget.reserveCpu(fp16.length*4,'fp16-conversion');
+    if(lease)scoped.temporary.add(lease);
+    return createMappedStorageBuffer(device,fp16.length*4,mapped=>{
+      const fp32=new Float32Array(mapped);
+      for(let i=0;i<fp16.length;i++)fp32[i]=fp16ToFp32(fp16[i]);
+    },{ownedBuffers:scoped?.ownedBuffers??null});
+  }
+  });
+}
+
+function extractTensorCPU(buffer, info, context) {
+  return cpuScope(context, scoped => {
+  const { dtype, offset, size } = info;
+  const raw = extractBytes(buffer, offset, size, scoped);
+  if (dtype === 0) {
+    const fp32 = new Float32Array(raw.buffer, raw.byteOffset, size / 4);
+    return allocateCpu(scoped, size, 'cpu-tensor-copy', () => new Float32Array(fp32));
+  }
+  const fp16 = new Uint16Array(raw.buffer, raw.byteOffset, size / 2);
+  const fp32 = allocateCpu(scoped, fp16.length * 4, 'cpu-fp16-conversion', () => new Float32Array(fp16.length));
+  for (let i = 0; i < fp16.length; i++) fp32[i] = fp16ToFp32(fp16[i]);
+  return fp32;
+  });
+}
+
+/**
+ * Extract a byte range from the chunked buffer.
+ * Returns a Uint8Array view if the range falls within a single chunk,
+ * otherwise copies into a new buffer (only for tensors that span chunk boundaries).
+ */
+/** Families read lazily through the raw accessors after load (CLIP estimator, CPU heads). */
+const LAZILY_READ_TENSOR_PREFIXES = Object.freeze(['image_estimator.']);
+
+/**
+ * After the eager builders have uploaded their tensors, copy out only the
+ * tensors that will still be read lazily (retainPrefixes) or were never
+ * consumed, then release the streamed chunks so ~2 GB of JS heap can go.
+ * Returns { retained: Map<name, Uint8Array copy>, rawBytes(name), retainedBytes, droppedBytes }.
+ */
+function compactRetainedTensors(tensors, chunkedBuffer, consumed, retainPrefixes = LAZILY_READ_TENSOR_PREFIXES, context = null) {
+  const retained = new Map();
+  let disposed = false;
+  let retainedBytes = 0;
+  let droppedBytes = 0;
+  for (const [name, info] of tensors) {
+    const keep = !consumed.has(name) || retainPrefixes.some(prefix => name.startsWith(prefix));
+    if (keep) {
+      retained.set(name, cpuScope(context, scoped => {
+        const raw = extractBytes(chunkedBuffer, info.offset, info.size, scoped);
+        return allocateCpu(scoped, info.size, 'retained-raw-copy', () => raw.slice());
+      }));
+      retainedBytes += info.size;
+    } else {
+      droppedBytes += info.size;
+    }
+  }
+  if (Array.isArray(chunkedBuffer?.chunks)) { chunkedBuffer.chunks.length = 0; chunkedBuffer.offsets.length = 0; }
+  const rawBytes = (name) => {
+    if (disposed) throw new Error('SF3D weights are disposed');
+    const bytes = retained.get(name);
+    if (!bytes) {
+      throw new Error(tensors.has(name)
+        ? `tensor ${name} was uploaded at load and its raw bytes were released; lazy raw access covers ${retainPrefixes.join(', ')}`
+        : `Missing weight: ${name}`);
+    }
+    return bytes;
+  };
+  return {
+    retained, rawBytes, retainedBytes, droppedBytes,
+    dispose() { disposed = true; retained.clear(); },
+  };
+}
+
+function extractBytes(chunkedBuffer, offset, size, context = null) {
+  if (chunkedBuffer instanceof ArrayBuffer) {
+    // Legacy single-buffer path
+    return new Uint8Array(chunkedBuffer, offset, size);
+  }
+  // chunkedBuffer is { chunks, offsets, totalSize }
+  const { chunks, offsets } = chunkedBuffer;
+
+  // Find the first chunk that contains the start
+  let startChunk = -1;
+  for (let i = 0; i < offsets.length; i++) {
+    if (offsets[i] + chunks[i].length > offset) { startChunk = i; break; }
+  }
+  if (startChunk === -1) {
+    throw new Error(`Weight data offset ${offset} (size ${size}) is beyond end of file (${chunkedBuffer.totalSize} bytes)`);
+  }
+
+  const localOffset = offset - offsets[startChunk];
+  // Check if entirely within this chunk
+  if (localOffset + size <= chunks[startChunk].length) {
+    // Ensure 4-byte alignment for typed array views (Float32Array, Uint16Array)
+    const chunkBaseOffset = chunks[startChunk].byteOffset + localOffset;
+    if (chunkBaseOffset % 4 !== 0) {
+      const copy = allocateCpu(context, size, 'aligned-tensor-copy', () => new Uint8Array(size), context?.temporary);
+      copy.set(chunks[startChunk].subarray(localOffset, localOffset + size));
+      return copy;
+    }
+    return chunks[startChunk].subarray(localOffset, localOffset + size);
+  }
+
+  // Spans multiple chunks — copy into aligned buffer
+  const result = allocateCpu(context, size, 'cross-chunk-tensor-copy', () => new Uint8Array(size), context?.temporary);
+  let written = 0;
+  for (let i = startChunk; i < chunks.length && written < size; i++) {
+    const chunkStart = Math.max(0, offset + written - offsets[i]);
+    const avail = chunks[i].length - chunkStart;
+    const take = Math.min(avail, size - written);
+    result.set(chunks[i].subarray(chunkStart, chunkStart + take), written);
+    written += take;
+  }
+  return result;
+}
+
+/**
+ * Load SF3D weights and organize into component structure.
+ */
+async function loadWeights(device, url, onProgress, {memoryBudget = null, expectedWeightBytes, loadingMode='whole-file', expectedSourceETag} = {}) {
+  if (memoryBudget && !isLoaderMemoryBudget(memoryBudget)) throw new TypeError('authenticated loader budget required');
+  if (memoryBudget && (!Number.isSafeInteger(expectedWeightBytes) || expectedWeightBytes < 16))
+    throw new TypeError('budgeted load requires explicit expectedWeightBytes');
+  memoryBudget?.assertDevice(device);
+  if(loadingMode==='tensor-ranges')return loadRangeWeights(device,url,onProgress,{memoryBudget,expectedWeightBytes,expectedSourceETag});
+  if(loadingMode!=='whole-file')throw TypeError('unknown weight loadingMode');
+  memoryBudget?.setPhase('weight-source');
+  const ownedCpu = new Set(), ownedBuffers = new Set(), context = memoryBudget ? {budget:memoryBudget, ownedCpu} : null;
+  // This reservation precedes fetch, not just append of already allocated chunks.
+  const sourceLease = memoryBudget?.reserveCpu(expectedWeightBytes, 'weight-source');
+  let reader;
+  try {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Failed to fetch weights: ${response.status}`);
+
+  const contentLength = parseInt(response.headers.get('content-length') || '0');
+  if (memoryBudget && response.headers.has('content-length') && Number(response.headers.get('content-length')) !== expectedWeightBytes)
+    throw new Error('weight content length differs from expectedWeightBytes');
+  reader = response.body.getReader();
+  const chunks = [];
+  const chunkOffsets = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (memoryBudget && value.length > expectedWeightBytes - received) throw new Error('weight bytes exceed expectedWeightBytes');
+    chunkOffsets.push(received);
+    chunks.push(value);
+    received += value.length;
+    if (onProgress) onProgress(received, contentLength);
+  }
+  if (memoryBudget && received !== expectedWeightBytes) throw new Error('weight bytes differ from expectedWeightBytes');
+
+  // Build a chunked buffer that avoids a single >2GB ArrayBuffer
+  const chunkedBuffer = { chunks, offsets: chunkOffsets, totalSize: received };
+
+  // Read the exact declared table rather than copying a fixed 1-MiB prefix.
+  const {tensors} = cpuScope(context, scoped => {
+    const prefix = extractBytes(chunkedBuffer, 0, 16, scoped);
+    const view = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
+    const count = view.getUint32(8, true), headerSize = view.getUint32(12, true);
+    if (headerSize !== 16 + count * ENTRY_SIZE || headerSize > received) throw new Error('weight header exceeds or contradicts received bytes');
+    const header = extractBytes(chunkedBuffer, 0, headerSize, scoped);
+    return parseHeader(allocateCpu(scoped, headerSize, 'weight-header-copy', () => header.slice().buffer, scoped?.temporary));
+  });
+  memoryBudget?.setPhase('weight-construction');
+    return buildWeightSet(device, chunkedBuffer, tensors, ownedBuffers, context);
+  } catch (error) {
+    // No weight set is returned on a partial load; its allocations still have
+    // an owner and must not wait for a producer that will never be created.
+    const cleanupErrors=retireOwnedBuffers(ownedBuffers);
+    for (const lease of ownedCpu) lease.release();
+    if(cleanupErrors.length)throw new AggregateError([error,...cleanupErrors],'SF3D load failed and partial cleanup encountered failures',{cause:error});
+    throw error;
+  } finally { sourceLease?.release(); await reader?.cancel().catch(() => {}); }
+}
+
+function buildWeightSet(device, chunkedBuffer, tensors, ownedBuffers, context = null, staged = null) {
+  const upload = (buffer, info) => {
+    const gpuBuffer = extractTensor(device, buffer, info, context);
+    ownedBuffers.add(gpuBuffer);
+    return gpuBuffer;
+  };
+  const consumed = new Set();
+  const get = (name) => {
+    const info = tensors.get(name);
+    if (!info) throw new Error(`Missing weight: ${name}`);
+    consumed.add(name);
+    return staged?.references ? staged.references(name) : staged?.dryRun ? {} : staged ? staged.buffers.get(name) : upload(chunkedBuffer, info);
+  };
+
+  const tryGet = (name) => {
+    const info = tensors.get(name);
+    if (!info) return null;
+    consumed.add(name);
+    return staged?.references ? staged.references(name) : staged?.dryRun ? {} : staged ? staged.buffers.get(name) : upload(chunkedBuffer, info);
+  };
+
+  // === Image Tokenizer (DINOv2 ViT-Large with modulation) ===
+  const imageTokenizer = {
+    imageMean: get('image_tokenizer.image_mean'),
+    imageStd: get('image_tokenizer.image_std'),
+    patchEmbed: {
+      weight: get('image_tokenizer.model.embeddings.patch_embeddings.projection.weight'),
+      bias: get('image_tokenizer.model.embeddings.patch_embeddings.projection.bias'),
+    },
+    clsToken: get('image_tokenizer.model.embeddings.cls_token'),
+    posEmbed: get('image_tokenizer.model.embeddings.position_embeddings'),
+    layernorm: {
+      weight: get('image_tokenizer.model.layernorm.weight'),
+      bias: get('image_tokenizer.model.layernorm.bias'),
+    },
+    blocks: [],
+  };
+
+  // 24 DINOv2 transformer blocks with AdaNorm modulation
+  for (let l = 0; l < 24; l++) {
+    const p = `image_tokenizer.model.encoder.layer.${l}`;
+    imageTokenizer.blocks.push({
+      norm1: { weight: get(`${p}.norm1.weight`), bias: get(`${p}.norm1.bias`) },
+      attn: {
+        q: { weight: get(`${p}.attention.attention.query.weight`), bias: get(`${p}.attention.attention.query.bias`) },
+        k: { weight: get(`${p}.attention.attention.key.weight`), bias: get(`${p}.attention.attention.key.bias`) },
+        v: { weight: get(`${p}.attention.attention.value.weight`), bias: get(`${p}.attention.attention.value.bias`) },
+        proj: { weight: get(`${p}.attention.output.dense.weight`), bias: get(`${p}.attention.output.dense.bias`) },
+      },
+      layerScale1: get(`${p}.layer_scale1.lambda1`),
+      norm2: { weight: get(`${p}.norm2.weight`), bias: get(`${p}.norm2.bias`) },
+      mlp: {
+        fc1: { weight: get(`${p}.mlp.fc1.weight`), bias: get(`${p}.mlp.fc1.bias`) },
+        fc2: { weight: get(`${p}.mlp.fc2.weight`), bias: get(`${p}.mlp.fc2.bias`) },
+      },
+      layerScale2: get(`${p}.layer_scale2.lambda1`),
+      // AdaNorm modulation from camera embeddings
+      norm1Mod: { weight: get(`${p}.norm1_modulation.linear2.weight`), bias: get(`${p}.norm1_modulation.linear2.bias`) },
+      norm2Mod: { weight: get(`${p}.norm2_modulation.linear2.weight`), bias: get(`${p}.norm2_modulation.linear2.bias`) },
+    });
+  }
+
+  // === Camera Embedder ===
+  const cameraEmbedder = {
+    weight: get('camera_embedder.linear.weight'),
+    bias: get('camera_embedder.linear.bias'),
+  };
+
+  // === Triplane Tokenizer ===
+  const tokenizer = {
+    embeddings: get('tokenizer.embeddings'), // [3, 1024, 96, 96]
+  };
+
+  // === Two-Stream Backbone ===
+  const backbone = {
+    latentInit: get('backbone.latent_init'),         // [1, 1792, 1024]
+    normTriplane: { weight: get('backbone.norm_triplane.weight'), bias: get('backbone.norm_triplane.bias') },
+    projTriplane: { weight: get('backbone.proj_triplane.weight'), bias: get('backbone.proj_triplane.bias') },
+    normImage: { weight: get('backbone.norm_image.weight'), bias: get('backbone.norm_image.bias') },
+    projImage: { weight: get('backbone.proj_image.weight'), bias: get('backbone.proj_image.bias') },
+    normLatent: { weight: get('backbone.norm_latent.weight'), bias: get('backbone.norm_latent.bias') },
+    projLatent: { weight: get('backbone.proj_latent.weight'), bias: get('backbone.proj_latent.bias') },
+    projOut: { weight: get('backbone.proj_out.weight'), bias: get('backbone.proj_out.bias') },
+    mainBlocks: [],
+  };
+
+  // 4 TwoStreamBlocks, each with fuse_block_in, 3 transformer_blocks, fuse_block_out
+  for (let b = 0; b < 4; b++) {
+    const bp = `backbone.main_blocks.${b}`;
+
+    // Helper to load a FuseBlock
+    function loadFuseBlock(prefix) {
+      return {
+        attn: {
+          wq: get(`${prefix}.attn.wq.weight`),
+          wk: get(`${prefix}.attn.wk.weight`),
+          wv: get(`${prefix}.attn.wv.weight`),
+          proj: { weight: get(`${prefix}.attn.proj.weight`), bias: get(`${prefix}.attn.proj.bias`) },
+        },
+        normZ1: { weight: get(`${prefix}.norm_z1.weight`), bias: get(`${prefix}.norm_z1.bias`) },
+        normX: tensors.has(`${prefix}.norm_x.weight`) ? {
+          weight: get(`${prefix}.norm_x.weight`), bias: get(`${prefix}.norm_x.bias`),
+        } : null,
+        normZ2: { weight: get(`${prefix}.norm_z2.weight`), bias: get(`${prefix}.norm_z2.bias`) },
+        ff: {
+          geglu: { weight: get(`${prefix}.ff.net.0.proj.weight`), bias: get(`${prefix}.ff.net.0.proj.bias`) },
+          proj: { weight: get(`${prefix}.ff.net.2.weight`), bias: get(`${prefix}.ff.net.2.bias`) },
+        },
+      };
+    }
+
+    // Helper to load a BasicBlock
+    function loadBasicBlock(prefix) {
+      return {
+        norm1: { weight: get(`${prefix}.norm1.weight`), bias: get(`${prefix}.norm1.bias`) },
+        attn1: {  // self-attention
+          wq: get(`${prefix}.attn1.wq.weight`),
+          wk: get(`${prefix}.attn1.wk.weight`),
+          wv: get(`${prefix}.attn1.wv.weight`),
+          proj: { weight: get(`${prefix}.attn1.proj.weight`), bias: get(`${prefix}.attn1.proj.bias`) },
+        },
+        norm2: { weight: get(`${prefix}.norm2.weight`), bias: get(`${prefix}.norm2.bias`) },
+        attn2: {  // cross-attention (or self if no encoder_hidden_states)
+          wq: get(`${prefix}.attn2.wq.weight`),
+          wk: get(`${prefix}.attn2.wk.weight`),
+          wv: get(`${prefix}.attn2.wv.weight`),
+          proj: { weight: get(`${prefix}.attn2.proj.weight`), bias: get(`${prefix}.attn2.proj.bias`) },
+        },
+        norm3: { weight: get(`${prefix}.norm3.weight`), bias: get(`${prefix}.norm3.bias`) },
+        ff: {
+          geglu: { weight: get(`${prefix}.ff.net.0.proj.weight`), bias: get(`${prefix}.ff.net.0.proj.bias`) },
+          proj: { weight: get(`${prefix}.ff.net.2.weight`), bias: get(`${prefix}.ff.net.2.bias`) },
+        },
+      };
+    }
+
+    backbone.mainBlocks.push({
+      fuseBlockIn: loadFuseBlock(`${bp}.fuse_block_in`),
+      transformerBlocks: [0, 1, 2].map(i => loadBasicBlock(`${bp}.transformer_block.${i}`)),
+      fuseBlockOut: loadFuseBlock(`${bp}.fuse_block_out`),
+    });
+  }
+
+  // === Post-Processor (PixelShuffle) ===
+  const postProcessor = {
+    convLayers: [
+      { weight: get('post_processor.upsample.0.weight'), bias: get('post_processor.upsample.0.bias') },
+      { weight: get('post_processor.upsample.2.weight'), bias: get('post_processor.upsample.2.bias') },
+      { weight: get('post_processor.upsample.4.weight'), bias: get('post_processor.upsample.4.bias') },
+      { weight: get('post_processor.upsample.6.weight'), bias: get('post_processor.upsample.6.bias') },
+    ],
+  };
+
+  // === Decoder (MaterialMLP) ===
+  const decoder = {
+    heads: {},
+  };
+  for (const headName of ['density', 'features', 'perturb_normal', 'vertex_offset']) {
+    const layers = [];
+    for (let i = 0; ; i += 2) {
+      const w = tryGet(`decoder.heads.${headName}.${i}.weight`);
+      const b = tryGet(`decoder.heads.${headName}.${i}.bias`);
+      if (!w) break;
+      layers.push({ weight: w, bias: b });
+    }
+    decoder.heads[headName] = layers;
+  }
+
+  // === Image Estimator (CLIP for roughness/metallic) ===
+  // For v1, we can run this on CPU or skip and use defaults.
+  // Load the estimation heads at minimum.
+  const imageEstimator = {
+    // CLIP visual encoder weights would go here
+    // For now, just load the roughness/metallic prediction heads
+    heads: {},
+  };
+  for (const headName of ['roughness', 'metallic']) {
+    const subLayers = [];
+    for (let sub = 0; sub < 3; sub++) {
+      const layers = [];
+      for (let i = 0; ; i += 2) {
+        const w = tryGet(`image_estimator.heads.${headName}.${sub}.${i}.weight`);
+        const b = tryGet(`image_estimator.heads.${headName}.${sub}.${i}.bias`);
+        if (!w) break;
+        layers.push({ weight: w, bias: b });
+      }
+      if (layers.length > 0) subLayers.push(layers);
+    }
+    imageEstimator.heads[headName] = subLayers;
+  }
+
+  if(staged?.dryRun)return consumed;
+  const components={imageTokenizer,cameraEmbedder,tokenizer,backbone,postProcessor,decoder,imageEstimator};
+  if(staged?.references)return components;
+  console.log(`Loaded ${tensors.size} SF3D tensors from weight file`);
+
+  // Raw tensor access for modules that read weights lazily by name (the CLIP
+  // visual encoder and CPU heads in clip_estimator.js). Only those families
+  // (and anything the builders above did not consume) are kept, as standalone
+  // copies; the streamed chunks are released so the page does not carry the
+  // whole weight file in JS heap for the producer's lifetime.
+  const compact = staged?.compact ?? compactRetainedTensors(tensors, chunkedBuffer, consumed, LAZILY_READ_TENSOR_PREFIXES, context);
+  console.log(`Retained ${(compact.retainedBytes / 1048576).toFixed(0)} MB of raw tensor bytes for lazy readers; released ${(compact.droppedBytes / 1048576).toFixed(0)} MB of streamed chunks`);
+  const lazyBuffers = new Map();
+  let disposed = false;
+  const _assertActive = (requestedDevice = device) => {
+    if (disposed) throw new Error('SF3D weights are disposed');
+    if (requestedDevice !== device) throw new Error('SF3D weights belong to a different GPUDevice');
+  };
+  const rawInfo = (name) => {
+    _assertActive();
+    const info = tensors.get(name);
+    if (!info) throw new Error(`Missing weight: ${name}`);
+    return { dtype: info.dtype, offset: 0, size: info.size };
+  };
+  // Lazy uploads belong to this same weight set. Reuse by tensor name also
+  // makes a partially failed CLIP initialization retry without duplicate GPU
+  // uploads; ownership never moves into the estimator's cache.
+  const _rawGet = (name) => {
+    _assertActive();
+    if (!lazyBuffers.has(name)) {
+      lazyBuffers.set(name, upload(compact.rawBytes(name).buffer, rawInfo(name)));
+    }
+    return lazyBuffers.get(name);
+  };
+  const _rawGetCPU = (name) => {
+    _assertActive();
+    return extractTensorCPU(compact.rawBytes(name).buffer, rawInfo(name), context);
+  };
+  const _rawTryGet = (name) => { _assertActive(); return tensors.has(name) ? _rawGet(name) : null; };
+  const _rawHas = (name) => { _assertActive(); return tensors.has(name); };
+  const dispose = () => {
+    if (disposed && ownedBuffers.size===0) return 0;
+    disposed = true;
+    const count = ownedBuffers.size;
+    const cleanupErrors=retireOwnedBuffers(ownedBuffers);
+    lazyBuffers.clear();
+    compact.dispose();
+    for (const lease of context?.ownedCpu ?? []) lease.release();
+    context?.ownedCpu.clear();
+    if(cleanupErrors.length)throw new AggregateError(cleanupErrors,'SF3D weight cleanup encountered failures');
+    return count;
+  };
+
+  return {
+    ...components,
+    ...(staged ? {loadingReport:staged.report} : {}),
+    dispose,
+    _assertActive,
+    _rawGet,
+    _rawGetCPU,
+    _rawTryGet,
+    _rawHas,
+  };
+}
+
+function rangeLoadContext(device,memoryBudget){
+  if(!isLoaderMemoryBudget(memoryBudget))throw TypeError('tensor-ranges requires authenticated loader budget');
+  memoryBudget.assertDevice(device);
+  const ownedBuffers=new Set(),ownedCpu=new Set();
+  const context={budget:memoryBudget,ownedCpu,ownedBuffers};
+  const cleanup=error=>{
+    const failures=retireOwnedBuffers(ownedBuffers);
+    for(const lease of ownedCpu)lease.release();ownedCpu.clear();
+    if(failures.length)throw new AggregateError(error?[error,...failures]:failures,'SF3D range cleanup encountered failures',{cause:error});
+  };
+  return {ownedBuffers,ownedCpu,context,cleanup};
+}
+
+// Complete conversion into one full GPU operand. The reusable working store
+// changes pacing, not coverage. Keep the existing full expansion allowance;
+// an unresolved queue prefix retains that allowance and exact GPU owner until
+// the actual phase disposer obtains a new successful drain.
+async function uploadRangeFp16(device,bytes,owner){
+  const half=new Uint16Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/2);
+  const expandedBytes=half.length*4;
+  const lease=owner.context.budget.reserveCpu(expandedBytes,'fp16-conversion');
+  owner.ownedCpu.add(lease);
+  const working=new Float32Array(Math.min(half.length,262144));
+  const buffer=createEmptyBuffer(device,expandedBytes,0,'complete-phase-fp16-upload');
+  owner.ownedBuffers.add(buffer);
+  for(let start=0;start<half.length;start+=working.length){
+    const count=Math.min(working.length,half.length-start);
+    for(let i=0;i<count;i++)working[i]=fp16ToFp32(half[start+i]);
+    device.queue.writeBuffer(buffer,start*4,working,0,count);
+    await device.queue.onSubmittedWorkDone();
+  }
+  lease.release();owner.ownedCpu.delete(lease);
+  return buffer;
+}
+
+// Consume the entire authenticated range without a complete raw CPU copy.
+// Packed halves and expanded values share one working backing; expand backward
+// so unread halves survive. Keep all old full-range/conversion declarations.
+async function uploadRangeFp16Source(device,source,name,owner){
+  const info=source.tensors.get(name),expandedBytes=info.size*2;
+  const conversion=owner.context.budget.reserveCpu(expandedBytes,'fp16-conversion');
+  let working;
+  const lease={release(){conversion.release();working=null;}};
+  owner.ownedCpu.add(lease);
+  working=new Float32Array(Math.min(info.size/2,262144));
+  const packed=new Uint8Array(working.buffer,0,working.length*2),half=new Uint16Array(working.buffer,0,working.length);
+  const buffer=createEmptyBuffer(device,expandedBytes,0,'complete-phase-fp16-upload');
+  owner.ownedBuffers.add(buffer);
+  let used=0,uploaded=0;
+  const flush=async()=>{
+    if(used%2)throw Error('complete FP16 prefix has an incomplete element');
+    const count=used/2;
+    for(let i=count-1;i>=0;i--)working[i]=fp16ToFp32(half[i]);
+    device.queue.writeBuffer(buffer,uploaded,working,0,count);
+    await device.queue.onSubmittedWorkDone();
+    uploaded+=count*4;used=0;
+  };
+  await source.consumeTensor(name,async value=>{
+    for(let offset=0;offset<value.length;){
+      const count=Math.min(packed.length-used,value.length-offset);
+      packed.set(value.subarray(offset,offset+count),used);used+=count;offset+=count;
+      if(used===packed.length)await flush();
+    }
+  });
+  if(used)await flush();
+  if(uploaded!==expandedBytes)throw Error('complete FP16 source upload coverage mismatch');
+  lease.release();owner.ownedCpu.delete(lease);
+  return buffer;
+}
+
+async function uploadRangeTensor(device,source,name,owner,{retain=false,streamFp16Uploads=false}={}){
+  const info=source.tensors.get(name);
+  if(streamFp16Uploads&&info.dtype===1&&!retain){
+    const buffer=await uploadRangeFp16Source(device,source,name,owner);
+    await device.queue.onSubmittedWorkDone();
+    return {buffer};
+  }
+  let unit=await source.readTensor(name);
+  try{
+    const info=source.tensors.get(name);
+    const buffer=streamFp16Uploads&&info.dtype===1?
+      await uploadRangeFp16(device,unit.bytes,owner):
+      extractTensor(device,unit.bytes.buffer,{...info,offset:0},owner.context);
+    owner.ownedBuffers.add(buffer);
+    // Backpressure before another source unit; queue completion is not GC or
+    // proven physical reclamation. The parent process observer remains needed.
+    await device.queue.onSubmittedWorkDone();
+    if(retain){owner.ownedCpu.add(unit);const bytes=unit.bytes;unit=null;return {buffer,bytes};}
+    return {buffer};
+  }finally{unit?.release();if(unit)unit.bytes=null;}
+}
+
+async function loadRangeWeights(device,url,onProgress,options){
+  const owner=rangeLoadContext(device,options.memoryBudget);
+  try{
+    const source=await createFlatTensorRangeSource(url,{...options,onProgress});
+    // Exercise the SAME builders without allocation to identify eager consumers
+    // and validate required names before payload acquisition. No second model
+    // schema or asynchronous consumer API is introduced.
+    const consumed=buildWeightSet(device,null,source.tensors,new Set(),null,{dryRun:true});
+    const retained=new Map(),buffers=new Map();let retainedBytes=0,droppedBytes=0,disposed=false;
+    for(const [name,info]of source.tensors){
+      const keep=!consumed.has(name)||LAZILY_READ_TENSOR_PREFIXES.some(p=>name.startsWith(p));
+      if(consumed.has(name)){
+        const result=await uploadRangeTensor(device,source,name,owner,{retain:keep});buffers.set(name,result.buffer);
+        if(keep){retained.set(name,result.bytes);retainedBytes+=info.size;}else droppedBytes+=info.size;
+      }else {
+        const unit=await source.readTensor(name);owner.ownedCpu.add(unit);retained.set(name,unit.bytes);retainedBytes+=info.size;
+      }
+    }
+    const compact={retained,retainedBytes,droppedBytes,rawBytes(name){
+      if(disposed)throw Error('SF3D weights are disposed');
+      if(!retained.has(name))throw Error(`tensor ${name} was uploaded at load and its raw bytes were released`);
+      return retained.get(name);
+    },dispose(){disposed=true;retained.clear();}};
+    return buildWeightSet(device,null,source.tensors,owner.ownedBuffers,owner.context,{buffers,compact,report:source.report});
+  }catch(error){owner.cleanup(error);throw error;}
+}
+
+/**
+ * Opt-in computation-bound residency over the SAME model builders/converter.
+ * Construction validates the complete eager model schema from the range table,
+ * but allocates no payload. A caller selects actual template leaves for one
+ * computation; those buffers retire only after its submitted queue work drains.
+ * This is explicit lifetime accounting, never host-fit or physical reclaim authority.
+ */
+async function createWeightPhaseSource(device,url,options={}){
+  const streamFp16Uploads=options.streamFp16Uploads===undefined?false:options.streamFp16Uploads;
+  if(typeof streamFp16Uploads!=='boolean')throw TypeError('explicit boolean phase FP16 upload mode required');
+  const onAfterWeightsLoaded=options.onAfterWeightsLoaded;
+  if(onAfterWeightsLoaded!==undefined&&typeof onAfterWeightsLoaded!=='function')
+    throw TypeError('weight observation callback must be a function');
+  if(!isLoaderMemoryBudget(options.memoryBudget))throw TypeError('authenticated loader budget required');
+  options.memoryBudget.assertDevice(device);
+  const source=await createFlatTensorRangeSource(url,options),references=new WeakMap();
+  source.report.gpuFp16UploadMode=streamFp16Uploads?'queue-write-complete-source-prefix-v1':'direct-mapped-v1';
+  const template=buildWeightSet(device,null,source.tensors,new Set(),null,{references(name){
+    const ref=Object.freeze({});references.set(ref,name);return ref;
+  }});
+  let active=false,disposed=false,quarantined=false,unresolvedOwner=null;
+  const phases=[];
+  const assertActive=()=>{
+    if(disposed)throw Error('weight phase source is disposed');
+    if(quarantined)throw Error('weight phase source queue cleanup is quarantined');
+    if(active)throw Error('weight phase source has an active phase');
+  };
+  const select=(value,names,buffers=null)=>{
+    if(value===null)return null;
+    if(!value||typeof value!=='object')throw TypeError('authenticated weight phase selection required');
+    if(references.has(value)){
+      const name=references.get(value);names.add(name);return buffers?buffers.get(name):value;
+    }
+    if(Array.isArray(value))return value.map(v=>select(v,names,buffers));
+    const entries=Object.entries(value);
+    if(!entries.length)throw TypeError('authenticated weight phase selection required');
+    return Object.fromEntries(entries.map(([key,v])=>[key,select(v,names,buffers)]));
+  };
+  const withPhase=async(selection,work,storageKind)=>{
+      assertActive();if(typeof work!=='function')throw TypeError('weight phase computation required');
+      const names=new Set();
+      if(selection&&typeof selection==='object'&&!Object.keys(selection).length)throw TypeError('nonempty weight phase selection required');
+      const pinned=select(selection,names);if(!names.size)throw TypeError('nonempty weight phase selection required');
+      active=true;
+      const owner=rangeLoadContext(device,options.memoryBudget),buffers=new Map();
+      const phase={tensorNames:[...names],storageKind,status:'loading',retirementAuthority:
+        storageKind==='cpu-fp32'?'owned CPU lease release; not physical reclamation':'API destruction after queue drain; not physical reclamation'};
+      phases.push(phase);
+      let value,error,failed=false;
+      try{
+        for(const name of names){
+          if(storageKind==='cpu-fp32'){
+            const unit=await source.readTensor(name);
+            try{buffers.set(name,extractTensorCPU(unit.bytes.buffer,{...source.tensors.get(name),offset:0},owner.context));}
+            finally{unit.release();unit.bytes=null;}
+          }else buffers.set(name,(await uploadRangeTensor(device,source,name,owner,{streamFp16Uploads})).buffer);
+        }
+        // Opt-in borrowed observation, while the original phase owns every
+        // buffer/lease. The observer must complete before compute or retirement.
+        if(onAfterWeightsLoaded){
+          if(owner.ownedBuffers.size)await device.queue.onSubmittedWorkDone();
+          phase.status='observing-loaded-weights';
+          await onAfterWeightsLoaded(Object.freeze({storageKind,sourceETag:source.report.sourceETag,
+            tensors:Object.freeze([...buffers].map(([name,value])=>Object.freeze({
+              name,value,...source.tensors.get(name)})))}));
+        }
+        phase.status='computing';value=await work(select(pinned,new Set(),buffers));
+      }catch(failure){failed=true;error=failure;phase.error=String(failure?.message??failure);}
+      try{
+        if(owner.ownedBuffers.size)await device.queue.onSubmittedWorkDone();
+        owner.cleanup();buffers.clear();phase.status=failed?'failed-retired':'completed-retired';
+      }catch(failure){
+        quarantined=true;unresolvedOwner=owner;phase.status='cleanup-unresolved';phase.cleanupError=String(failure?.message??failure);
+        error=failed?new AggregateError([error,failure],'weight phase failed and cleanup is unresolved',{cause:error}):failure;failed=true;
+      }finally{active=false;}
+      if(failed)throw error;return value;
+    };
+  return Object.freeze({template,loadingReport:source.report,phases,
+    reference(name){
+      assertActive();if(typeof name!=='string'||!source.tensors.has(name))throw Error('Missing weight: '+name);
+      const ref=Object.freeze({});references.set(ref,name);return ref;
+    },
+    describe(selection){
+      assertActive();const names=new Set();select(selection,names);
+      if(!names.size)throw TypeError('nonempty weight phase selection required');
+      return Object.freeze([...names].map(name=>Object.freeze({name,...source.tensors.get(name)})));
+    },
+    withWeights(selection,work){return withPhase(selection,work,'gpu-buffer');},
+    withCpuWeights(selection,work){return withPhase(selection,work,'cpu-fp32');},
+    async dispose(){
+      if(active)throw Error('cannot dispose an active weight phase');
+      if(disposed&&!unresolvedOwner)return;
+      disposed=true;
+      if(unresolvedOwner){
+        await device.queue.onSubmittedWorkDone();unresolvedOwner.cleanup();unresolvedOwner=null;
+      }
+    },
+  });
+}
+
+function sequential4({ weightType, loadWeight, weightHelper, activationExpression, activationHelpers }) {
+  return `
+struct LinearDims {
+  input_channels: u32,
+  output_channels: u32,
+  total_output: u32,
+  _pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> input_values: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<${weightType}>;
+@group(0) @binding(2) var<storage, read> bias: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output_values: array<f32>;
+@group(0) @binding(4) var<uniform> dims: LinearDims;
+
+${weightHelper}${activationHelpers}
+
+fn activate(value: f32) -> f32 {
+  return ${activationExpression};
+}
+
+@compute @workgroup_size(64)
+fn main(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(num_workgroups) dispatch_grid: vec3<u32>,
+) {
+  let index = gid.x + gid.y * dispatch_grid.x * 64u;
+  if (index >= dims.total_output) { return; }
+  let output_channel = index % dims.output_channels;
+  let token = index / dims.output_channels;
+  let input_base = token * dims.input_channels;
+  let weight_base = output_channel * dims.input_channels;
+  var sum = bias[output_channel];
+  for (var channel = 0u; channel < dims.input_channels; channel = channel + 4u) {
+    sum = sum + input_values[input_base + channel] * ${loadWeight("weight_base + channel")};
+    sum = sum + input_values[input_base + channel + 1u] * ${loadWeight("weight_base + channel + 1u")};
+    sum = sum + input_values[input_base + channel + 2u] * ${loadWeight("weight_base + channel + 2u")};
+    sum = sum + input_values[input_base + channel + 3u] * ${loadWeight("weight_base + channel + 3u")};
+  }
+  output_values[index] = activate(sum);
+}
+`;
+}
+
+function split4({ weightType, loadWeight, weightHelper, activationFunction, activate }) {
+  return `// Linear projection: output = input @ weight + bias
+// Adapted from webgpu-samples visionTransformer mlp.wgsl with 2D dispatch.
+//
+// Weight layout controlled by params.transposed:
+//   transposed=1 (default): weight is [inDim, outDim], access ${loadWeight("k * outDim + col")}
+//   transposed=0: weight is [outDim, inDim] (PyTorch native), access ${loadWeight("col * inDim + k")}
+
+struct Params {
+  numRows: u32,
+  inDim: u32,
+  outDim: u32,
+  numWorkgroupsX: u32,
+  transposed: u32,  // 1=transposed [inDim, outDim], 0=native [outDim, inDim]
+}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
+@group(0) @binding(2) var<storage, read> weight: array<${weightType}>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+const WG_SIZE: u32 = 256;
+
+${weightHelper}${activationFunction}@compute @workgroup_size(WG_SIZE)
+fn main(
+  @builtin(workgroup_id) wgid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;
+  let idx = linearWG * WG_SIZE + lid.x;
+
+  if (idx >= params.numRows * params.outDim) { return; }
+
+  let row = idx / params.outDim;
+  let col = idx % params.outDim;
+
+  // 4-way split accumulation for better fp32 precision on large dot products.
+  var s0 = 0.0;
+  var s1 = 0.0;
+  var s2 = 0.0;
+  var s3 = 0.0;
+  let inBase = row * params.inDim;
+  let len4 = (params.inDim / 4u) * 4u;
+
+  if (params.transposed == 1u) {
+    // Transposed layout: ${loadWeight("k, col")} = ${loadWeight("k * outDim + col")}
+    let wBase = col;
+    let stride = params.outDim;
+    for (var k = 0u; k < len4; k += 4u) {
+      s0 += input[inBase + k]      * ${loadWeight("(k)      * stride + wBase")};
+      s1 += input[inBase + k + 1u] * ${loadWeight("(k + 1u) * stride + wBase")};
+      s2 += input[inBase + k + 2u] * ${loadWeight("(k + 2u) * stride + wBase")};
+      s3 += input[inBase + k + 3u] * ${loadWeight("(k + 3u) * stride + wBase")};
+    }
+    for (var k = len4; k < params.inDim; k++) {
+      s0 += input[inBase + k] * ${loadWeight("k * stride + wBase")};
+    }
+  } else {
+    // Native layout: ${loadWeight("col, k")} = ${loadWeight("col * inDim + k")}
+    let wBase = col * params.inDim;
+    for (var k = 0u; k < len4; k += 4u) {
+      s0 += input[inBase + k]      * ${loadWeight("wBase + k")};
+      s1 += input[inBase + k + 1u] * ${loadWeight("wBase + k + 1u")};
+      s2 += input[inBase + k + 2u] * ${loadWeight("wBase + k + 2u")};
+      s3 += input[inBase + k + 3u] * ${loadWeight("wBase + k + 3u")};
+    }
+    for (var k = len4; k < params.inDim; k++) {
+      s0 += input[inBase + k] * ${loadWeight("wBase + k")};
+    }
+  }
+  output[idx] = ${activate("(s0 + s1) + (s2 + s3) + bias[col]")};
+}
+`;
+}
+
+function split4Range({ weightType, loadWeight, weightHelper, activationFunction, activate }) {
+  return `// Row-range linear projection: output[row] = input[row] @ weight + bias.
+// The accumulation order and weight layout match linear.wgsl exactly.
+
+struct Params {
+  totalRows: u32,
+  inDim: u32,
+  outDim: u32,
+  rowStart: u32,
+  rowCount: u32,
+  numWorkgroupsX: u32,
+  transposed: u32,
+  _padding: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
+@group(0) @binding(2) var<storage, read> weight: array<${weightType}>;
+@group(0) @binding(3) var<storage, read> bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+const WG_SIZE: u32 = 256;
+
+${weightHelper}${activationFunction}@compute @workgroup_size(WG_SIZE)
+fn main(
+  @builtin(workgroup_id) wgid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;
+  let localIdx = linearWG * WG_SIZE + lid.x;
+  if (localIdx >= params.rowCount * params.outDim) { return; }
+
+  let localRow = localIdx / params.outDim;
+  let col = localIdx % params.outDim;
+  let row = params.rowStart + localRow;
+  if (row >= params.totalRows) { return; }
+  let idx = row * params.outDim + col;
+
+  var s0 = 0.0;
+  var s1 = 0.0;
+  var s2 = 0.0;
+  var s3 = 0.0;
+  let inBase = row * params.inDim;
+  let len4 = (params.inDim / 4u) * 4u;
+
+  if (params.transposed == 1u) {
+    let wBase = col;
+    let stride = params.outDim;
+    for (var k = 0u; k < len4; k += 4u) {
+      s0 += input[inBase + k]      * ${loadWeight("(k)      * stride + wBase")};
+      s1 += input[inBase + k + 1u] * ${loadWeight("(k + 1u) * stride + wBase")};
+      s2 += input[inBase + k + 2u] * ${loadWeight("(k + 2u) * stride + wBase")};
+      s3 += input[inBase + k + 3u] * ${loadWeight("(k + 3u) * stride + wBase")};
+    }
+    for (var k = len4; k < params.inDim; k++) {
+      s0 += input[inBase + k] * ${loadWeight("k * stride + wBase")};
+    }
+  } else {
+    let wBase = col * params.inDim;
+    for (var k = 0u; k < len4; k += 4u) {
+      s0 += input[inBase + k]      * ${loadWeight("wBase + k")};
+      s1 += input[inBase + k + 1u] * ${loadWeight("wBase + k + 1u")};
+      s2 += input[inBase + k + 2u] * ${loadWeight("wBase + k + 2u")};
+      s3 += input[inBase + k + 3u] * ${loadWeight("wBase + k + 3u")};
+    }
+    for (var k = len4; k < params.inDim; k++) {
+      s0 += input[inBase + k] * ${loadWeight("wBase + k")};
+    }
+  }
+  output[idx] = ${activate("(s0 + s1) + (s2 + s3) + bias[col]")};
+}
+`;
+}
+
+const PACKED_WEIGHT_HELPER = `
+fn load_weight(index: u32) -> f32 {
+  let pair = unpack2x16float(weight[index / 2u]);
+  return pair[index % 2u];
+}
+
+`;
+
+/**
+ * Emit a proven scalar linear variant; the caller owns buffers, dispatch and scheduling.
+ * sequential4: input/weight/bias/output/uniform bindings 0..4; input channels divisible by four.
+ * split4(-range): uniform/input/weight/bias/output bindings 0..4; native or transposed weights.
+ * Packed storage contains existing binary16 bits, not newly quantized f32 values.
+ * Activation expressions/helpers are trusted caller WGSL, with the result named value.
+ */
+function createWebGpuLinearShader({
+  variant,
+  weightStorage = 'f32',
+  activationExpression = 'value',
+  activationHelpers = '',
+} = {}) {
+  const generators = { sequential4, split4, 'split4-range': split4Range };
+  if (!Object.hasOwn(generators, variant)) throw new RangeError('unsupported linear variant');
+  if (!['f32', 'f16-packed-u32'].includes(weightStorage)) {
+    throw new RangeError('unsupported weightStorage');
+  }
+  if (typeof activationExpression !== 'string' || !activationExpression.trim()) {
+    throw new TypeError('activationExpression must be nonempty WGSL');
+  }
+  if (typeof activationHelpers !== 'string') {
+    throw new TypeError('activationHelpers must be WGSL text');
+  }
+  const packed = weightStorage === 'f16-packed-u32';
+  const identity = activationExpression === 'value' && activationHelpers === '';
+  return generators[variant]({
+    weightType: packed ? 'u32' : 'f32',
+    loadWeight: index => packed ? `load_weight(${index})` : `weight[${index}]`,
+    weightHelper: packed ? PACKED_WEIGHT_HELPER : '',
+    activationExpression,
+    activationHelpers,
+    activationFunction: identity ? '' : `${activationHelpers}
+fn activate(value: f32) -> f32 {
+  return ${activationExpression};
+}
+
+`,
+    activate: value => identity ? value : `activate(${value})`,
+  });
+}
+
+const WEBGPU_ROUTE_RECEIPT_SCHEMA = 'kaminos.webgpu-route-receipt.v0';
+
+function clone$4(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function isNonEmptyString$9(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isFiniteNonNegative(value) {
+  return Number.isFinite(value) && value >= 0;
+}
+
+function requireString(errors, value, path) {
+  if (!isNonEmptyString$9(value)) errors.push(`${path} must be a non-empty string`);
+}
+
+function requireArray(errors, value, path) {
+  if (!Array.isArray(value) || value.length === 0) {
+    errors.push(`${path} must be a non-empty array`);
+  }
+}
+
+function createWebGpuLocalRouteReceipt(input) {
+  const status = input.status || (input.fallbackReason ? 'fallback' : 'real');
+  return {
+    schema: WEBGPU_ROUTE_RECEIPT_SCHEMA,
+    requestedRouteId: input.requestedRouteId,
+    effectiveRouteId: input.effectiveRouteId,
+    status,
+    fallbackReason: input.fallbackReason || null,
+    backend: clone$4(input.backend),
+    model: clone$4(input.model),
+    kernel: clone$4(input.kernel),
+    inputs: clone$4(input.inputs || []),
+    outputs: clone$4(input.outputs || []),
+    timings: clone$4(input.timings),
+    createdAt: input.createdAt || new Date().toISOString(),
+  };
+}
+
+function validateRouteReceipt(receipt) {
+  const errors = [];
+
+  if (!receipt || typeof receipt !== 'object') {
+    return { ok: false, errors: ['receipt must be an object'] };
+  }
+
+  if (receipt.schema !== WEBGPU_ROUTE_RECEIPT_SCHEMA) {
+    errors.push(`schema must be ${WEBGPU_ROUTE_RECEIPT_SCHEMA}`);
+  }
+
+  requireString(errors, receipt.requestedRouteId, 'requestedRouteId');
+  requireString(errors, receipt.effectiveRouteId, 'effectiveRouteId');
+  requireString(errors, receipt.status, 'status');
+
+  if (!receipt.backend || typeof receipt.backend !== 'object') {
+    errors.push('backend must be an object');
+  } else {
+    if (receipt.backend.kind !== 'webgpu-local') {
+      errors.push('backend.kind must be webgpu-local');
+    }
+    requireString(errors, receipt.backend.runtime, 'backend.runtime');
+  }
+
+  if (!receipt.model || typeof receipt.model !== 'object') {
+    errors.push('model must be an object');
+  } else {
+    requireString(errors, receipt.model.id, 'model.id');
+    requireString(errors, receipt.model.revision, 'model.revision');
+    requireString(errors, receipt.model.weightsHash, 'model.weightsHash');
+    requireString(errors, receipt.model.dtype, 'model.dtype');
+  }
+
+  if (!receipt.kernel || typeof receipt.kernel !== 'object') {
+    errors.push('kernel must be an object');
+  } else {
+    requireString(errors, receipt.kernel.kitVersion, 'kernel.kitVersion');
+    requireString(errors, receipt.kernel.profile, 'kernel.profile');
+  }
+
+  requireArray(errors, receipt.inputs, 'inputs');
+  if (Array.isArray(receipt.inputs)) {
+    receipt.inputs.forEach((input, index) => {
+      requireString(errors, input?.role, `inputs[${index}].role`);
+      requireString(errors, input?.artifactId, `inputs[${index}].artifactId`);
+      requireString(errors, input?.sha256, `inputs[${index}].sha256`);
+    });
+  }
+
+  requireArray(errors, receipt.outputs, 'outputs');
+  if (Array.isArray(receipt.outputs)) {
+    receipt.outputs.forEach((output, index) => {
+      requireString(errors, output?.role, `outputs[${index}].role`);
+      requireString(errors, output?.artifactId, `outputs[${index}].artifactId`);
+      requireString(errors, output?.sha256, `outputs[${index}].sha256`);
+      requireString(errors, output?.status, `outputs[${index}].status`);
+      if (!Array.isArray(output?.shape) || output.shape.length === 0 || !output.shape.every(Number.isInteger)) {
+        errors.push(`outputs[${index}].shape must be a non-empty integer array`);
+      }
+    });
+  }
+
+  if (!receipt.timings || typeof receipt.timings !== 'object') {
+    errors.push('timings must be an object');
+  } else {
+    requireString(errors, receipt.timings.source, 'timings.source');
+    if (!isFiniteNonNegative(receipt.timings.totalMs)) {
+      errors.push('timings.totalMs must be a finite non-negative number');
+    }
+    if (receipt.timings.stages != null && !Array.isArray(receipt.timings.stages)) {
+      errors.push('timings.stages must be an array when present');
+    }
+  }
+
+  if (receipt.status === 'fallback' && !isNonEmptyString$9(receipt.fallbackReason)) {
+    errors.push('fallback receipts must include fallbackReason');
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+const WEBGPU_BUFFER_USAGE = Object.freeze({
+  mapRead: 0x0001,
+  mapWrite: 0x0002,
+  copySrc: 0x0004,
+  copyDst: 0x0008,
+  index: 0x0010,
+  vertex: 0x0020,
+  uniform: 0x0040,
+  storage: 0x0080,
+  indirect: 0x0100,
+  queryResolve: 0x0200,
+});
+
+const WEBGPU_SHADER_STAGE = Object.freeze({
+  vertex: 0x1,
+  fragment: 0x2,
+  compute: 0x4,
+});
+
+const WEBGPU_PHASE_RESOURCE_PLAN_SCHEMA = 'kaminos.webgpu-phase-resource-plan.v0';
+const WEBGPU_PHASE_RESOURCE_WORKING_SET_SCHEMA = 'kaminos.webgpu-phase-resource-working-set.v0';
+const WEBGPU_PHASE_RESOURCE_TRANSITION_SCHEMA = 'kaminos.webgpu-phase-resource-transition.v0';
+
+function isNonEmptyString$8(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function deepFreeze$4(value) {
+  if (value == null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze$4(child);
+  return Object.freeze(value);
+}
+
+function cloneJson(value, label, path = label, ancestors = new Set()) {
+  if (value === null) return null;
+  if (typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || Object.is(value, -0)) {
+      throw new Error(`${label} must be JSON-compatible; invalid number at ${path}`);
+    }
+    return value;
+  }
+  if (typeof value !== 'object') {
+    throw new Error(`${label} must be JSON-compatible; unsupported ${typeof value} at ${path}`);
+  }
+  if (ancestors.has(value)) throw new Error(`${label} must be JSON-compatible; cycle at ${path}`);
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const clone = new Array(value.length);
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, index);
+        if (!descriptor || !Object.hasOwn(descriptor, 'value')) {
+          throw new Error(`${label} must be JSON-compatible; invalid array element at ${path}[${index}]`);
+        }
+        clone[index] = cloneJson(descriptor.value, label, `${path}[${index}]`, ancestors);
+      }
+      const namedKeys = Reflect.ownKeys(value).filter(key => (
+        key !== 'length' && (typeof key === 'symbol' || !/^(0|[1-9][0-9]*)$/.test(key))
+      ));
+      if (namedKeys.length > 0) {
+        throw new Error(`${label} must be JSON-compatible; named array property at ${path}`);
+      }
+      return clone;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new Error(`${label} must be JSON-compatible; non-plain object at ${path}`);
+    }
+    const clone = {};
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key === 'symbol') throw new Error(`${label} must be JSON-compatible; symbol key at ${path}`);
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) {
+        throw new Error(`${label} must be JSON-compatible; invalid property at ${path}.${key}`);
+      }
+      clone[key] = cloneJson(descriptor.value, label, `${path}.${key}`, ancestors);
+    }
+    return clone;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value != null && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function normalizedResourceIds(value, label) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  const ids = [];
+  const seen = new Set();
+  for (const resourceId of value) {
+    if (!isNonEmptyString$8(resourceId)) throw new Error(`${label} entries must be non-empty strings`);
+    if (seen.has(resourceId)) throw new Error(`${label} contains duplicate resource ${resourceId}`);
+    seen.add(resourceId);
+    ids.push(resourceId);
+  }
+  return ids;
+}
+
+function sumDeclaredBytes(resources) {
+  let total = 0;
+  for (const resource of resources) {
+    total += resource.declaredBytes;
+    if (!Number.isSafeInteger(total)) throw new Error('phase resource declared bytes exceed the safe integer range');
+  }
+  return total;
+}
+
+function defineWebGpuPhaseResourcePlan(input = {}) {
+  if (
+    input.maxResources != null
+    || input.maxPhases != null
+    || input.maxDeclaredBytes != null
+    || input.retentionLimit != null
+  ) {
+    throw new Error('phase resource plans are uncapped; maxResources, maxPhases, maxDeclaredBytes, and retentionLimit are not supported');
+  }
+  if (!isNonEmptyString$8(input.planId)) throw new Error('phase resource planId must be a non-empty string');
+  if (!Array.isArray(input.resources) || input.resources.length === 0) {
+    throw new Error('phase resource plan resources must be a non-empty array');
+  }
+  if (!Array.isArray(input.phases) || input.phases.length === 0) {
+    throw new Error('phase resource plan phases must be a non-empty array');
+  }
+
+  const resourceIds = new Set();
+  const resources = input.resources.map((resource, index) => {
+    if (!resource || typeof resource !== 'object' || Array.isArray(resource)) {
+      throw new Error(`phase resource plan resources[${index}] must be an object`);
+    }
+    if (!isNonEmptyString$8(resource.resourceId)) {
+      throw new Error(`phase resource plan resources[${index}].resourceId must be a non-empty string`);
+    }
+    if (resourceIds.has(resource.resourceId)) {
+      throw new Error(`duplicate phase resource ${resource.resourceId}`);
+    }
+    if (!Number.isSafeInteger(resource.declaredBytes) || resource.declaredBytes < 0) {
+      throw new Error(`phase resource ${resource.resourceId} declaredBytes must be a non-negative safe integer`);
+    }
+    resourceIds.add(resource.resourceId);
+    return {
+      resourceId: resource.resourceId,
+      declaredBytes: resource.declaredBytes,
+      metadata: cloneJson(resource.metadata ?? null, `phase resource ${resource.resourceId} metadata`),
+    };
+  });
+
+  const phaseIds = new Set();
+  const phases = input.phases.map((phase, index) => {
+    if (!phase || typeof phase !== 'object' || Array.isArray(phase)) {
+      throw new Error(`phase resource plan phases[${index}] must be an object`);
+    }
+    if (!isNonEmptyString$8(phase.phaseId)) {
+      throw new Error(`phase resource plan phases[${index}].phaseId must be a non-empty string`);
+    }
+    if (phaseIds.has(phase.phaseId)) throw new Error(`duplicate phase ${phase.phaseId}`);
+    phaseIds.add(phase.phaseId);
+    const requiredResourceIds = normalizedResourceIds(
+      phase.requiredResourceIds,
+      `phase ${phase.phaseId} requiredResourceIds`,
+    );
+    const prefetchResourceIds = normalizedResourceIds(
+      phase.prefetchResourceIds,
+      `phase ${phase.phaseId} prefetchResourceIds`,
+    );
+    for (const resourceId of [...requiredResourceIds, ...prefetchResourceIds]) {
+      if (!resourceIds.has(resourceId)) {
+        throw new Error(`phase ${phase.phaseId} references unknown resource ${resourceId}`);
+      }
+    }
+    const holdResourceIds = [...requiredResourceIds];
+    const held = new Set(holdResourceIds);
+    for (const resourceId of prefetchResourceIds) {
+      if (!held.has(resourceId)) {
+        held.add(resourceId);
+        holdResourceIds.push(resourceId);
+      }
+    }
+    return {
+      phaseId: phase.phaseId,
+      requiredResourceIds,
+      prefetchResourceIds,
+      holdResourceIds,
+      metadata: cloneJson(phase.metadata ?? null, `phase ${phase.phaseId} metadata`),
+    };
+  });
+
+  const identityInput = {
+    planId: input.planId,
+    resources,
+    phases,
+    metadata: cloneJson(input.metadata ?? null, 'phase resource plan metadata'),
+  };
+  const plan = {
+    schema: WEBGPU_PHASE_RESOURCE_PLAN_SCHEMA,
+    ...identityInput,
+    resourceIds: resources.map(resource => resource.resourceId),
+    phaseIds: phases.map(phase => phase.phaseId),
+    totalDeclaredBytes: sumDeclaredBytes(resources),
+    identity: `${encodeURIComponent(input.planId)}#${encodeURIComponent(canonicalJson(identityInput))}`,
+  };
+  return deepFreeze$4(plan);
+}
+
+function abortError(signal) {
+  const error = new Error(String(signal?.reason || 'phase resource transition aborted'));
+  error.name = 'AbortError';
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+function errorWithWorkingSetReport(cause, report) {
+  const error = cause instanceof Error ? cause : new Error(String(cause));
+  if (!Object.hasOwn(error, 'workingSetReport')) {
+    try {
+      error.workingSetReport = report;
+      if (error.workingSetReport === report) return error;
+    } catch {}
+  }
+  const wrapped = new Error(error.message);
+  wrapped.name = error.name;
+  wrapped.cause = error;
+  wrapped.workingSetReport = report;
+  return wrapped;
+}
+
+function releaseLease(entry) {
+  const result = entry.lease.release();
+  if (result != null && typeof result.then === 'function') {
+    throw new Error(`phase resource ${entry.resource.resourceId} lease release must complete synchronously`);
+  }
+  const releaseStatus = result?.status ?? 'released';
+  if (releaseStatus === 'release-failed') {
+    throw new Error(`phase resource ${entry.resource.resourceId} lease release failed`);
+  }
+  if (releaseStatus === 'invalidated') {
+    return { outcome: 'invalidated', releaseStatus };
+  }
+  if (releaseStatus !== 'released' && releaseStatus !== 'already-released') {
+    throw new Error(
+      `phase resource ${entry.resource.resourceId} lease release returned unsupported status ${releaseStatus}`,
+    );
+  }
+  return { outcome: 'released', releaseStatus };
+}
+
+function cleanupEntries(entries) {
+  const releasedResourceIds = [];
+  const invalidatedResourceIds = [];
+  const releaseResults = [];
+  const failures = [];
+  for (const entry of [...entries].reverse()) {
+    try {
+      const release = releaseLease(entry);
+      releaseResults.push({
+        resourceId: entry.resource.resourceId,
+        status: release.releaseStatus,
+      });
+      if (release.outcome === 'invalidated') {
+        invalidatedResourceIds.push(entry.resource.resourceId);
+      } else {
+        releasedResourceIds.push(entry.resource.resourceId);
+      }
+    } catch (error) {
+      failures.push({
+        resourceId: entry.resource.resourceId,
+        message: String(error?.message || error),
+      });
+    }
+  }
+  return deepFreeze$4({
+    status: failures.length > 0
+      ? 'release-failed'
+      : (invalidatedResourceIds.length > 0 ? 'invalidated' : 'released'),
+    releasedResourceIds,
+    invalidatedResourceIds,
+    releaseResults,
+    failures,
+  });
+}
+
+function failedReleaseResourceIds(cleanup) {
+  return new Set(cleanup.failures.map(failure => failure.resourceId));
+}
+
+function createWebGpuPhaseResourceWorkingSet(input = {}) {
+  if (
+    input.maxHeldResources != null
+    || input.maxHeldBytes != null
+    || input.maxTransitions != null
+    || input.retentionLimit != null
+  ) {
+    throw new Error('phase resource working sets are uncapped; maxHeldResources, maxHeldBytes, maxTransitions, and retentionLimit are not supported');
+  }
+  if (!isNonEmptyString$8(input.controllerId)) throw new Error('phase resource controllerId must be a non-empty string');
+  if (typeof input.acquireResource !== 'function') throw new Error('phase resource acquireResource must be a function');
+  if (input.residencySnapshot != null && typeof input.residencySnapshot !== 'function') {
+    throw new Error('phase resource residencySnapshot must be a function');
+  }
+  const plan = defineWebGpuPhaseResourcePlan(input.plan);
+  const now = input.now ?? (() => globalThis.performance?.now?.() ?? Date.now());
+  if (typeof now !== 'function') throw new Error('phase resource now must be a function');
+
+  const resourceById = new Map(plan.resources.map(resource => [resource.resourceId, resource]));
+  const phaseById = new Map(plan.phases.map(phase => [phase.phaseId, phase]));
+  const state = {
+    status: 'active',
+    currentPhaseId: null,
+    held: new Map(),
+    transitionCount: 0,
+    activeTransition: null,
+    closedAtMs: null,
+  };
+
+  function readResidencyReport() {
+    if (!input.residencySnapshot) return { residency: null, residencyError: null };
+    try {
+      return {
+        residency: cloneJson(input.residencySnapshot(), 'phase resource residency snapshot'),
+        residencyError: null,
+      };
+    } catch (error) {
+      return {
+        residency: null,
+        residencyError: {
+          name: error?.name || 'Error',
+          message: String(error?.message || error),
+        },
+      };
+    }
+  }
+
+  function heldResourceIds() {
+    return [...state.held.keys()];
+  }
+
+  function heldDeclaredBytes() {
+    return sumDeclaredBytes([...state.held.values()].map(entry => entry.resource));
+  }
+
+  function snapshot() {
+    const residencyReport = readResidencyReport();
+    return deepFreeze$4({
+      schema: WEBGPU_PHASE_RESOURCE_WORKING_SET_SCHEMA,
+      controllerId: input.controllerId,
+      planIdentity: plan.identity,
+      status: state.status,
+      currentPhaseId: state.currentPhaseId,
+      heldResourceIds: heldResourceIds(),
+      heldDeclaredBytes: heldDeclaredBytes(),
+      transitionCount: state.transitionCount,
+      activeTransition: state.activeTransition ? { ...state.activeTransition } : null,
+      ...residencyReport,
+      closedAtMs: state.closedAtMs,
+    });
+  }
+
+  async function transitionToPhase(phaseId, options = {}) {
+    if (state.status !== 'active') throw new Error(`phase resource working set is ${state.status}`);
+    if (state.activeTransition) throw new Error('phase resource transition is already in progress');
+    const phase = phaseById.get(phaseId);
+    if (!phase) throw new Error(`unknown phase resource phase ${phaseId || '<missing>'}`);
+    throwIfAborted(options.signal);
+
+    const startedAtMs = now();
+    const fromPhaseId = state.currentPhaseId;
+    const retainedResourceIds = phase.holdResourceIds.filter(resourceId => state.held.has(resourceId));
+    const acquired = [];
+    let failedResourceId = null;
+    state.activeTransition = {
+      fromPhaseId,
+      toPhaseId: phaseId,
+      startedAtMs,
+    };
+
+    try {
+      for (const resourceId of phase.holdResourceIds) {
+        if (state.held.has(resourceId)) continue;
+        throwIfAborted(options.signal);
+        failedResourceId = resourceId;
+        const resource = resourceById.get(resourceId);
+        const purpose = phase.requiredResourceIds.includes(resourceId) ? 'required' : 'prefetch';
+        const lease = await input.acquireResource({
+          controllerId: input.controllerId,
+          plan,
+          phaseId,
+          purpose,
+          resource,
+          signal: options.signal,
+        });
+        if (!lease || typeof lease !== 'object' || typeof lease.release !== 'function') {
+          throw new Error(`phase resource ${resourceId} acquisition must return a lease with release()`);
+        }
+        const entry = { resource, lease, purpose };
+        acquired.push(entry);
+        if (lease.resourceId != null && lease.resourceId !== resourceId) {
+          throw new Error(`phase resource ${resourceId} acquisition returned lease for ${lease.resourceId}`);
+        }
+        throwIfAborted(options.signal);
+      }
+
+      const target = new Set(phase.holdResourceIds);
+      const departed = [...state.held.values()].filter(entry => !target.has(entry.resource.resourceId));
+      const release = cleanupEntries(departed);
+      if (release.status === 'release-failed') {
+        const acquiredCleanup = cleanupEntries(acquired);
+        const settledDeparted = new Set([
+          ...release.releasedResourceIds,
+          ...release.invalidatedResourceIds,
+        ]);
+        const unresolvedAcquired = failedReleaseResourceIds(acquiredCleanup);
+        const degradedHeld = new Map(
+          [...state.held].filter(([resourceId]) => !settledDeparted.has(resourceId)),
+        );
+        for (const entry of acquired) {
+          if (unresolvedAcquired.has(entry.resource.resourceId)) {
+            degradedHeld.set(entry.resource.resourceId, entry);
+          }
+        }
+        state.held = degradedHeld;
+        state.currentPhaseId = null;
+        state.status = 'release-failed';
+        throw errorWithWorkingSetReport(new Error('phase resource transition could not release departed resources'), deepFreeze$4({
+          schema: WEBGPU_PHASE_RESOURCE_TRANSITION_SCHEMA,
+          status: 'release-failed',
+          controllerId: input.controllerId,
+          planIdentity: plan.identity,
+          fromPhaseId,
+          toPhaseId: phaseId,
+          startedAtMs,
+          settledAtMs: now(),
+          failedResourceId: null,
+          failure: { name: 'Error', message: 'phase resource transition could not release departed resources' },
+          acquiredResourceIds: acquired.map(entry => entry.resource.resourceId),
+          retainedResourceIds,
+          releasedResourceIds: release.releasedResourceIds,
+          invalidatedResourceIds: release.invalidatedResourceIds,
+          heldResourceIds: heldResourceIds(),
+          heldDeclaredBytes: heldDeclaredBytes(),
+          ...readResidencyReport(),
+          cleanup: acquiredCleanup,
+          releaseFailures: release.failures,
+        }));
+      }
+
+      const nextHeld = new Map();
+      for (const resourceId of phase.holdResourceIds) {
+        const entry = state.held.get(resourceId)
+          || acquired.find(candidate => candidate.resource.resourceId === resourceId);
+        nextHeld.set(resourceId, entry);
+      }
+      state.held = nextHeld;
+      state.currentPhaseId = phaseId;
+      state.transitionCount += 1;
+      failedResourceId = null;
+      return deepFreeze$4({
+        schema: WEBGPU_PHASE_RESOURCE_TRANSITION_SCHEMA,
+        status: release.status === 'invalidated' ? 'prepared-after-invalidation' : 'prepared',
+        controllerId: input.controllerId,
+        planIdentity: plan.identity,
+        transitionSequence: state.transitionCount,
+        fromPhaseId,
+        toPhaseId: phaseId,
+        startedAtMs,
+        settledAtMs: now(),
+        failedResourceId: null,
+        failure: null,
+        acquiredResourceIds: acquired.map(entry => entry.resource.resourceId),
+        retainedResourceIds,
+        releasedResourceIds: release.releasedResourceIds,
+        invalidatedResourceIds: release.invalidatedResourceIds,
+        heldResourceIds: heldResourceIds(),
+        heldDeclaredBytes: heldDeclaredBytes(),
+        ...readResidencyReport(),
+        cleanup: null,
+      });
+    } catch (cause) {
+      if (cause?.workingSetReport) throw cause;
+      const cleanup = cleanupEntries(acquired);
+      if (cleanup.status === 'release-failed') {
+        const unresolvedAcquired = failedReleaseResourceIds(cleanup);
+        for (const entry of acquired) {
+          if (unresolvedAcquired.has(entry.resource.resourceId)) {
+            state.held.set(entry.resource.resourceId, entry);
+          }
+        }
+        state.currentPhaseId = null;
+        state.status = 'release-failed';
+      }
+      const canceled = cause?.name === 'AbortError' || options.signal?.aborted === true;
+      const error = canceled && cause?.name !== 'AbortError' ? abortError(options.signal) : cause;
+      const report = deepFreeze$4({
+        schema: WEBGPU_PHASE_RESOURCE_TRANSITION_SCHEMA,
+        status: canceled ? 'canceled' : 'failed',
+        controllerId: input.controllerId,
+        planIdentity: plan.identity,
+        transitionSequence: state.transitionCount + 1,
+        fromPhaseId,
+        toPhaseId: phaseId,
+        startedAtMs,
+        settledAtMs: now(),
+        failedResourceId,
+        failure: { name: error?.name || 'Error', message: String(error?.message || error) },
+        acquiredResourceIds: acquired.map(entry => entry.resource.resourceId),
+        retainedResourceIds,
+        releasedResourceIds: [],
+        invalidatedResourceIds: cleanup.invalidatedResourceIds,
+        heldResourceIds: heldResourceIds(),
+        heldDeclaredBytes: heldDeclaredBytes(),
+        ...readResidencyReport(),
+        cleanup,
+        workingSetStatus: state.status,
+      });
+      throw errorWithWorkingSetReport(error, report);
+    } finally {
+      state.activeTransition = null;
+    }
+  }
+
+  function close() {
+    if (state.activeTransition) throw new Error('phase resource working set cannot close during an active transition');
+    if (state.status === 'closed' || state.status === 'closed-after-invalidation') {
+      return deepFreeze$4({
+        schema: WEBGPU_PHASE_RESOURCE_WORKING_SET_SCHEMA,
+        controllerId: input.controllerId,
+        status: 'already-closed',
+        releasedResourceIds: [],
+      });
+    }
+    const cleanup = cleanupEntries([...state.held.values()]);
+    const unresolved = failedReleaseResourceIds(cleanup);
+    state.held = new Map(
+      [...state.held].filter(([resourceId]) => unresolved.has(resourceId)),
+    );
+    state.currentPhaseId = null;
+    state.status = cleanup.status === 'release-failed'
+      ? 'close-failed'
+      : (cleanup.status === 'invalidated' ? 'closed-after-invalidation' : 'closed');
+    state.closedAtMs = now();
+    return deepFreeze$4({
+      schema: WEBGPU_PHASE_RESOURCE_WORKING_SET_SCHEMA,
+      controllerId: input.controllerId,
+      status: state.status,
+      releasedResourceIds: cleanup.releasedResourceIds,
+      invalidatedResourceIds: cleanup.invalidatedResourceIds,
+      failures: cleanup.failures,
+      heldResourceIds: heldResourceIds(),
+      heldDeclaredBytes: heldDeclaredBytes(),
+      ...readResidencyReport(),
+      closedAtMs: state.closedAtMs,
+    });
+  }
+
+  return Object.freeze({
+    schema: WEBGPU_PHASE_RESOURCE_WORKING_SET_SCHEMA,
+    controllerId: input.controllerId,
+    plan,
+    transitionToPhase,
+    snapshot,
+    close,
+  });
+}
+
+const LIMIT_KEYS = [
+  'maxBufferSize',
+  'maxStorageBufferBindingSize',
+  'maxComputeWorkgroupStorageSize',
+  'maxComputeInvocationsPerWorkgroup',
+  'maxComputeWorkgroupSizeX',
+  'maxComputeWorkgroupSizeY',
+];
+
+function featureList(features) {
+  if (!features) return [];
+  return Array.from(features).map(String).sort();
+}
+
+function isNonEmptyString$7(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function copyLimits(limits = {}) {
+  const out = {};
+  for (const key of LIMIT_KEYS) {
+    if (Number.isFinite(limits[key])) out[key] = limits[key];
+  }
+  return out;
+}
+
+function createWebGpuBackendIdentity(input) {
+  return {
+    kind: 'webgpu-local',
+    runtime: 'browser',
+    adapterName: input.adapterName || null,
+    browser: input.browser || null,
+    requestedFeatures: featureList(input.requestedFeatures),
+    // Absent and empty are different observations: a zero-feature device
+    // truthfully captures [], while forgetting to capture at all yields
+    // undefined and fails validation downstream.
+    features: (input.effectiveFeatures != null || input.features != null)
+      ? featureList(input.effectiveFeatures || input.features)
+      : undefined,
+    limits: copyLimits(input.limits),
+    timestampQuery: input.timestampQuery || 'unavailable',
+  };
+}
+
+function validateWebGpuBackendIdentity(identity) {
+  const errors = [];
+
+  if (!identity || typeof identity !== 'object') {
+    return { ok: false, errors: ['identity must be an object'] };
+  }
+  if (identity.kind !== 'webgpu-local') errors.push('kind must be webgpu-local');
+  if (identity.runtime !== 'browser') errors.push('runtime must be browser');
+  if (!isNonEmptyString$7(identity.adapterName)) errors.push('adapterName must be a non-empty string');
+  if (!Array.isArray(identity.features)) {
+    errors.push('features must be an array (empty is lawful for a zero-feature device)');
+  }
+  if (!identity.limits || typeof identity.limits !== 'object' || Object.keys(identity.limits).length === 0) {
+    errors.push('limits must be a non-empty object');
+  }
+
+  const timestampStates = new Set(['requested', 'available', 'unavailable', 'disabled']);
+  if (!timestampStates.has(identity.timestampQuery)) {
+    errors.push('timestampQuery has unsupported state');
+  }
+
+  if (identity.timestampQuery === 'requested') {
+    const requested = featureList(identity.requestedFeatures);
+    const effective = featureList(identity.features);
+    if (!requested.includes('timestamp-query')) {
+      errors.push('timestamp-query requested state must include timestamp-query in requestedFeatures');
+    }
+    if (!effective.includes('timestamp-query')) {
+      errors.push('timestamp-query requested state must include timestamp-query in features');
+    }
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+const WEBGPU_INFERENCE_KIT_VERSION = '0.1.53';
+const DEFAULT_KIT_VERSION = WEBGPU_INFERENCE_KIT_VERSION;
+
+function isNonEmptyString$6(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function normalizeSource(input) {
+  return input && typeof input === 'object' ? input : {};
+}
+
+function stringOrDefault(value, fallback) {
+  return isNonEmptyString$6(value) ? value : fallback;
+}
+
+function validateKernelProfileMetadata(kernel) {
+  const errors = [];
+
+  if (!kernel || typeof kernel !== 'object') {
+    return { ok: false, errors: ['kernel must be an object'] };
+  }
+
+  if (!isNonEmptyString$6(kernel.kitVersion)) errors.push('kernel.kitVersion must be a non-empty string');
+  if (!isNonEmptyString$6(kernel.profile)) errors.push('kernel.profile must be a non-empty string');
+  if (kernel.commit != null && typeof kernel.commit !== 'string') {
+    errors.push('kernel.commit must be a string or null');
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+function createKernelProfileMetadata(input = {}, options = {}) {
+  const source = normalizeSource(input);
+  const kernel = {
+    kitVersion: stringOrDefault(source.kitVersion, options.defaultKitVersion || DEFAULT_KIT_VERSION),
+    profile: stringOrDefault(source.profile, options.defaultProfile),
+    commit: source.commit || null,
+  };
+
+  if (options.requireProfile === true || options.validate === true) {
+    const result = validateKernelProfileMetadata(kernel);
+    if (!result.ok) throw new Error(result.errors.join('; '));
+  }
+
+  return kernel;
+}
+
+const WEBGPU_HOST_PHASE = Object.freeze({
+  cpuPreprocess: 'cpu-preprocess',
+  commandEncoding: 'command-encoding',
+  queueSubmission: 'queue-submission',
+  readback: 'readback',
+  presentation: 'presentation',
+  other: 'other',
+});
+
+new Set(Object.values(WEBGPU_HOST_PHASE));
+
+const PROFILE_SCHEMA = 'kaminos.webgpu-staged-profile.v0';
+
+function isNonEmptyString$5(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function roundMs(value) {
+  return Math.round(value * 10) / 10;
+}
+
+function createStagedSubmitProfile(input = {}) {
+  return {
+    schema: PROFILE_SCHEMA,
+    route: input.route || 'staged-submits',
+    timingSource: input.timingSource || 'queue-submit-wait',
+    timestampQueryValidatedAgainstStaged: !!input.timestampQueryValidatedAgainstStaged,
+    requiredStages: Array.isArray(input.requiredStages) ? [...input.requiredStages] : [],
+    stages: [],
+  };
+}
+
+function addStagedSubmitStage(profile, stage) {
+  if (!profile || typeof profile !== 'object') throw new Error('profile must be an object');
+  if (!isNonEmptyString$5(stage?.name)) throw new Error('stage.name must be a non-empty string');
+  if (!Number.isFinite(stage.ms) || stage.ms < 0) throw new Error('stage.ms must be a finite non-negative number');
+  if (!Array.isArray(profile.stages)) profile.stages = [];
+
+  profile.stages.push({
+    name: stage.name,
+    ms: roundMs(stage.ms),
+    shape: Array.isArray(stage.shape) ? [...stage.shape] : undefined,
+    metadata: stage.metadata ? JSON.parse(JSON.stringify(stage.metadata)) : undefined,
+  });
+  return profile;
+}
+
+function finishStagedSubmitProfile(profile) {
+  if (!profile || typeof profile !== 'object') throw new Error('profile must be an object');
+  const stages = Array.isArray(profile.stages) ? profile.stages : [];
+  const totalMs = roundMs(stages.reduce((sum, stage) => sum + (Number.isFinite(stage.ms) ? stage.ms : 0), 0));
+
+  return {
+    ...profile,
+    schema: profile.schema || PROFILE_SCHEMA,
+    stages,
+    stageNames: stages.map(stage => stage.name),
+    totalMs,
+  };
+}
+
+function validateStagedSubmitProfile(profile) {
+  const errors = [];
+
+  if (!profile || typeof profile !== 'object') {
+    return { ok: false, errors: ['profile must be an object'] };
+  }
+  if (profile.schema !== PROFILE_SCHEMA) errors.push(`schema must be ${PROFILE_SCHEMA}`);
+  if (!isNonEmptyString$5(profile.route)) errors.push('route must be a non-empty string');
+  if (!isNonEmptyString$5(profile.timingSource)) errors.push('timingSource must be a non-empty string');
+  if (!Array.isArray(profile.stages) || profile.stages.length === 0) {
+    errors.push('stages must be a non-empty array');
+  }
+  if (!Number.isFinite(profile.totalMs) || profile.totalMs < 0) {
+    errors.push('totalMs must be a finite non-negative number');
+  }
+
+  const stageNames = new Set();
+  if (Array.isArray(profile.stages)) {
+    profile.stages.forEach((stage, index) => {
+      if (!isNonEmptyString$5(stage.name)) errors.push(`stages[${index}].name must be a non-empty string`);
+      if (!Number.isFinite(stage.ms) || stage.ms < 0) errors.push(`stages[${index}].ms must be a finite non-negative number`);
+      if (isNonEmptyString$5(stage.name)) stageNames.add(stage.name);
+    });
+  }
+
+  if (Array.isArray(profile.requiredStages)) {
+    for (const required of profile.requiredStages) {
+      if (!stageNames.has(required)) errors.push(`missing required stage ${required}`);
+    }
+  }
+
+  if (profile.timingSource === 'timestamp-query' && profile.timestampQueryValidatedAgainstStaged !== true) {
+    errors.push('timestamp-query profile must be validated against staged-submit timings');
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+function validateRouteReceiptArtifact(value, name) {
+  if (!value || typeof value !== 'object') throw new Error(`${name} output must be an object`);
+  if (typeof value.artifactId !== 'string' || value.artifactId.length === 0) {
+    throw new Error(`${name} output must include artifactId`);
+  }
+  if (typeof value.sha256 !== 'string' || value.sha256.length === 0) {
+    throw new Error(`${name} output must include sha256`);
+  }
+  if (!Array.isArray(value.shape) || value.shape.length === 0) {
+    throw new Error(`${name} output must include shape`);
+  }
+}
+
+function createRouteReceiptInputArtifact(role, artifact) {
+  return {
+    role,
+    artifactId: artifact.artifactId,
+    sha256: artifact.sha256,
+    shape: Array.isArray(artifact.shape) ? [...artifact.shape] : undefined,
+  };
+}
+
+function createRouteReceiptArtifacts({ artifacts, roles }) {
+  if (!artifacts || typeof artifacts !== 'object') throw new Error('artifacts must be an object');
+  if (!Array.isArray(roles) || roles.length === 0) throw new Error('roles must be a non-empty array');
+
+  const outputs = [];
+  for (const role of roles) {
+    const key = role.key;
+    const artifact = artifacts[key];
+    if (!artifact) {
+      if (role.required !== false) throw new Error(`${key} output is required`);
+      continue;
+    }
+
+    validateRouteReceiptArtifact(artifact, key);
+    outputs.push({
+      role: role.role,
+      artifactId: artifact.artifactId,
+      sha256: artifact.sha256,
+      shape: [...artifact.shape],
+      status: artifact.status || 'real',
+    });
+  }
+  return outputs;
+}
+
+function finishAndValidateRouteProfile(profile) {
+  const finished = finishStagedSubmitProfile(profile);
+  const result = validateStagedSubmitProfile(finished);
+  if (!result.ok) throw new Error(`invalid staged profile: ${result.errors.join('; ')}`);
+  return finished;
+}
+
+function validateRouteReceiptBackendIdentity(backend) {
+  const result = validateWebGpuBackendIdentity(backend);
+  if (!result.ok) throw new Error(`invalid WebGPU backend identity: ${result.errors.join('; ')}`);
+  return backend;
+}
+
+function createWebGpuRouteReceiptFromArtifacts(input) {
+  validateRouteReceiptBackendIdentity(input.backend);
+  const profile = finishAndValidateRouteProfile(input.profile);
+
+  return createWebGpuLocalRouteReceipt({
+    requestedRouteId: input.requestedRouteId,
+    effectiveRouteId: input.effectiveRouteId || input.requestedRouteId,
+    status: input.status || (input.fallbackReason ? 'fallback' : 'real'),
+    fallbackReason: input.fallbackReason || null,
+    backend: input.backend,
+    model: input.model,
+    kernel: input.kernel,
+    inputs: input.inputs,
+    outputs: input.outputs,
+    timings: {
+      source: profile.timingSource,
+      totalMs: profile.totalMs,
+      stages: profile.stages,
+      profile,
+    },
+  });
+}
+
+const WEBGPU_FOREGROUND_OPPORTUNITY_SCHEMA = 'kaminos.webgpu-foreground-opportunity-interlock.v0';
+const WEBGPU_FOREGROUND_OPPORTUNITY_PRESSURE_SCHEMA = 'kaminos.webgpu-foreground-opportunity-pressure.v0';
+const WEBGPU_FOREGROUND_OPPORTUNITY_RECEIPT_SCHEMA = 'kaminos.webgpu-foreground-opportunity-receipt.v0';
+const WEBGPU_FOREGROUND_OPPORTUNITY_SERVICE_SCHEMA = 'kaminos.webgpu-foreground-opportunity-service.v0';
+
+function isPlainObject$3(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonEmptyString$4(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function clone$3(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function deepFreeze$3(value) {
+  if (value == null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze$3(child);
+  return Object.freeze(value);
+}
+
+function normalizeError$2(error) {
+  return {
+    name: isNonEmptyString$4(error?.name) ? error.name : 'Error',
+    message: isNonEmptyString$4(error?.message) ? error.message : String(error),
+  };
+}
+
+function validateBoundary(input) {
+  if (!isPlainObject$3(input)) throw new Error('foreground opportunity boundary must be an object');
+  for (const key of ['invocationId', 'boundaryId', 'dutyId', 'phase']) {
+    if (!isNonEmptyString$4(input[key])) throw new Error(`${key} must be a non-empty string`);
+  }
+  if (input.position !== 'before-encode') {
+    throw new Error('foreground opportunities are serviced only at position before-encode');
+  }
+  if (input.metadata != null && !isPlainObject$3(input.metadata)) {
+    throw new Error('foreground opportunity boundary metadata must be an object when provided');
+  }
+  return deepFreeze$3({
+    invocationId: input.invocationId,
+    boundaryId: input.boundaryId,
+    dutyId: input.dutyId,
+    phase: input.phase,
+    position: input.position,
+    metadata: clone$3(input.metadata || {}),
+  });
+}
+
+function createInterlock(input, outsideRun = false) {
+  if (!isNonEmptyString$4(input.routeId)) throw new Error('routeId must be a non-empty string');
+  if (!outsideRun && !isNonEmptyString$4(input.runId)) throw new Error('runId must be a non-empty caller-owned identity');
+  if (!input.device || typeof input.device !== 'object') throw new Error('device must be an object');
+  if (!input.queue || typeof input.queue !== 'object') throw new Error('queue must be an object');
+  if (input.maxRequests != null || input.maxReceipts != null || input.retention != null && input.retention !== 'uncapped') {
+    throw new Error('foreground opportunity retention is uncapped; capped retention is not supported');
+  }
+  const now = input.now || (() => globalThis.performance?.now?.() ?? Date.now());
+  const state = {
+    routeId: input.routeId,
+    runId: outsideRun ? null : input.runId,
+    sequence: 0,
+    serviceSequence: 0,
+    pending: [],
+    requests: new Map(),
+    receipts: [],
+    services: [],
+    activeRequestCount: 0,
+    activeServiceCount: 0,
+    queuedServiceCount: 0,
+    serviceTail: Promise.resolve(),
+    noDemandBoundaryCount: 0,
+  };
+
+  function finishRequest(requestState, receiptInput) {
+    if (requestState.receipt) return requestState.receipt;
+    const receipt = deepFreeze$3({
+      schema: WEBGPU_FOREGROUND_OPPORTUNITY_RECEIPT_SCHEMA,
+      routeId: state.routeId,
+      runId: state.runId,
+      requestId: requestState.requestId,
+      requestSequence: requestState.sequence,
+      status: receiptInput.status,
+      requestedAtMs: requestState.requestedAtMs,
+      startedAtMs: receiptInput.startedAtMs ?? null,
+      settledAtMs: receiptInput.settledAtMs,
+      elapsedMs: receiptInput.startedAtMs == null
+        ? 0
+        : (receiptInput.settledAtMs == null
+          ? null
+          : Math.max(0, receiptInput.settledAtMs - receiptInput.startedAtMs)),
+      boundary: clone$3(receiptInput.boundary || null),
+      metadata: clone$3(requestState.metadata),
+      result: clone$3(receiptInput.result ?? null),
+      submissionCount: receiptInput.submissions?.filter(row => row.submissionStatus === 'queue-submit-returned').length || 0,
+      submissions: clone$3(receiptInput.submissions || []),
+      cancellation: clone$3(receiptInput.cancellation || null),
+      failure: clone$3(receiptInput.failure || null),
+      authority: 'foreground-callback-and-queue-submission-observed-no-gpu-completion-or-presentation-claim',
+    });
+    requestState.status = receipt.status;
+    requestState.receipt = receipt;
+    state.receipts.push(clone$3(receipt));
+    requestState.resolveCompletion(receipt);
+    return receipt;
+  }
+
+  function request(requestInput = {}) {
+    if (!isPlainObject$3(requestInput)) throw new Error('foreground opportunity request must be an object');
+    if (!isNonEmptyString$4(requestInput.requestId)) throw new Error('requestId must be a non-empty string');
+    if (state.requests.has(requestInput.requestId)) {
+      throw new Error(`duplicate foreground opportunity request ${requestInput.requestId}`);
+    }
+    if (typeof requestInput.run !== 'function') throw new Error('foreground opportunity run must be a function');
+    if (requestInput.metadata != null && !isPlainObject$3(requestInput.metadata)) {
+      throw new Error('foreground opportunity metadata must be an object when provided');
+    }
+    state.sequence += 1;
+    let resolveCompletion;
+    const completion = new Promise(resolve => { resolveCompletion = resolve; });
+    const abortController = new AbortController();
+    const requestState = {
+      requestId: requestInput.requestId,
+      sequence: state.sequence,
+      requestedAtMs: now(),
+      metadata: clone$3(requestInput.metadata || {}),
+      run: requestInput.run,
+      status: 'pending',
+      receipt: null,
+      resolveCompletion,
+      abortController,
+      cancellationReason: null,
+    };
+    state.requests.set(requestState.requestId, requestState);
+    state.pending.push(requestState);
+
+    return Object.freeze({
+      requestId: requestState.requestId,
+      completion,
+      cancel(reason = 'foreground-opportunity-canceled') {
+        if (requestState.status === 'active') {
+          requestState.cancellationReason = String(reason);
+          requestState.abortController.abort(requestState.cancellationReason);
+          return deepFreeze$3({
+            status: 'cancellation-requested',
+            requestId: requestState.requestId,
+            reason: requestState.cancellationReason,
+          });
+        }
+        if (requestState.status !== 'pending') {
+          return requestState.receipt || deepFreeze$3({
+            status: requestState.status,
+            requestId: requestState.requestId,
+          });
+        }
+        requestState.abortController.abort(reason);
+        const receipt = finishRequest(requestState, {
+          status: 'canceled-before-service',
+          settledAtMs: now(),
+          cancellation: { reason: String(reason) },
+        });
+        state.pending = state.pending.filter(candidate => candidate !== requestState);
+        return receipt;
+      },
+    });
+  }
+
+  async function serviceBoundaryTurn(boundary) {
+    const captured = state.pending.filter(requestState => requestState.status === 'pending');
+    if (captured.length === 0) {
+      state.noDemandBoundaryCount += 1;
+      return deepFreeze$3({
+        schema: WEBGPU_FOREGROUND_OPPORTUNITY_SERVICE_SCHEMA,
+        status: 'no-demand',
+        routeId: state.routeId,
+        runId: state.runId,
+        boundary,
+        capturedRequestCount: 0,
+        servicedRequestCount: 0,
+        failures: [],
+        authority: 'no-foreground-demand-observed-at-safe-boundary',
+      });
+    }
+    const capturedSet = new Set(captured);
+    state.pending = state.pending.filter(requestState => !capturedSet.has(requestState));
+    state.serviceSequence += 1;
+    const serviceStartedAtMs = now();
+    const receipts = [];
+    const failures = [];
+    let receiptTimingError = null;
+
+    for (const requestState of captured) {
+      if (requestState.status !== 'pending') continue;
+      requestState.status = 'active';
+      state.activeRequestCount += 1;
+      const startedAtMs = now();
+      const submissions = [];
+      let result = null;
+      let failure = null;
+      try {
+        result = await requestState.run(Object.freeze({
+          schema: WEBGPU_FOREGROUND_OPPORTUNITY_SCHEMA,
+          routeId: state.routeId,
+          runId: state.runId,
+          requestId: requestState.requestId,
+          boundary,
+          device: input.device,
+          queue: input.queue,
+          signal: requestState.abortController.signal,
+          submit(commandBuffers, submissionInput = {}) {
+            if (requestState.status !== 'active') {
+              throw new Error('foreground opportunity submission lease is not active');
+            }
+            if (requestState.abortController.signal.aborted) {
+              throw new Error('foreground opportunity was canceled before submission');
+            }
+            if (!Array.isArray(commandBuffers) || commandBuffers.length === 0) {
+              throw new Error('foreground opportunity submit requires a non-empty command buffer array');
+            }
+            if (!isPlainObject$3(submissionInput)) throw new Error('foreground submission input must be an object');
+            const submissionId = submissionInput.submissionId
+              || `${requestState.requestId}:submission:${submissions.length + 1}`;
+            if (!isNonEmptyString$4(submissionId)) throw new Error('submissionId must be a non-empty string');
+            if (submissions.some(row => row.submissionId === submissionId)) {
+              throw new Error(`duplicate foreground submission ${submissionId}`);
+            }
+            if (typeof input.queue.submit !== 'function') throw new Error('queue.submit must be available');
+            let submissionMetadata;
+            try {
+              submissionMetadata = clone$3(submissionInput.metadata || {});
+            } catch (error) {
+              throw new Error(`foreground submission metadata must be JSON-serializable: ${error.message}`);
+            }
+            const submittedAtMs = now();
+            try {
+              input.queue.submit(commandBuffers);
+            } catch (error) {
+              submissions.push(deepFreeze$3({
+                submissionId,
+                submissionSequence: submissions.length + 1,
+                commandBufferCount: commandBuffers.length,
+                submittedAtMs,
+                returnedAtMs: now(),
+                submissionStatus: 'queue-submit-threw',
+                metadata: submissionMetadata,
+                failure: normalizeError$2(error),
+                authority: 'queue-submit-call-failed-no-gpu-submission-claim',
+              }));
+              throw error;
+            }
+            let returnedAtMs = null;
+            let timingFailure = null;
+            try {
+              returnedAtMs = now();
+            } catch (error) {
+              timingFailure = {
+                phase: 'foreground-submission-return-timing',
+                error: normalizeError$2(error),
+              };
+            }
+            const row = deepFreeze$3({
+              submissionId,
+              submissionSequence: submissions.length + 1,
+              commandBufferCount: commandBuffers.length,
+              submittedAtMs,
+              returnedAtMs,
+              submissionStatus: 'queue-submit-returned',
+              ...(timingFailure ? { timingFailure } : {}),
+              metadata: submissionMetadata,
+              authority: 'queue-submit-call-returned-no-gpu-completion-or-presentation-claim',
+            });
+            submissions.push(row);
+            return row;
+          },
+        }));
+      } catch (error) {
+        failure = {
+          phase: 'foreground-callback',
+          error: normalizeError$2(error),
+        };
+      } finally {
+        state.activeRequestCount -= 1;
+      }
+      const successfulSubmissionCount = submissions
+        .filter(row => row.submissionStatus === 'queue-submit-returned').length;
+      const canceledDuringService = requestState.abortController.signal.aborted;
+      let receiptResult = null;
+      if (!failure && !canceledDuringService) {
+        try {
+          receiptResult = clone$3(result ?? null);
+        } catch (error) {
+          failure = {
+            phase: 'foreground-result-serialization',
+            error: normalizeError$2(error),
+          };
+        }
+      }
+      let settledAtMs = null;
+      let receiptTimingFailure = null;
+      try {
+        settledAtMs = now();
+      } catch (error) {
+        receiptTimingError ||= error;
+        receiptTimingFailure = {
+          phase: 'foreground-receipt-timing',
+          error: normalizeError$2(error),
+        };
+      }
+      const receiptFailure = failure || receiptTimingFailure;
+      const receipt = finishRequest(requestState, {
+        status: canceledDuringService
+          ? 'canceled-during-service'
+          : (receiptFailure
+            ? (successfulSubmissionCount > 0 ? 'failed-after-submission' : 'failed-before-submission')
+            : 'completed'),
+        startedAtMs,
+        settledAtMs,
+        boundary,
+        result: receiptResult,
+        submissions,
+        cancellation: canceledDuringService
+          ? {
+              reason: requestState.cancellationReason
+                || String(requestState.abortController.signal.reason || 'foreground-opportunity-canceled'),
+              callbackError: failure ? clone$3(failure.error) : null,
+            }
+          : null,
+        failure: canceledDuringService ? receiptTimingFailure : receiptFailure,
+      });
+      receipts.push(receipt);
+      if (receiptFailure && (!canceledDuringService || receiptTimingFailure)) failures.push({
+        requestId: requestState.requestId,
+        status: receipt.status,
+        failure: clone$3(receiptFailure),
+      });
+    }
+
+    let serviceSettledAtMs = null;
+    let serviceTimingFailure = null;
+    let serviceTimingError = null;
+    try {
+      serviceSettledAtMs = now();
+    } catch (error) {
+      serviceTimingError = error;
+      serviceTimingFailure = {
+        phase: 'foreground-service-receipt-timing',
+        error: normalizeError$2(error),
+      };
+    }
+    const service = deepFreeze$3({
+      schema: WEBGPU_FOREGROUND_OPPORTUNITY_SERVICE_SCHEMA,
+      status: failures.length > 0 || serviceTimingFailure ? 'failed' : 'serviced',
+      routeId: state.routeId,
+      runId: state.runId,
+      serviceSequence: state.serviceSequence,
+      boundary,
+      startedAtMs: serviceStartedAtMs,
+      settledAtMs: serviceSettledAtMs,
+      capturedRequestCount: captured.length,
+      servicedRequestCount: receipts.length,
+      receiptIds: receipts.map(receipt => receipt.requestId),
+      failures,
+      failure: serviceTimingFailure,
+      authority: 'foreground-callbacks-settled-before-next-inference-encode-no-gpu-completion-or-presentation-claim',
+    });
+    state.services.push(clone$3(service));
+    if (!outsideRun && (receiptTimingError || serviceTimingFailure)) {
+      throw receiptTimingError || serviceTimingError;
+    }
+    return service;
+  }
+
+  async function serviceAtBoundary(boundaryInput = {}) {
+    const boundary = validateBoundary(boundaryInput);
+    const precedingTurn = state.serviceTail;
+    let releaseTurn;
+    state.serviceTail = new Promise(resolve => { releaseTurn = resolve; });
+    state.queuedServiceCount += 1;
+    await precedingTurn;
+    state.queuedServiceCount -= 1;
+    state.activeServiceCount += 1;
+    try {
+      return await serviceBoundaryTurn(boundary);
+    } finally {
+      state.activeServiceCount -= 1;
+      releaseTurn();
+    }
+  }
+
+  function pressureSnapshot() {
+    return Object.freeze({
+      schema: WEBGPU_FOREGROUND_OPPORTUNITY_PRESSURE_SCHEMA,
+      routeId: state.routeId,
+      runId: state.runId,
+      pendingRequestCount: state.pending.length,
+      activeRequestCount: state.activeRequestCount,
+      activeServiceCount: state.activeServiceCount,
+      queuedServiceCount: state.queuedServiceCount,
+      authority: 'live-foreground-opportunity-counters-no-history-clone',
+    });
+  }
+
+  function snapshot() {
+    const pressure = pressureSnapshot();
+    return deepFreeze$3({
+      schema: WEBGPU_FOREGROUND_OPPORTUNITY_SCHEMA,
+      routeId: state.routeId,
+      runId: state.runId,
+      retention: 'uncapped',
+      requestCount: state.requests.size,
+      pendingRequestCount: pressure.pendingRequestCount,
+      activeRequestCount: pressure.activeRequestCount,
+      activeServiceCount: pressure.activeServiceCount,
+      queuedServiceCount: pressure.queuedServiceCount,
+      receiptCount: state.receipts.length,
+      receipts: clone$3(state.receipts),
+      serviceCount: state.services.length,
+      services: clone$3(state.services),
+      noDemandBoundaryCount: state.noDemandBoundaryCount,
+      authority: 'foreground-opportunity-request-and-queue-submit-observation-no-presentation-claim',
+    });
+  }
+
+  function finish() {
+    const report = snapshot();
+    return deepFreeze$3({
+      ...report,
+      status: report.pendingRequestCount === 0
+          && report.activeRequestCount === 0
+          && report.activeServiceCount === 0
+          && report.queuedServiceCount === 0
+        ? 'succeeded'
+        : 'incomplete',
+    });
+  }
+
+  return Object.freeze({
+    schema: WEBGPU_FOREGROUND_OPPORTUNITY_SCHEMA,
+    request,
+    serviceAtBoundary,
+    pressureSnapshot,
+    snapshot,
+    finish,
+  });
+}
+
+const WEBGPU_FOREGROUND_SERVICE_SCHEMA = 'kaminos.webgpu-foreground-service.v0';
+
+/**
+ * One foreground requester across sequential model runs on a borrowed device.
+ * Await beginRun before model work, use the returned foregroundOpportunities
+ * at cooperative GPU boundaries, and wrap CPU/worker-only waits in
+ * withForeground(phase, work). That scope settles foreground callbacks before
+ * returning to the model; it does not fence GPU execution or preempt a duty.
+ * Await finish when model encoding ends, including on failure. A rejected
+ * finish leaves the run latched and does not certify queue completion; retain
+ * model-owned resources. Idle renderer callbacks continue after that failure.
+ * snapshot().lastOutsideRunService exposes the latest idle service result,
+ * including timing failures with an unknown settledAtMs. dispose drains idle
+ * callbacks after the last run; device/resource ownership stays external.
+ */
+function createWebGpuForegroundService(input = {}) {
+  const options = { ...input, queue: input.queue ?? input.device?.queue };
+  if (typeof options.queue?.submit !== 'function') throw new Error('queue.submit must be a function');
+  if (options.now != null && typeof options.now !== 'function') throw new Error('now must be a function');
+  createInterlock(options, true); // Validate before accepting any lifecycle state.
+  const outside = new Map();
+  let current = null;
+  let idleTail = Promise.resolve();
+  let disposal = null;
+  let sequence = 0;
+  let runCount = 0;
+  let outsideRunReceiptCount = 0;
+  let lastOutsideRunReceipt = null;
+  let lastOutsideRunService = null;
+
+  function assertOpen() {
+    if (disposal) throw new Error('foreground service is disposed');
+  }
+
+  function serviceBoundary(runId, phase) {
+    const id = `${options.routeId}:foreground-service:${++sequence}`;
+    return { invocationId: runId ?? id, boundaryId: id, dutyId: id, phase, position: 'before-encode' };
+  }
+
+  function request(requestInput) {
+    assertOpen();
+    if (current && !current.finishing) {
+      const handle = current.interlock.request(requestInput);
+      if (current.window?.accepting) current.service(current.window.phase);
+      return handle;
+    }
+    if (outside.has(requestInput?.requestId)) {
+      throw new Error(`duplicate foreground opportunity request ${requestInput.requestId}`);
+    }
+    // A one-request interlock gives idle frames the same contract without
+    // retaining an application's lifetime of frames in an internal history.
+    const interlock = createInterlock(options, true);
+    const handle = interlock.request(requestInput);
+    outside.set(handle.requestId, handle);
+    handle.completion.then(receipt => {
+      outside.delete(handle.requestId);
+      outsideRunReceiptCount += 1;
+      lastOutsideRunReceipt = receipt;
+    });
+    const finishing = current?.finishing;
+    // The model caller observes finish failure; it must not poison idle rendering.
+    idleTail = idleTail.then(() => finishing?.catch(() => undefined)).then(() =>
+      interlock.serviceAtBoundary(serviceBoundary(null, 'foreground-idle'))).then(service => {
+        lastOutsideRunService = service;
+        return service;
+      });
+    return handle;
+  }
+
+  function beginRun(runId) {
+    assertOpen();
+    if (current) throw new Error(`foreground service already has an active run (${current.runId})`);
+    const interlock = createInterlock({ ...options, runId });
+    const run = { runId, interlock, window: null, finishing: null, tail: Promise.resolve() };
+    current = run;
+    runCount += 1;
+
+    function assertRunning() {
+      if (current !== run || run.finishing) throw new Error(`foreground run ${runId} is finishing or finished`);
+      if (run.window) throw new Error('model GPU boundary is unavailable during a CPU foreground window');
+    }
+
+    function serviceAtBoundary(boundary) {
+      assertRunning();
+      run.tail = interlock.serviceAtBoundary(boundary);
+      return run.tail;
+    }
+    run.service = phase => {
+      run.tail = interlock.serviceAtBoundary(serviceBoundary(runId, phase));
+      return run.tail;
+    };
+
+    async function withForeground(phase, work) {
+      assertRunning();
+      if (!isNonEmptyString$4(phase)) throw new Error('foreground window phase must be a non-empty string');
+      if (typeof work !== 'function') throw new Error('foreground window work must be a function');
+      run.window = { phase, accepting: true };
+      run.service(phase);
+      try {
+        return await work();
+      } finally {
+        run.window.accepting = false;
+        try { await run.tail; } finally { run.window = null; }
+      }
+    }
+
+    function finish() {
+      if (run.finishing) return run.finishing;
+      assertRunning();
+      // Seal admission synchronously. New requests join idleTail behind this
+      // finish, while the interlock serializes the final drain after all turns.
+      let resolveFinish;
+      let rejectFinish;
+      run.finishing = new Promise((resolve, reject) => { resolveFinish = resolve; rejectFinish = reject; });
+      run.service('foreground-run-finish').then(() => {
+        const report = interlock.finish();
+        current = null;
+        resolveFinish(report);
+      }, rejectFinish);
+      return run.finishing;
+    }
+
+    const foregroundOpportunities = Object.freeze({
+      schema: WEBGPU_FOREGROUND_OPPORTUNITY_SCHEMA,
+      request(requestInput) {
+        if (current !== run || run.finishing) throw new Error(`foreground run ${runId} is finishing or finished`);
+        return request(requestInput);
+      },
+      serviceAtBoundary,
+      pressureSnapshot: interlock.pressureSnapshot,
+      snapshot: interlock.snapshot,
+      finish: interlock.finish,
+    });
+    // Reservation occurs before awaiting idle work: newly arriving frames join
+    // the new run instead of prolonging startup indefinitely.
+    return idleTail.then(() => Object.freeze({ runId, foregroundOpportunities, withForeground, finish }));
+  }
+
+  function snapshot() {
+    return Object.freeze({
+      schema: WEBGPU_FOREGROUND_SERVICE_SCHEMA,
+      routeId: options.routeId,
+      disposed: disposal !== null,
+      runCount,
+      activeRun: current ? Object.freeze({
+        runId: current.runId,
+        finishing: current.finishing !== null,
+        foregroundPhase: current.window?.phase ?? null,
+        pressure: current.interlock.pressureSnapshot(),
+      }) : null,
+      outsideRunInFlightCount: outside.size,
+      outsideRunReceiptCount,
+      lastOutsideRunReceipt,
+      lastOutsideRunService,
+    });
+  }
+
+  function dispose() {
+    if (disposal) return disposal;
+    if (current) throw new Error('finish the active run before disposing foreground service');
+    disposal = idleTail.then(() => undefined);
+    return disposal;
+  }
+
+  return Object.freeze({ schema: WEBGPU_FOREGROUND_SERVICE_SCHEMA, routeId: options.routeId, request, beginRun, snapshot, dispose });
+}
+
+function isNonEmptyString$3(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+const GPU_OBJECT_IDENTITY_KEYS = new Set(['module', 'layout']);
+
+function createObjectIdentityTracker() {
+  const objectIds = new WeakMap();
+  let nextObjectId = 1;
+
+  return function getObjectId(value) {
+    if (!objectIds.has(value)) {
+      objectIds.set(value, nextObjectId);
+      nextObjectId += 1;
+    }
+    return objectIds.get(value);
+  };
+}
+
+function pipelineDescriptorKey(descriptor, getObjectId) {
+  const seen = new WeakSet();
+  return JSON.stringify(descriptor, (key, inner) => {
+    if (typeof inner === 'function') return `[Function:${inner.name || 'anonymous'}]`;
+    if (!inner || typeof inner !== 'object') return inner;
+    if (GPU_OBJECT_IDENTITY_KEYS.has(key)) {
+      return { __gpuObjectId: getObjectId(inner) };
+    }
+    if (seen.has(inner)) return '[Circular]';
+    seen.add(inner);
+    if (Array.isArray(inner)) return inner;
+    const keys = Object.keys(inner);
+    if (keys.length === 0) return { __objectId: getObjectId(inner) };
+    const out = {};
+    for (const objectKey of keys.sort()) out[objectKey] = inner[objectKey];
+    return out;
+  });
+}
+
+function createWebGpuResourceCaches(device) {
+  if (!device || typeof device !== 'object') throw new Error('device must be an object');
+
+  const shaderModules = new Map();
+  const computePipelines = new Map();
+  const getObjectId = createObjectIdentityTracker();
+
+  return {
+    getShaderModule(label, code, descriptor = {}) {
+      if (!isNonEmptyString$3(label)) throw new Error('shader module label must be a non-empty string');
+      if (!isNonEmptyString$3(code)) throw new Error('shader module code must be a non-empty string');
+      if (typeof device.createShaderModule !== 'function') throw new Error('device.createShaderModule must be available');
+
+      const key = `${label}\u0000${code}`;
+      if (!shaderModules.has(key)) {
+        shaderModules.set(key, device.createShaderModule({
+          ...descriptor,
+          label,
+          code,
+        }));
+      }
+      return shaderModules.get(key);
+    },
+
+    getComputePipeline(label, descriptor) {
+      if (!isNonEmptyString$3(label)) throw new Error('compute pipeline label must be a non-empty string');
+      if (!descriptor || typeof descriptor !== 'object') throw new Error('compute pipeline descriptor must be an object');
+      if (typeof device.createComputePipeline !== 'function') throw new Error('device.createComputePipeline must be available');
+
+      const key = `${label}\u0000${pipelineDescriptorKey(descriptor, getObjectId)}`;
+      if (!computePipelines.has(key)) {
+        computePipelines.set(key, device.createComputePipeline({
+          ...descriptor,
+          label,
+        }));
+      }
+      return computePipelines.get(key);
+    },
+
+    clear() {
+      shaderModules.clear();
+      computePipelines.clear();
+    },
+
+    sizes() {
+      return {
+        shaderModules: shaderModules.size,
+        computePipelines: computePipelines.size,
+      };
+    },
+  };
+}
+
+const WEBGPU_COOPERATIVE_BOUNDARY_MANIFEST_SCHEMA =
+  'kaminos.webgpu-cooperative-boundary-manifest.v0';
+
+const BOUNDARY_KINDS = new Set(['gpu-command', 'cpu-work']);
+const COMMAND_DUTY_KINDS = new Set(['compute', 'copy', 'render', 'mixed']);
+const HOST_PHASES = new Set([
+  'cpu-preprocess',
+  'command-encoding',
+  'queue-submission',
+  'readback',
+  'presentation',
+  'other',
+]);
+const YIELD_POLICIES = new Set(['after-duty', 'none']);
+const TOP_LEVEL_KEYS = new Set(['manifestId', 'routeId', 'phases', 'metadata']);
+const PHASE_KEYS = new Set(['phaseId', 'boundaries', 'metadata']);
+const BOUNDARY_KEYS = new Set([
+  'boundaryId',
+  'kind',
+  'unit',
+  'totalItems',
+  'progressWeight',
+  'commandDutyKind',
+  'hostPhase',
+  'chunking',
+  'yieldPolicy',
+  'resources',
+  'metadata',
+]);
+
+function isPlainObject$2(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonEmptyString$2(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function requireIdentity(name, value) {
+  if (!isNonEmptyString$2(value)) throw new TypeError(`${name} must be a non-empty string`);
+  return value;
+}
+
+function requirePositiveSafeInteger$2(name, value) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError(`${name} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function clone$2(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function deepFreeze$2(value) {
+  if (value == null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze$2(child);
+  return Object.freeze(value);
+}
+
+function rejectUnsupportedKeys(value, allowed, name) {
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new TypeError(`${name} has unsupported field ${key}`);
+  }
+}
+
+function normalizeMetadata(value, name) {
+  if (value == null) return {};
+  if (!isPlainObject$2(value)) throw new TypeError(`${name} must be an object when provided`);
+  return clone$2(value);
+}
+
+function normalizeResourceList(value, name) {
+  if (value == null) return [];
+  if (!Array.isArray(value)) throw new TypeError(`${name} must be an array`);
+  const resources = value.map((resource, index) => requireIdentity(`${name}[${index}]`, resource));
+  if (new Set(resources).size !== resources.length) {
+    throw new TypeError(`${name} must not contain duplicate resource identities`);
+  }
+  return resources;
+}
+
+function normalizeResources(value, name) {
+  if (value == null) return { retain: [], produce: [], release: [] };
+  if (!isPlainObject$2(value)) throw new TypeError(`${name} must be an object when provided`);
+  rejectUnsupportedKeys(value, new Set(['retain', 'produce', 'release']), name);
+  return {
+    retain: normalizeResourceList(value.retain, `${name}.retain`),
+    produce: normalizeResourceList(value.produce, `${name}.produce`),
+    release: normalizeResourceList(value.release, `${name}.release`),
+  };
+}
+
+function normalizeChunking(value, kind, name) {
+  if (!isPlainObject$2(value)) throw new TypeError(`${name} must be an object`);
+  if (value.mode === 'fixed') {
+    rejectUnsupportedKeys(value, new Set(['mode', 'chunkItems']), name);
+    return {
+      mode: 'fixed',
+      chunkItems: requirePositiveSafeInteger$2(`${name}.chunkItems`, value.chunkItems),
+    };
+  }
+  if (value.mode !== 'adaptive') {
+    throw new TypeError(`${name}.mode must be fixed or adaptive`);
+  }
+  if (kind !== 'gpu-command') {
+    throw new TypeError(`${name}.mode adaptive is supported only for gpu-command boundaries`);
+  }
+  rejectUnsupportedKeys(
+    value,
+    new Set(['mode', 'initialItems', 'minItems', 'maxItems', 'targetDurationMs', 'adjustmentGain']),
+    name,
+  );
+  const initialItems = requirePositiveSafeInteger$2(`${name}.initialItems`, value.initialItems);
+  const minItems = requirePositiveSafeInteger$2(`${name}.minItems`, value.minItems);
+  const maxItems = requirePositiveSafeInteger$2(`${name}.maxItems`, value.maxItems);
+  if (maxItems < minItems) throw new TypeError(`${name}.maxItems must be at least minItems`);
+  if (initialItems < minItems || initialItems > maxItems) {
+    throw new TypeError(`${name}.initialItems must be within minItems and maxItems`);
+  }
+  if (!Number.isFinite(value.targetDurationMs) || value.targetDurationMs <= 0) {
+    throw new TypeError(`${name}.targetDurationMs must be finite and greater than zero`);
+  }
+  const adjustmentGain = value.adjustmentGain === undefined ? 1 : value.adjustmentGain;
+  if (!Number.isFinite(adjustmentGain) || adjustmentGain <= 0 || adjustmentGain > 1) {
+    throw new TypeError(`${name}.adjustmentGain must be finite, greater than zero, and at most one`);
+  }
+  return {
+    mode: 'adaptive',
+    initialItems,
+    minItems,
+    maxItems,
+    targetDurationMs: value.targetDurationMs,
+    adjustmentGain,
+  };
+}
+
+function normalizeBoundary(value, phaseId, boundaryIds, index) {
+  const name = `phases.${phaseId}.boundaries[${index}]`;
+  if (!isPlainObject$2(value)) throw new TypeError(`${name} must be an object`);
+  rejectUnsupportedKeys(value, BOUNDARY_KEYS, name);
+  const boundaryId = requireIdentity(`${name}.boundaryId`, value.boundaryId);
+  if (boundaryIds.has(boundaryId)) throw new TypeError(`duplicate boundaryId: ${boundaryId}`);
+  boundaryIds.add(boundaryId);
+
+  if (!BOUNDARY_KINDS.has(value.kind)) {
+    throw new TypeError(`${name}.kind must be gpu-command or cpu-work`);
+  }
+  const totalItems = value.totalItems == null
+    ? null
+    : requirePositiveSafeInteger$2(`${name}.totalItems`, value.totalItems);
+  if (!Number.isFinite(value.progressWeight) || value.progressWeight <= 0) {
+    throw new TypeError(`${name}.progressWeight must be finite and greater than zero`);
+  }
+  const yieldPolicy = value.yieldPolicy || 'after-duty';
+  if (!YIELD_POLICIES.has(yieldPolicy)) {
+    throw new TypeError(`${name}.yieldPolicy must be after-duty or none`);
+  }
+
+  let commandDutyKind = null;
+  let hostPhase = null;
+  if (value.kind === 'gpu-command') {
+    commandDutyKind = value.commandDutyKind || 'compute';
+    if (!COMMAND_DUTY_KINDS.has(commandDutyKind)) {
+      throw new TypeError(`${name}.commandDutyKind is unsupported`);
+    }
+    if (value.hostPhase != null) throw new TypeError(`${name}.hostPhase belongs only to cpu-work boundaries`);
+  } else {
+    hostPhase = value.hostPhase || 'other';
+    if (!HOST_PHASES.has(hostPhase)) throw new TypeError(`${name}.hostPhase is unsupported`);
+    if (value.commandDutyKind != null) {
+      throw new TypeError(`${name}.commandDutyKind belongs only to gpu-command boundaries`);
+    }
+  }
+
+  return {
+    boundaryId,
+    kind: value.kind,
+    unit: requireIdentity(`${name}.unit`, value.unit),
+    totalItems,
+    progressWeight: value.progressWeight,
+    commandDutyKind,
+    hostPhase,
+    chunking: normalizeChunking(value.chunking, value.kind, `${name}.chunking`),
+    yieldPolicy,
+    resources: normalizeResources(value.resources, `${name}.resources`),
+    metadata: normalizeMetadata(value.metadata, `${name}.metadata`),
+  };
+}
+
+function defineWebGpuCooperativeBoundaryManifest(input = {}) {
+  if (!isPlainObject$2(input)) throw new TypeError('cooperative boundary manifest input must be an object');
+  rejectUnsupportedKeys(input, TOP_LEVEL_KEYS, 'cooperative boundary manifest');
+  const manifestId = requireIdentity('manifestId', input.manifestId);
+  const routeId = requireIdentity('routeId', input.routeId);
+  if (!Array.isArray(input.phases) || input.phases.length === 0) {
+    throw new TypeError('phases must be a non-empty array');
+  }
+
+  const phaseIds = new Set();
+  const boundaryIds = new Set();
+  const phases = input.phases.map((phase, phaseIndex) => {
+    const name = `phases[${phaseIndex}]`;
+    if (!isPlainObject$2(phase)) throw new TypeError(`${name} must be an object`);
+    rejectUnsupportedKeys(phase, PHASE_KEYS, name);
+    const phaseId = requireIdentity(`${name}.phaseId`, phase.phaseId);
+    if (phaseIds.has(phaseId)) throw new TypeError(`duplicate phaseId: ${phaseId}`);
+    phaseIds.add(phaseId);
+    if (!Array.isArray(phase.boundaries) || phase.boundaries.length === 0) {
+      throw new TypeError(`${name}.boundaries must be a non-empty array`);
+    }
+    const boundaries = phase.boundaries.map((boundary, boundaryIndex) => (
+      normalizeBoundary(boundary, phaseId, boundaryIds, boundaryIndex)
+    ));
+    return {
+      phaseId,
+      progressWeight: boundaries.reduce((sum, boundary) => sum + boundary.progressWeight, 0),
+      boundaries,
+      metadata: normalizeMetadata(phase.metadata, `${name}.metadata`),
+    };
+  });
+
+  return deepFreeze$2({
+    schema: WEBGPU_COOPERATIVE_BOUNDARY_MANIFEST_SCHEMA,
+    manifestId,
+    routeId,
+    progressWeight: phases.reduce((sum, phase) => sum + phase.progressWeight, 0),
+    phases,
+    metadata: normalizeMetadata(input.metadata, 'metadata'),
+  });
+}
+
+const WEBGPU_ADAPTIVE_COMMAND_DUTY_PLANNER_SCHEMA = 'kaminos.webgpu-adaptive-command-duty-planner.v0';
+const WEBGPU_ADAPTIVE_COMMAND_DUTY_RANGE_SCHEMA = 'kaminos.webgpu-adaptive-command-duty-range.v0';
+const WEBGPU_ADAPTIVE_COMMAND_DUTY_OBSERVATION_SCHEMA = 'kaminos.webgpu-adaptive-command-duty-observation.v0';
+
+const ADAPTIVE_TIMING_AUTHORITIES = new Set([
+  'queue-work-done',
+  'gpu-timestamp-query',
+]);
+
+function isPlainObject$1(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonEmptyString$1(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function requirePositiveSafeInteger$1(value, name) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive safe integer`);
+  }
+}
+
+function clone$1(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function deepFreeze$1(value) {
+  if (value == null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze$1(child);
+  return Object.freeze(value);
+}
+
+function normalizeError$1(error) {
+  return {
+    name: isNonEmptyString$1(error?.name) ? error.name : 'Error',
+    message: isNonEmptyString$1(error?.message) ? error.message : String(error),
+  };
+}
+
+function normalizeInput(input) {
+  if (!isPlainObject$1(input)) throw new Error('adaptive command duty planner input must be an object');
+  if (!isNonEmptyString$1(input.plannerId)) throw new Error('plannerId must be a non-empty string');
+  if (!isNonEmptyString$1(input.unit)) throw new Error('unit must be a non-empty string');
+  requirePositiveSafeInteger$1(input.totalItems, 'totalItems');
+  requirePositiveSafeInteger$1(input.initialChunkItems, 'initialChunkItems');
+  if (!Number.isFinite(input.targetDurationMs) || input.targetDurationMs <= 0) {
+    throw new Error('targetDurationMs must be finite and greater than zero');
+  }
+  const adjustmentGain = input.adjustmentGain === undefined ? 1 : input.adjustmentGain;
+  if (!Number.isFinite(adjustmentGain) || adjustmentGain <= 0 || adjustmentGain > 1) {
+    throw new Error('adjustmentGain must be finite, greater than zero, and at most one');
+  }
+  if (!isPlainObject$1(input.bounds)) throw new Error('bounds must be a caller-declared object');
+  const { minChunkItems, maxChunkItems } = input.bounds;
+  requirePositiveSafeInteger$1(minChunkItems, 'bounds.minChunkItems');
+  requirePositiveSafeInteger$1(maxChunkItems, 'bounds.maxChunkItems');
+  if (maxChunkItems < minChunkItems) {
+    throw new Error('bounds.maxChunkItems must be greater than or equal to bounds.minChunkItems');
+  }
+  if (input.initialChunkItems < minChunkItems || input.initialChunkItems > maxChunkItems) {
+    throw new Error('initialChunkItems must be within caller-declared bounds');
+  }
+  if (input.metadata != null && !isPlainObject$1(input.metadata)) {
+    throw new Error('metadata must be an object when provided');
+  }
+  if (input.retention != null && input.retention !== 'uncapped') {
+    throw new Error('adaptive command duty history retention is uncapped');
+  }
+  return {
+    plannerId: input.plannerId,
+    unit: input.unit,
+    totalItems: input.totalItems,
+    initialChunkItems: input.initialChunkItems,
+    targetDurationMs: input.targetDurationMs,
+    requestedAdjustmentGain: adjustmentGain,
+    effectiveAdjustmentGain: adjustmentGain,
+    bounds: { minChunkItems, maxChunkItems },
+    metadata: clone$1(input.metadata || {}),
+  };
+}
+
+function nextChunkFromObservation({
+  range,
+  observedDurationMs,
+  targetDurationMs,
+  adjustmentGain,
+  bounds,
+}) {
+  let fullGainCorrectionRatio;
+  if (observedDurationMs === 0) {
+    fullGainCorrectionRatio = Number.POSITIVE_INFINITY;
+  } else {
+    fullGainCorrectionRatio = targetDurationMs / observedDurationMs;
+  }
+  const effectiveCorrectionRatio = fullGainCorrectionRatio ** adjustmentGain;
+  const rawChunkItems = range.itemCount * fullGainCorrectionRatio;
+  const effectiveRawChunkItems = range.itemCount * effectiveCorrectionRatio;
+
+  let nextChunkItems;
+  let boundApplication = null;
+  if (effectiveRawChunkItems < bounds.minChunkItems) {
+    nextChunkItems = bounds.minChunkItems;
+    boundApplication = 'minChunkItems';
+  } else if (effectiveRawChunkItems > bounds.maxChunkItems) {
+    nextChunkItems = bounds.maxChunkItems;
+    boundApplication = 'maxChunkItems';
+  } else {
+    nextChunkItems = Math.max(
+      bounds.minChunkItems,
+      Math.min(bounds.maxChunkItems, Math.round(effectiveRawChunkItems)),
+    );
+  }
+
+  return {
+    fullGainCorrectionRatio: Number.isFinite(fullGainCorrectionRatio)
+      ? fullGainCorrectionRatio
+      : null,
+    effectiveCorrectionRatio: Number.isFinite(effectiveCorrectionRatio)
+      ? effectiveCorrectionRatio
+      : null,
+    rawChunkItems: Number.isFinite(rawChunkItems) ? rawChunkItems : null,
+    effectiveRawChunkItems: Number.isFinite(effectiveRawChunkItems)
+      ? effectiveRawChunkItems
+      : null,
+    nextChunkItems,
+    boundApplication,
+    adjustment: nextChunkItems < range.plannedChunkItems
+      ? 'decrease'
+      : nextChunkItems > range.plannedChunkItems
+        ? 'increase'
+        : 'maintain',
+  };
+}
+
+function createWebGpuAdaptiveCommandDutyPlanner(input = {}) {
+  const config = normalizeInput(input);
+  const state = {
+    status: 'active',
+    completedItems: 0,
+    currentChunkItems: config.initialChunkItems,
+    pendingRange: null,
+    ranges: [],
+    observations: [],
+    failure: null,
+  };
+
+  function snapshot() {
+    return clone$1({
+      schema: WEBGPU_ADAPTIVE_COMMAND_DUTY_PLANNER_SCHEMA,
+      plannerId: config.plannerId,
+      unit: config.unit,
+      status: state.status,
+      totalItems: config.totalItems,
+      completedItems: state.completedItems,
+      progress: state.completedItems / config.totalItems,
+      initialChunkItems: config.initialChunkItems,
+      currentChunkItems: state.currentChunkItems,
+      targetDurationMs: config.targetDurationMs,
+      requestedAdjustmentGain: config.requestedAdjustmentGain,
+      effectiveAdjustmentGain: config.effectiveAdjustmentGain,
+      bounds: config.bounds,
+      metadata: config.metadata,
+      retention: 'uncapped',
+      pendingRangeId: state.pendingRange?.rangeId || null,
+      rangeCount: state.ranges.length,
+      actualRangeCount: state.status === 'complete' ? state.ranges.length : null,
+      rangeCountAuthority: state.status === 'complete' ? 'actual' : 'open-until-completion',
+      ranges: state.ranges,
+      observations: state.observations,
+      failure: state.failure,
+    });
+  }
+
+  function nextRange() {
+    if (state.status === 'failed') throw new Error('failed planner cannot produce another range');
+    if (state.status === 'complete') return null;
+    if (state.pendingRange) throw new Error(`pending range ${state.pendingRange.rangeId} must be observed or failed first`);
+
+    const itemStart = state.completedItems;
+    const itemCount = Math.min(state.currentChunkItems, config.totalItems - itemStart);
+    const itemEnd = itemStart + itemCount;
+    const rangeIndex = state.ranges.length;
+    const range = deepFreeze$1({
+      schema: WEBGPU_ADAPTIVE_COMMAND_DUTY_RANGE_SCHEMA,
+      plannerId: config.plannerId,
+      rangeId: `${config.plannerId}:${rangeIndex}`,
+      rangeIndex,
+      rangeTotal: null,
+      rangeCountAuthority: 'actual-after-completion',
+      unit: config.unit,
+      itemStart,
+      itemEnd,
+      itemCount,
+      totalItems: config.totalItems,
+      completedItemsBefore: itemStart,
+      completedItemsAfter: itemEnd,
+      progressBefore: itemStart / config.totalItems,
+      progressAfter: itemEnd / config.totalItems,
+      plannedChunkItems: state.currentChunkItems,
+      targetDurationMs: config.targetDurationMs,
+      requestedAdjustmentGain: config.requestedAdjustmentGain,
+      effectiveAdjustmentGain: config.effectiveAdjustmentGain,
+      bounds: clone$1(config.bounds),
+      metadata: clone$1(config.metadata),
+    });
+    state.pendingRange = range;
+    state.ranges.push({ ...clone$1(range), status: 'pending-observation' });
+    return range;
+  }
+
+  function requirePendingRange(rangeId) {
+    if (!state.pendingRange) throw new Error('adaptive command duty planner has no pending range');
+    if (rangeId !== state.pendingRange.rangeId) {
+      throw new Error(`rangeId ${rangeId || '<missing>'} does not match pending range ${state.pendingRange.rangeId}`);
+    }
+    return state.pendingRange;
+  }
+
+  function observeRange(observation = {}) {
+    if (state.status !== 'active') throw new Error(`${state.status} planner cannot accept range observations`);
+    if (!isPlainObject$1(observation)) throw new Error('range observation must be an object');
+    const range = requirePendingRange(observation.rangeId);
+    if (!ADAPTIVE_TIMING_AUTHORITIES.has(observation.timingAuthority)) {
+      throw new Error('timingAuthority must be queue-work-done or gpu-timestamp-query');
+    }
+    if (!Number.isFinite(observation.observedDurationMs) || observation.observedDurationMs < 0) {
+      throw new Error('observedDurationMs must be finite and non-negative');
+    }
+    if (observation.timingAuthority === 'gpu-timestamp-query'
+        && observation.observedDurationMs <= 0) {
+      throw new Error('gpu-timestamp-query observedDurationMs must be greater than zero');
+    }
+
+    state.completedItems = range.itemEnd;
+    const complete = state.completedItems === config.totalItems;
+    const adjustment = complete
+      ? {
+          fullGainCorrectionRatio: null,
+          effectiveCorrectionRatio: null,
+          rawChunkItems: null,
+          effectiveRawChunkItems: null,
+          nextChunkItems: null,
+          boundApplication: null,
+          adjustment: 'complete',
+        }
+      : nextChunkFromObservation({
+          range,
+          observedDurationMs: observation.observedDurationMs,
+          targetDurationMs: config.targetDurationMs,
+          adjustmentGain: config.effectiveAdjustmentGain,
+          bounds: config.bounds,
+        });
+    if (!complete) state.currentChunkItems = adjustment.nextChunkItems;
+    state.status = complete ? 'complete' : 'active';
+    state.pendingRange = null;
+
+    const receipt = deepFreeze$1({
+      schema: WEBGPU_ADAPTIVE_COMMAND_DUTY_OBSERVATION_SCHEMA,
+      plannerId: config.plannerId,
+      status: complete ? 'planner-complete' : 'range-observed',
+      rangeId: range.rangeId,
+      rangeIndex: range.rangeIndex,
+      timingAuthority: observation.timingAuthority,
+      observedDurationMs: observation.observedDurationMs,
+      targetDurationMs: config.targetDurationMs,
+      requestedAdjustmentGain: config.requestedAdjustmentGain,
+      effectiveAdjustmentGain: config.effectiveAdjustmentGain,
+      fullGainCorrectionRatio: adjustment.fullGainCorrectionRatio,
+      effectiveCorrectionRatio: adjustment.effectiveCorrectionRatio,
+      observedChunkItems: range.itemCount,
+      rawNextChunkItems: adjustment.rawChunkItems,
+      effectiveRawNextChunkItems: adjustment.effectiveRawChunkItems,
+      nextChunkItems: adjustment.nextChunkItems,
+      adjustment: adjustment.adjustment,
+      boundApplication: adjustment.boundApplication,
+      completedItems: state.completedItems,
+      totalItems: config.totalItems,
+      progress: state.completedItems / config.totalItems,
+      actualRangeCount: complete ? state.ranges.length : null,
+      rangeCountAuthority: complete ? 'actual' : 'open-until-completion',
+      metadata: clone$1(config.metadata),
+    });
+    state.ranges[range.rangeIndex] = {
+      ...state.ranges[range.rangeIndex],
+      status: 'observed',
+      observedDurationMs: observation.observedDurationMs,
+      timingAuthority: observation.timingAuthority,
+    };
+    state.observations.push(clone$1(receipt));
+    return receipt;
+  }
+
+  function failRange(failureInput = {}) {
+    if (state.status !== 'active') throw new Error(`${state.status} planner cannot fail a range`);
+    if (!isPlainObject$1(failureInput)) throw new Error('range failure must be an object');
+    const range = requirePendingRange(failureInput.rangeId);
+    if (!isNonEmptyString$1(failureInput.phase)) throw new Error('range failure phase must be a non-empty string');
+    const failure = deepFreeze$1({
+      rangeId: range.rangeId,
+      rangeIndex: range.rangeIndex,
+      phase: failureInput.phase,
+      error: normalizeError$1(failureInput.error),
+    });
+    state.status = 'failed';
+    state.failure = clone$1(failure);
+    state.pendingRange = null;
+    state.ranges[range.rangeIndex] = {
+      ...state.ranges[range.rangeIndex],
+      status: 'failed',
+      failure: clone$1(failure),
+    };
+    return deepFreeze$1({
+      schema: WEBGPU_ADAPTIVE_COMMAND_DUTY_OBSERVATION_SCHEMA,
+      plannerId: config.plannerId,
+      status: 'failed',
+      completedItems: state.completedItems,
+      totalItems: config.totalItems,
+      requestedAdjustmentGain: config.requestedAdjustmentGain,
+      effectiveAdjustmentGain: config.effectiveAdjustmentGain,
+      rangeCountAuthority: 'open-at-failure',
+      actualRangeCount: null,
+      failure,
+      metadata: clone$1(config.metadata),
+    });
+  }
+
+  return Object.freeze({
+    schema: WEBGPU_ADAPTIVE_COMMAND_DUTY_PLANNER_SCHEMA,
+    plannerId: config.plannerId,
+    unit: config.unit,
+    nextRange,
+    observeRange,
+    failRange,
+    snapshot,
+  });
+}
+
+const WEBGPU_COOPERATIVE_EXECUTION_REPORT_SCHEMA =
+  'kaminos.webgpu-cooperative-execution-report.v0';
+const WEBGPU_COOPERATIVE_PROGRESS_SCHEMA =
+  'kaminos.webgpu-cooperative-progress.v0';
+const WEBGPU_COOPERATIVE_RANGE_SCHEMA =
+  'kaminos.webgpu-cooperative-range.v0';
+
+const SCHEDULING_MODES = new Set(['cooperative', 'disabled']);
+const COMPLETION_POLICIES = new Set(['strict-prefix', 'bounded-prefix']);
+
+function isPlainObject(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function clone(value) {
+  return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+function deepFreeze(value) {
+  if (value == null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
+function requirePositiveSafeInteger(name, value) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError(`${name} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function normalizeError(error) {
+  return {
+    name: isNonEmptyString(error?.name) ? error.name : 'Error',
+    message: isNonEmptyString(error?.message) ? error.message : String(error),
+  };
+}
+
+function readNow(now) {
+  const value = now();
+  if (!Number.isFinite(value)) throw new TypeError('cooperative execution clock returned a non-finite value');
+  return value;
+}
+
+function createAbortError(signal) {
+  const reason = signal?.reason;
+  const error = new Error(
+    isNonEmptyString(reason?.message)
+      ? reason.message
+      : isNonEmptyString(reason)
+        ? reason
+        : 'cooperative execution was cancelled',
+  );
+  error.name = 'AbortError';
+  return error;
+}
+
+function createFixedRangePlanner({
+  plannerId,
+  unit,
+  totalItems,
+  chunkItems,
+  metadata,
+  maxPendingRanges = 1,
+}) {
+  const ranges = [];
+  let status = 'active';
+  let issuedItems = 0;
+  let completedItems = 0;
+  let pendingRanges = [];
+  let failure = null;
+
+  function snapshot() {
+    return clone({
+      status,
+      plannerId,
+      unit,
+      totalItems,
+      issuedItems,
+      completedItems,
+      progress: completedItems / totalItems,
+      maxPendingRanges,
+      pendingRangeId: pendingRanges[0]?.rangeId || null,
+      pendingRangeIds: pendingRanges.map(range => range.rangeId),
+      pendingRangeCount: pendingRanges.length,
+      rangeCount: ranges.length,
+      actualRangeCount: status === 'complete' ? ranges.length : null,
+      rangeCountAuthority: status === 'complete' ? 'actual' : 'open-until-completion',
+      ranges,
+      failure,
+    });
+  }
+
+  return Object.freeze({
+    nextRange() {
+      if (status === 'failed') throw new Error('failed planner cannot produce another range');
+      if (status === 'complete') return null;
+      if (pendingRanges.length >= maxPendingRanges) {
+        throw new Error(
+          `pending range capacity ${maxPendingRanges} must retire before another range is issued`,
+        );
+      }
+      if (issuedItems === totalItems) return null;
+      const itemStart = issuedItems;
+      const itemCount = Math.min(chunkItems, totalItems - itemStart);
+      const rangeIndex = ranges.length;
+      const pendingRange = deepFreeze({
+        schema: WEBGPU_COOPERATIVE_RANGE_SCHEMA,
+        plannerId,
+        rangeId: `${plannerId}:${rangeIndex}`,
+        rangeIndex,
+        rangeTotal: null,
+        rangeCountAuthority: 'actual-after-completion',
+        unit,
+        itemStart,
+        itemEnd: itemStart + itemCount,
+        itemCount,
+        totalItems,
+        completedItemsBefore: itemStart,
+        completedItemsAfter: itemStart + itemCount,
+        progressBefore: itemStart / totalItems,
+        progressAfter: (itemStart + itemCount) / totalItems,
+        plannedChunkItems: chunkItems,
+        metadata: clone(metadata),
+      });
+      issuedItems = pendingRange.itemEnd;
+      pendingRanges.push(pendingRange);
+      ranges.push({ ...clone(pendingRange), status: 'pending-completion' });
+      return pendingRange;
+    },
+
+    completeRange(rangeId, detail = {}) {
+      if (status !== 'active' || pendingRanges.length === 0) {
+        throw new Error('planner has no active range to complete');
+      }
+      const range = pendingRanges[0];
+      if (range.rangeId !== rangeId) {
+        throw new Error('range does not match the oldest pending planner range');
+      }
+      completedItems = range.itemEnd;
+      status = completedItems === totalItems ? 'complete' : 'active';
+      pendingRanges.shift();
+      ranges[range.rangeIndex] = {
+        ...ranges[range.rangeIndex],
+        ...clone(detail),
+        status: 'completed',
+      };
+      return snapshot();
+    },
+
+    failRange(rangeId, phase, error) {
+      if (status !== 'active' || pendingRanges.length === 0) return snapshot();
+      const pendingRange = pendingRanges.find(range => range.rangeId === rangeId);
+      if (!pendingRange) throw new Error('range does not match a pending planner range');
+      failure = {
+        rangeId,
+        rangeIndex: pendingRange.rangeIndex,
+        phase,
+        error: normalizeError(error),
+      };
+      ranges[pendingRange.rangeIndex] = {
+        ...ranges[pendingRange.rangeIndex],
+        status: 'failed',
+        failure: clone(failure),
+      };
+      pendingRanges = [];
+      status = 'failed';
+      return snapshot();
+    },
+
+    snapshot,
+  });
+}
+
+function decorateError(error, report) {
+  const decorated = error instanceof Error ? error : new Error(String(error));
+  try {
+    Object.defineProperty(decorated, 'cooperativeExecutionReport', {
+      value: report,
+      configurable: true,
+      enumerable: false,
+    });
+  } catch {
+    decorated.cooperativeExecutionReport = report;
+  }
+  return decorated;
+}
+
+function createWebGpuCooperativeExecution(input = {}) {
+  if (!isPlainObject(input)) throw new TypeError('cooperative execution input must be an object');
+  const runtime = input.runtime;
+  const manifest = input.manifest;
+  if (!runtime || typeof runtime !== 'object') throw new TypeError('runtime must be an object');
+  if (manifest?.schema !== WEBGPU_COOPERATIVE_BOUNDARY_MANIFEST_SCHEMA) {
+    throw new TypeError('a cooperative boundary manifest is required');
+  }
+  if (runtime.routeId !== manifest.routeId) throw new Error('cooperative execution runtime route mismatch');
+  if (typeof runtime.runInvocation !== 'function') {
+    throw new TypeError('runtime.runInvocation must be available');
+  }
+  if (!runtime.queue || typeof runtime.queue !== 'object') {
+    throw new TypeError('runtime.queue must be available');
+  }
+  if (!isNonEmptyString(input.invocationId)) {
+    throw new TypeError('invocationId must be a non-empty caller-owned identity');
+  }
+  const schedulingMode = input.schedulingMode || 'cooperative';
+  if (!SCHEDULING_MODES.has(schedulingMode)) {
+    throw new TypeError('schedulingMode must be cooperative or disabled');
+  }
+  const completionPolicy = input.completionPolicy || 'strict-prefix';
+  if (!COMPLETION_POLICIES.has(completionPolicy)) {
+    throw new TypeError('completionPolicy must be strict-prefix or bounded-prefix');
+  }
+  if (completionPolicy === 'bounded-prefix' && schedulingMode !== 'cooperative') {
+    throw new TypeError('bounded-prefix completion requires cooperative scheduling');
+  }
+  if (completionPolicy === 'bounded-prefix') {
+    requirePositiveSafeInteger('maxInFlightGpuDuties', input.maxInFlightGpuDuties);
+    const adaptiveGpuBoundary = manifest.phases
+      .flatMap(phase => phase.boundaries)
+      .find(boundary => boundary.kind === 'gpu-command' && boundary.chunking.mode === 'adaptive');
+    if (adaptiveGpuBoundary) {
+      throw new TypeError(
+        `bounded-prefix completion supports fixed GPU boundaries only; ${adaptiveGpuBoundary.boundaryId} is adaptive`,
+      );
+    }
+  } else if (input.maxInFlightGpuDuties != null) {
+    throw new TypeError('maxInFlightGpuDuties is available only with bounded-prefix completion');
+  }
+  const maxInFlightGpuDuties = completionPolicy === 'bounded-prefix'
+    ? input.maxInFlightGpuDuties
+    : 1;
+  if (input.onProgress != null && typeof input.onProgress !== 'function') {
+    throw new TypeError('onProgress must be a function when provided');
+  }
+  if (input.now != null && typeof input.now !== 'function') {
+    throw new TypeError('now must be a function when provided');
+  }
+  const now = input.now || (() => globalThis.performance?.now?.() ?? Date.now());
+  const signal = input.signal || null;
+  if (signal != null && typeof signal.aborted !== 'boolean') {
+    throw new TypeError('signal must be an AbortSignal when provided');
+  }
+
+  const definitions = new Map();
+  const boundaryStates = new Map();
+  for (const phase of manifest.phases) {
+    for (const boundary of phase.boundaries) {
+      definitions.set(boundary.boundaryId, { phase, boundary });
+      boundaryStates.set(boundary.boundaryId, {
+        phaseId: phase.phaseId,
+        boundaryId: boundary.boundaryId,
+        kind: boundary.kind,
+        unit: boundary.unit,
+        status: 'pending',
+        totalItems: boundary.totalItems,
+        completedItems: 0,
+        progressWeight: boundary.progressWeight,
+        planner: null,
+        controller: null,
+        ranges: [],
+        failure: null,
+      });
+    }
+  }
+
+  const state = {
+    status: 'pending',
+    startedAtMs: null,
+    endedAtMs: null,
+    failure: null,
+    currentPhaseId: null,
+    currentBoundaryId: null,
+    schedulerRevision: null,
+    invocationScheduler: null,
+    runCalled: false,
+    terminalQueueFenceObserved: false,
+    submittedGpuDutyCount: 0,
+    observedPrefixFenceCount: 0,
+    unfencedSubmittedGpuDutyCount: 0,
+    gpuDuties: [],
+    inFlightGpuDuties: [],
+    maxObservedInFlightGpuDuties: 0,
+  };
+
+  function checkCancellation() {
+    if (signal?.aborted) throw createAbortError(signal);
+  }
+
+  function boundaryProgress(boundaryState) {
+    if (boundaryState.totalItems == null) return null;
+    return boundaryState.completedItems / boundaryState.totalItems;
+  }
+
+  function createProgress() {
+    const phases = manifest.phases.map(phase => {
+      const states = phase.boundaries.map(boundary => boundaryStates.get(boundary.boundaryId));
+      const allTotalsKnown = states.every(boundary => boundary.totalItems != null);
+      const totalItems = allTotalsKnown
+        ? states.reduce((sum, boundary) => sum + boundary.totalItems, 0)
+        : null;
+      const completedItems = states.reduce((sum, boundary) => sum + boundary.completedItems, 0);
+      const completedWeight = allTotalsKnown
+        ? states.reduce(
+            (sum, boundary) => sum + boundary.progressWeight * boundaryProgress(boundary),
+            0,
+          )
+        : null;
+      const progress = completedWeight == null ? null : completedWeight / phase.progressWeight;
+      const statuses = new Set(states.map(boundary => boundary.status));
+      const phaseStatus = statuses.has('failed')
+        ? 'failed'
+        : statuses.has('cancelled')
+          ? 'cancelled'
+          : states.every(boundary => boundary.status === 'complete')
+            ? 'complete'
+            : states.some(boundary => boundary.status === 'active')
+              ? 'active'
+              : 'pending';
+      return {
+        phaseId: phase.phaseId,
+        status: phaseStatus,
+        completedItems,
+        totalItems,
+        progress,
+        percent: progress == null ? null : progress * 100,
+        completedWeight,
+        totalWeight: phase.progressWeight,
+      };
+    });
+    const allTotalsKnown = [...boundaryStates.values()].every(boundary => boundary.totalItems != null);
+    const completedItems = [...boundaryStates.values()]
+      .reduce((sum, boundary) => sum + boundary.completedItems, 0);
+    const totalItems = allTotalsKnown
+      ? [...boundaryStates.values()].reduce((sum, boundary) => sum + boundary.totalItems, 0)
+      : null;
+    const completedWeight = allTotalsKnown
+      ? [...boundaryStates.values()].reduce(
+          (sum, boundary) => sum + boundary.progressWeight * boundaryProgress(boundary),
+          0,
+        )
+      : null;
+    const progress = completedWeight == null ? null : completedWeight / manifest.progressWeight;
+    return deepFreeze({
+      schema: WEBGPU_COOPERATIVE_PROGRESS_SCHEMA,
+      routeId: manifest.routeId,
+      invocationId: input.invocationId,
+      status: state.status,
+      completedItems,
+      totalItems,
+      progress,
+      percent: progress == null ? null : progress * 100,
+      completedWeight,
+      totalWeight: manifest.progressWeight,
+      currentPhaseId: state.currentPhaseId,
+      currentBoundaryId: state.currentBoundaryId,
+      phases,
+    });
+  }
+
+  function emitProgress(boundaryState) {
+    const progress = createProgress();
+    if (input.onProgress) {
+      try {
+        input.onProgress(progress);
+      } catch (error) {
+        throw failExecution(error, 'progress-callback', boundaryState);
+      }
+    }
+    return progress;
+  }
+
+  function createReport() {
+    const gpuBoundaryCount = [...definitions.values()]
+      .filter(definition => definition.boundary.kind === 'gpu-command').length;
+    const queueCompletionAuthority = gpuBoundaryCount === 0
+      ? 'not-applicable'
+      : state.submittedGpuDutyCount === 0
+        ? 'no-gpu-duty-submitted'
+        : state.unfencedSubmittedGpuDutyCount > 0
+          ? 'incomplete-prefix-fence-authority'
+          : schedulingMode === 'cooperative'
+        ? completionPolicy === 'bounded-prefix'
+          ? 'bounded-per-gpu-duty-prefix-fence'
+          : 'per-gpu-duty-prefix-fence'
+        : state.terminalQueueFenceObserved
+          ? 'one-terminal-prefix-fence'
+          : state.observedPrefixFenceCount === state.submittedGpuDutyCount
+            ? 'exceptional-per-duty-prefix-fence'
+            : 'terminal-prefix-fence-pending';
+    return deepFreeze({
+      schema: WEBGPU_COOPERATIVE_EXECUTION_REPORT_SCHEMA,
+      status: state.status,
+      routeId: manifest.routeId,
+      manifestId: manifest.manifestId,
+      invocationId: input.invocationId,
+      schedulingMode,
+      completionPolicy,
+      maxInFlightGpuDuties,
+      maxObservedInFlightGpuDuties: state.maxObservedInFlightGpuDuties,
+      issuedGpuDutyCount: state.gpuDuties.length,
+      retiredGpuDutyCount: state.gpuDuties.filter(duty => duty.status === 'retired').length,
+      inFlightGpuDutyCount: state.inFlightGpuDuties.length,
+      inFlightGpuDutyIds: state.inFlightGpuDuties.map(entry => entry.dutyId),
+      gpuDuties: clone(state.gpuDuties),
+      schedulerRevision: state.schedulerRevision,
+      invocationScheduler: clone(state.invocationScheduler),
+      queueCompletionAuthority,
+      submittedGpuDutyCount: state.submittedGpuDutyCount,
+      observedPrefixFenceCount: state.observedPrefixFenceCount,
+      unfencedSubmittedGpuDutyCount: state.unfencedSubmittedGpuDutyCount,
+      retention: 'uncapped',
+      startedAtMs: state.startedAtMs,
+      endedAtMs: state.endedAtMs,
+      durationMs: state.startedAtMs == null || state.endedAtMs == null
+        ? null
+        : state.endedAtMs - state.startedAtMs,
+      progress: createProgress(),
+      boundaries: manifest.phases.flatMap(phase => phase.boundaries.map(boundary => {
+        const boundaryState = boundaryStates.get(boundary.boundaryId);
+        const plannerSnapshot = boundaryState.planner?.snapshot() || null;
+        return {
+          phaseId: phase.phaseId,
+          boundaryId: boundary.boundaryId,
+          kind: boundary.kind,
+          unit: boundary.unit,
+          status: boundaryState.status,
+          completedItems: boundaryState.completedItems,
+          totalItems: boundaryState.totalItems,
+          progress: boundaryProgress(boundaryState),
+          progressWeight: boundary.progressWeight,
+          rangeCount: boundaryState.ranges.length,
+          actualRangeCount: boundaryState.status === 'complete'
+            ? boundaryState.ranges.length
+            : null,
+          rangeCountAuthority: boundaryState.status === 'complete'
+            ? 'actual'
+            : 'open-until-completion',
+          ranges: clone(boundaryState.ranges),
+          planner: clone(plannerSnapshot),
+          resources: clone(boundary.resources),
+          failure: clone(boundaryState.failure),
+        };
+      })),
+      runtimeTelemetry: {
+        commandDuties: runtime.commandDuties?.snapshot?.() || null,
+        hostPhases: runtime.hostPhases?.snapshot?.() || null,
+      },
+      failure: clone(state.failure),
+      lastTrustworthyBoundary: clone(
+        [...boundaryStates.values()].findLast(boundary => boundary.ranges.length > 0) || null,
+      ),
+    });
+  }
+
+  function failExecution(error, phase, boundaryState = null, diagnostics = {}) {
+    const cancelled = error?.name === 'AbortError';
+    const status = cancelled ? 'cancelled' : 'failed';
+    const secondaryFailures = clone(diagnostics.secondaryFailures || []);
+    if (boundaryState) {
+      boundaryState.status = status;
+      boundaryState.failure = {
+        phase: cancelled ? 'cancellation' : phase,
+        error: normalizeError(error),
+        secondaryFailures,
+      };
+    }
+    state.status = status;
+    state.failure = {
+      phase: cancelled ? 'cancellation' : phase,
+      boundaryId: boundaryState?.boundaryId || null,
+      error: normalizeError(error),
+      secondaryFailures,
+    };
+    state.endedAtMs = readNow(now);
+    return decorateError(error, createReport());
+  }
+
+  function requirePendingRange(boundaryState, range) {
+    if (!range || typeof range !== 'object') throw new TypeError('range must be an object');
+    const plannerSnapshot = boundaryState.planner?.snapshot();
+    const pendingRangeIds = plannerSnapshot?.pendingRangeIds
+      || (plannerSnapshot?.pendingRangeId ? [plannerSnapshot.pendingRangeId] : []);
+    if (!pendingRangeIds.includes(range.rangeId)) {
+      throw new Error(`range ${range.rangeId || '<missing>'} is not pending for ${boundaryState.boundaryId}`);
+    }
+  }
+
+  function completeFixedRange(boundaryState, range, detail) {
+    boundaryState.planner.completeRange(range.rangeId, detail);
+    const plannerSnapshot = boundaryState.planner.snapshot();
+    boundaryState.completedItems = plannerSnapshot.completedItems;
+    boundaryState.ranges = plannerSnapshot.ranges;
+    boundaryState.status = plannerSnapshot.status === 'complete' ? 'complete' : 'active';
+  }
+
+  function completeAdaptiveRange(boundaryState, range, observedDurationMs) {
+    boundaryState.planner.observeRange({
+      rangeId: range.rangeId,
+      timingAuthority: 'queue-work-done',
+      observedDurationMs,
+    });
+    const plannerSnapshot = boundaryState.planner.snapshot();
+    boundaryState.completedItems = plannerSnapshot.completedItems;
+    boundaryState.ranges = plannerSnapshot.ranges;
+    boundaryState.status = plannerSnapshot.status === 'complete' ? 'complete' : 'active';
+  }
+
+  function failRange(boundaryState, range, phase, error) {
+    const plannerSnapshot = boundaryState.planner?.snapshot();
+    const pendingRangeIds = plannerSnapshot?.pendingRangeIds
+      || (plannerSnapshot?.pendingRangeId ? [plannerSnapshot.pendingRangeId] : []);
+    if (pendingRangeIds.includes(range?.rangeId)) {
+      if (boundaryState.boundary.chunking.mode === 'adaptive' && schedulingMode === 'cooperative') {
+        boundaryState.planner.failRange({ rangeId: range.rangeId, phase, error });
+      } else {
+        boundaryState.planner.failRange(range.rangeId, phase, error);
+      }
+      boundaryState.ranges = boundaryState.planner.snapshot().ranges;
+    }
+  }
+
+  function createPlanner(definition, boundaryState, totalItems) {
+    const plannerId = `${input.invocationId}:${definition.boundary.boundaryId}:range`;
+    if (definition.boundary.chunking.mode === 'adaptive' && schedulingMode === 'cooperative') {
+      return createWebGpuAdaptiveCommandDutyPlanner({
+        plannerId,
+        unit: definition.boundary.unit,
+        totalItems,
+        initialChunkItems: definition.boundary.chunking.initialItems,
+        targetDurationMs: definition.boundary.chunking.targetDurationMs,
+        adjustmentGain: definition.boundary.chunking.adjustmentGain,
+        bounds: {
+          minChunkItems: definition.boundary.chunking.minItems,
+          maxChunkItems: definition.boundary.chunking.maxItems,
+        },
+        metadata: {
+          manifestId: manifest.manifestId,
+          routeId: manifest.routeId,
+          phaseId: definition.phase.phaseId,
+          boundaryId: definition.boundary.boundaryId,
+        },
+      });
+    }
+    const chunkItems = definition.boundary.chunking.mode === 'adaptive'
+      ? definition.boundary.chunking.initialItems
+      : definition.boundary.chunking.chunkItems;
+    return createFixedRangePlanner({
+      plannerId,
+      unit: definition.boundary.unit,
+      totalItems,
+      chunkItems,
+      maxPendingRanges: completionPolicy === 'bounded-prefix'
+        && definition.boundary.kind === 'gpu-command'
+        ? maxInFlightGpuDuties
+        : 1,
+      metadata: {
+        manifestId: manifest.manifestId,
+        routeId: manifest.routeId,
+        phaseId: definition.phase.phaseId,
+        boundaryId: definition.boundary.boundaryId,
+      },
+    });
+  }
+
+  function updateGpuDuty(entry, detail) {
+    state.gpuDuties[entry.dutyIndex] = {
+      ...state.gpuDuties[entry.dutyIndex],
+      ...clone(detail),
+    };
+  }
+
+  function registerBoundedGpuDuty({
+    boundaryId,
+    boundaryState,
+    range,
+    encoded,
+    submittedAtMs,
+    prefixFence,
+  }) {
+    const dutyIndex = state.gpuDuties.length;
+    const entry = {
+      dutyId: range.rangeId,
+      dutyIndex,
+      boundaryState,
+      range,
+      encoded,
+      submittedAtMs,
+      fenceOutcome: Promise.resolve(prefixFence).then(
+        () => ({ ok: true, completedAtMs: readNow(now) }),
+        error => ({ ok: false, error, completedAtMs: readNow(now) }),
+      ),
+    };
+    state.gpuDuties.push({
+      dutyId: entry.dutyId,
+      rangeId: range.rangeId,
+      rangeIndex: range.rangeIndex,
+      boundaryId,
+      status: 'issued',
+      submittedAtMs,
+      retiredAtMs: null,
+      rawQueueDurationMs: null,
+      timingAuthority: 'queue-work-done-prefix-fence-pending',
+      failure: null,
+    });
+    state.inFlightGpuDuties.push(entry);
+    state.maxObservedInFlightGpuDuties = Math.max(
+      state.maxObservedInFlightGpuDuties,
+      state.inFlightGpuDuties.length,
+    );
+    return entry;
+  }
+
+  async function drainGpuDutiesAfterFailure() {
+    const secondaryFailures = [];
+    while (state.inFlightGpuDuties.length > 0) {
+      const entry = state.inFlightGpuDuties[0];
+      const outcome = await entry.fenceOutcome;
+      state.inFlightGpuDuties.shift();
+      if (outcome.ok) {
+        updateGpuDuty(entry, {
+          status: 'retired-after-failure',
+          retiredAtMs: outcome.completedAtMs,
+          rawQueueDurationMs: outcome.completedAtMs - entry.submittedAtMs,
+          timingAuthority: 'queue-work-done',
+        });
+      } else {
+        updateGpuDuty(entry, {
+          status: 'failed',
+          retiredAtMs: outcome.completedAtMs,
+          rawQueueDurationMs: outcome.completedAtMs - entry.submittedAtMs,
+          timingAuthority: 'queue-work-done-prefix-fence-rejected',
+          failure: normalizeError(outcome.error),
+        });
+        secondaryFailures.push({
+          phase: 'queue-completion',
+          dutyId: entry.dutyId,
+          error: normalizeError(outcome.error),
+        });
+      }
+    }
+    return secondaryFailures;
+  }
+
+  async function retireOldestGpuDuty() {
+    const entry = state.inFlightGpuDuties[0];
+    if (!entry) return null;
+    const outcome = await entry.fenceOutcome;
+    state.inFlightGpuDuties.shift();
+    if (!outcome.ok) {
+      updateGpuDuty(entry, {
+        status: 'failed',
+        retiredAtMs: outcome.completedAtMs,
+        rawQueueDurationMs: outcome.completedAtMs - entry.submittedAtMs,
+        timingAuthority: 'queue-work-done-prefix-fence-rejected',
+        failure: normalizeError(outcome.error),
+      });
+      failRange(entry.boundaryState, entry.range, 'queue-completion', outcome.error);
+      const secondaryFailures = await drainGpuDutiesAfterFailure();
+      throw failExecution(
+        outcome.error,
+        'queue-completion',
+        entry.boundaryState,
+        { secondaryFailures },
+      );
+    }
+    completeFixedRange(entry.boundaryState, entry.range, {
+      timingAuthority: 'queue-work-done',
+      observedDurationMs: outcome.completedAtMs - entry.submittedAtMs,
+    });
+    updateGpuDuty(entry, {
+      status: 'retired',
+      retiredAtMs: outcome.completedAtMs,
+      rawQueueDurationMs: outcome.completedAtMs - entry.submittedAtMs,
+      timingAuthority: 'queue-work-done',
+    });
+    emitProgress(entry.boundaryState);
+    return entry;
+  }
+
+  async function drainGpuDuties() {
+    while (state.inFlightGpuDuties.length > 0) {
+      await retireOldestGpuDuty();
+    }
+  }
+
+  function startBoundary(boundaryId, options = {}, schedulerInvocation) {
+    checkCancellation();
+    const definition = definitions.get(boundaryId);
+    if (!definition) throw new Error(`unknown cooperative boundary: ${boundaryId}`);
+    const boundaryState = boundaryStates.get(boundaryId);
+    if (boundaryState.controller) throw new Error(`cooperative boundary ${boundaryId} was already started`);
+    const declaredTotal = definition.boundary.totalItems;
+    const totalItems = options.totalItems ?? declaredTotal;
+    requirePositiveSafeInteger(`${boundaryId}.totalItems`, totalItems);
+    if (declaredTotal != null && options.totalItems != null && options.totalItems !== declaredTotal) {
+      throw new Error(`${boundaryId}.totalItems does not match the boundary manifest`);
+    }
+    boundaryState.totalItems = totalItems;
+    boundaryState.status = 'active';
+    boundaryState.boundary = definition.boundary;
+    boundaryState.planner = createPlanner(definition, boundaryState, totalItems);
+
+    async function yieldAfterDuty(range) {
+      if (schedulingMode !== 'cooperative' || definition.boundary.yieldPolicy !== 'after-duty') return null;
+      return schedulerInvocation.yieldToBrowser({
+        reason: completionPolicy === 'bounded-prefix'
+          && definition.boundary.kind === 'gpu-command'
+          ? 'cooperative-boundary-duty-issued'
+          : 'cooperative-boundary-duty-complete',
+        metadata: {
+          manifestId: manifest.manifestId,
+          phaseId: definition.phase.phaseId,
+          boundaryId,
+          rangeId: range.rangeId,
+          rangeIndex: range.rangeIndex,
+        },
+      });
+    }
+
+    let gpuDutyAdmissionTail = Promise.resolve();
+    async function acquireGpuDutyAdmission() {
+      const predecessor = gpuDutyAdmissionTail;
+      let release;
+      gpuDutyAdmissionTail = new Promise(resolve => {
+        release = resolve;
+      });
+      await predecessor;
+      return release;
+    }
+
+    const controller = Object.freeze({
+      boundaryId,
+      kind: definition.boundary.kind,
+      unit: definition.boundary.unit,
+
+      nextRange() {
+        checkCancellation();
+        const range = boundaryState.planner.nextRange();
+        if (range) {
+          boundaryState.ranges = boundaryState.planner.snapshot().ranges;
+          state.currentPhaseId = definition.phase.phaseId;
+          state.currentBoundaryId = boundaryId;
+        }
+        return range;
+      },
+
+      async runGpuDuty(range, handlers = {}) {
+        const releaseAdmission = await acquireGpuDutyAdmission();
+        try {
+          checkCancellation();
+          if (completionPolicy === 'bounded-prefix'
+              && state.inFlightGpuDuties.some(entry => entry.boundaryState !== boundaryState)) {
+            await drainGpuDuties();
+          }
+          if (definition.boundary.kind !== 'gpu-command') {
+            throw new Error(`${boundaryId} is not a gpu-command boundary`);
+          }
+          requirePendingRange(boundaryState, range);
+          if (typeof handlers.encode !== 'function') {
+            const error = new TypeError('GPU duty encode must be a function');
+            failRange(boundaryState, range, 'command-encoding', error);
+            throw failExecution(error, 'command-encoding', boundaryState);
+          }
+          if (handlers.submit != null) {
+            const error = new TypeError(
+              'GPU duty submit callbacks are unsupported; encode must return command buffers',
+            );
+            failRange(boundaryState, range, 'command-encoding', error);
+            throw failExecution(error, 'command-encoding', boundaryState);
+          }
+
+        let descriptor = {
+          phase: definition.phase.phaseId,
+          kind: definition.boundary.commandDutyKind,
+          metadata: {
+            ...clone(definition.boundary.metadata),
+            manifestId: manifest.manifestId,
+            boundaryId,
+            rangeId: range.rangeId,
+            rangeIndex: range.rangeIndex,
+            itemStart: range.itemStart,
+            itemEnd: range.itemEnd,
+            itemCount: range.itemCount,
+            totalItems: range.totalItems,
+            unit: range.unit,
+          },
+        };
+        let prepared = false;
+        let encoded;
+        try {
+          if (schedulingMode === 'cooperative') {
+            if (typeof runtime.prepareCommandDutyAtBoundary !== 'function') {
+              throw new Error('cooperative GPU duties require runtime.prepareCommandDutyAtBoundary');
+            }
+            descriptor = await runtime.prepareCommandDutyAtBoundary(descriptor, schedulerInvocation);
+            prepared = true;
+            checkCancellation();
+          }
+          encoded = await handlers.encode({
+            range,
+            commandDuty: deepFreeze(clone(descriptor)),
+            schedulerInvocation,
+          });
+        } catch (error) {
+          const secondaryFailures = [];
+          if (prepared && typeof runtime.settleCommandDuty === 'function') {
+            try {
+              runtime.settleCommandDuty(descriptor, {
+                status: 'failed-before-encode',
+                phase: 'command-encoding',
+                error,
+              });
+            } catch (settlementError) {
+              secondaryFailures.push({
+                phase: 'scheduler-settlement',
+                error: normalizeError(settlementError),
+              });
+            }
+          }
+          failRange(boundaryState, range, 'command-encoding', error);
+          throw failExecution(error, 'command-encoding', boundaryState, { secondaryFailures });
+        }
+
+        if (prepared && typeof runtime.settleCommandDuty === 'function') {
+          try {
+            runtime.settleCommandDuty(descriptor, { status: 'encoded' });
+          } catch (error) {
+            failRange(boundaryState, range, 'scheduler-settlement', error);
+            throw failExecution(error, 'scheduler-settlement', boundaryState);
+          }
+        }
+
+        const commandBuffers = Array.isArray(encoded) ? [...encoded] : [encoded];
+        if (commandBuffers.length === 0 || commandBuffers.some(buffer => buffer == null)) {
+          const error = new TypeError('GPU duty encode must return command buffers');
+          failRange(boundaryState, range, 'command-encoding', error);
+          throw failExecution(error, 'command-encoding', boundaryState);
+        }
+
+        const submitStartMs = readNow(now);
+        let prefixFence = null;
+        let submitted = false;
+        let queueSubmittedAtMs = null;
+        let boundedEntry = null;
+        const capturePrefixFence = () => {
+          if (typeof runtime.queue.onSubmittedWorkDone !== 'function') {
+            throw new Error('GPU duties require queue.onSubmittedWorkDone');
+          }
+          const fence = runtime.queue.onSubmittedWorkDone();
+          if (fence == null || typeof fence.then !== 'function') {
+            throw new TypeError('queue onSubmittedWorkDone must return a Promise');
+          }
+          state.observedPrefixFenceCount += 1;
+          return fence;
+        };
+        try {
+          const submit = () => {
+            if (submitted) {
+              throw new Error('command duty recorder attempted duplicate GPU submission');
+            }
+            queueSubmittedAtMs = submitStartMs;
+            runtime.queue.submit(commandBuffers);
+            submitted = true;
+            state.submittedGpuDutyCount += 1;
+            queueSubmittedAtMs = readNow(now);
+            if (schedulingMode === 'cooperative') {
+              prefixFence = capturePrefixFence();
+            }
+            if (completionPolicy === 'bounded-prefix') {
+              boundedEntry = registerBoundedGpuDuty({
+                boundaryId,
+                boundaryState,
+                range,
+                encoded,
+                submittedAtMs: queueSubmittedAtMs,
+                prefixFence,
+              });
+            }
+          };
+          if (runtime.commandDuties?.measureSubmission) {
+            await runtime.commandDuties.measureSubmission(descriptor, submit);
+          } else {
+            submit();
+          }
+          if (!submitted) throw new Error('command duty recorder did not submit GPU work');
+          if (schedulingMode === 'cooperative' && completionPolicy === 'strict-prefix') {
+            await prefixFence;
+          }
+        } catch (error) {
+          const secondaryFailures = [];
+          if (submitted && completionPolicy === 'bounded-prefix') {
+            if (!boundedEntry) {
+              try {
+                if (!prefixFence) prefixFence = capturePrefixFence();
+                boundedEntry = registerBoundedGpuDuty({
+                  boundaryId,
+                  boundaryState,
+                  range,
+                  encoded,
+                  submittedAtMs: queueSubmittedAtMs,
+                  prefixFence,
+                });
+              } catch (fenceError) {
+                state.unfencedSubmittedGpuDutyCount += 1;
+                secondaryFailures.push({
+                  phase: 'queue-prefix-drain',
+                  error: normalizeError(fenceError),
+                });
+              }
+            }
+            failRange(boundaryState, range, 'queue-submission', error);
+            if (boundedEntry) {
+              secondaryFailures.push(...await drainGpuDutiesAfterFailure());
+            }
+            throw failExecution(error, 'queue-submission', boundaryState, { secondaryFailures });
+          }
+          if (submitted) {
+            try {
+              if (!prefixFence) prefixFence = capturePrefixFence();
+              await prefixFence;
+            } catch (fenceError) {
+              state.unfencedSubmittedGpuDutyCount += 1;
+              secondaryFailures.push({
+                phase: 'queue-prefix-drain',
+                error: normalizeError(fenceError),
+              });
+            }
+          }
+          failRange(boundaryState, range, 'queue-submission', error);
+          throw failExecution(error, 'queue-submission', boundaryState, { secondaryFailures });
+        }
+
+        if (completionPolicy === 'bounded-prefix') {
+          try {
+            await yieldAfterDuty(range);
+          } catch (error) {
+            failRange(boundaryState, range, 'browser-yield', error);
+            const secondaryFailures = await drainGpuDutiesAfterFailure();
+            throw failExecution(error, 'browser-yield', boundaryState, { secondaryFailures });
+          }
+          const retired = state.inFlightGpuDuties.length >= maxInFlightGpuDuties
+            ? await retireOldestGpuDuty()
+            : null;
+          return {
+            range,
+            encoded,
+            queueCompletionAuthority: 'bounded-prefix-fence',
+            settledRangeId: retired?.range.rangeId || null,
+          };
+        }
+
+        const completedAtMs = readNow(now);
+
+        if (definition.boundary.chunking.mode === 'adaptive' && schedulingMode === 'cooperative') {
+          completeAdaptiveRange(boundaryState, range, completedAtMs - submitStartMs);
+        } else {
+          completeFixedRange(boundaryState, range, {
+            timingAuthority: schedulingMode === 'cooperative'
+              ? 'queue-work-done'
+              : 'host-submit-call-only',
+            observedDurationMs: completedAtMs - submitStartMs,
+          });
+        }
+        try {
+          await yieldAfterDuty(range);
+        } catch (error) {
+          throw failExecution(error, 'browser-yield', boundaryState);
+        }
+        emitProgress(boundaryState);
+          return {
+            range,
+            encoded,
+            queueCompletionAuthority: prefixFence
+              ? 'immediate-prefix-fence'
+              : 'terminal-prefix-fence-pending',
+          };
+        } finally {
+          releaseAdmission();
+        }
+      },
+
+      async runCpuDuty(range, handlers = {}) {
+        checkCancellation();
+        if (definition.boundary.kind !== 'cpu-work') {
+          throw new Error(`${boundaryId} is not a cpu-work boundary`);
+        }
+        if (typeof handlers.work !== 'function') throw new TypeError('CPU duty work must be a function');
+        requirePendingRange(boundaryState, range);
+        if (completionPolicy === 'bounded-prefix') {
+          await drainGpuDuties();
+          checkCancellation();
+        }
+        const startedAtMs = readNow(now);
+        try {
+          const work = () => handlers.work({ range, schedulerInvocation });
+          if (runtime.hostPhases && typeof runtime.runHostPhase === 'function') {
+            await runtime.runHostPhase(definition.boundary.hostPhase, work, {
+              detail: {
+                manifestId: manifest.manifestId,
+                boundaryId,
+                rangeId: range.rangeId,
+                rangeIndex: range.rangeIndex,
+                itemStart: range.itemStart,
+                itemEnd: range.itemEnd,
+                totalItems: range.totalItems,
+                unit: range.unit,
+              },
+            });
+          } else {
+            await work();
+          }
+        } catch (error) {
+          failRange(boundaryState, range, 'cpu-work', error);
+          throw failExecution(error, 'cpu-work', boundaryState);
+        }
+        completeFixedRange(boundaryState, range, {
+          timingAuthority: 'host-work-call',
+          observedDurationMs: readNow(now) - startedAtMs,
+        });
+        try {
+          await yieldAfterDuty(range);
+        } catch (error) {
+          throw failExecution(error, 'browser-yield', boundaryState);
+        }
+        emitProgress(boundaryState);
+        return { range };
+      },
+
+      snapshot() {
+        return deepFreeze(clone({
+          phaseId: definition.phase.phaseId,
+          boundaryId,
+          status: boundaryState.status,
+          totalItems: boundaryState.totalItems,
+          completedItems: boundaryState.completedItems,
+          progress: boundaryProgress(boundaryState),
+          ranges: boundaryState.ranges,
+        }));
+      },
+    });
+    boundaryState.controller = controller;
+    return controller;
+  }
+
+  async function run(fn) {
+    if (typeof fn !== 'function') throw new TypeError('cooperative execution run requires a function');
+    if (state.runCalled) throw new Error('cooperative execution can run only once');
+    state.runCalled = true;
+    state.status = 'running';
+    state.startedAtMs = readNow(now);
+    try {
+      checkCancellation();
+      const output = await runtime.runInvocation({ invocationId: input.invocationId }, async invocation => {
+        state.schedulerRevision = invocation.schedulerRevision ?? null;
+        state.invocationScheduler = clone(invocation.scheduler || null);
+        return fn(Object.freeze({
+          invocationId: input.invocationId,
+          schedulingMode,
+          schedulerInvocation: invocation,
+          startBoundary(boundaryId, options = {}) {
+            return startBoundary(boundaryId, options, invocation);
+          },
+          progress: createProgress,
+          throwIfCancelled: checkCancellation,
+        }));
+      });
+      if (completionPolicy === 'bounded-prefix') {
+        await drainGpuDuties();
+      }
+      checkCancellation();
+      const incomplete = [...boundaryStates.values()]
+        .filter(boundary => boundary.status !== 'complete')
+        .map(boundary => boundary.boundaryId);
+      if (incomplete.length > 0) {
+        throw new Error(`incomplete cooperative boundaries: ${incomplete.join(', ')}`);
+      }
+      if (schedulingMode === 'disabled'
+        && [...definitions.values()].some(definition => definition.boundary.kind === 'gpu-command')) {
+        if (typeof runtime.queue.onSubmittedWorkDone !== 'function') {
+          throw new Error('disabled scheduling A/B requires a terminal queue.onSubmittedWorkDone fence');
+        }
+        const terminalFence = runtime.queue.onSubmittedWorkDone();
+        if (terminalFence == null || typeof terminalFence.then !== 'function') {
+          throw new TypeError('queue onSubmittedWorkDone must return a Promise');
+        }
+        await terminalFence;
+        state.terminalQueueFenceObserved = true;
+      }
+      state.status = 'succeeded';
+      state.currentPhaseId = null;
+      state.currentBoundaryId = null;
+      state.endedAtMs = readNow(now);
+      return output;
+    } catch (error) {
+      if (completionPolicy === 'bounded-prefix' && state.inFlightGpuDuties.length > 0) {
+        const priorReport = error?.cooperativeExecutionReport || null;
+        const phase = priorReport?.failure?.phase
+          || (error?.name === 'AbortError' ? 'cancellation' : 'completion');
+        const boundaryState = boundaryStates.get(priorReport?.failure?.boundaryId)
+          || state.inFlightGpuDuties[0]?.boundaryState
+          || null;
+        const oldestPending = state.inFlightGpuDuties[0];
+        if (boundaryState && oldestPending) {
+          failRange(boundaryState, oldestPending.range, phase, error);
+        }
+        const secondaryFailures = [
+          ...(priorReport?.failure?.secondaryFailures || []),
+          ...await drainGpuDutiesAfterFailure(),
+        ];
+        throw failExecution(error, phase, boundaryState, { secondaryFailures });
+      }
+      if (error?.cooperativeExecutionReport) throw error;
+      throw failExecution(
+        error,
+        error?.name === 'AbortError' ? 'cancellation' : 'completion',
+      );
+    }
+  }
+
+  return Object.freeze({
+    schema: WEBGPU_COOPERATIVE_EXECUTION_REPORT_SCHEMA,
+    routeId: manifest.routeId,
+    manifestId: manifest.manifestId,
+    invocationId: input.invocationId,
+    schedulingMode,
+    completionPolicy,
+    maxInFlightGpuDuties,
+    run,
+    progress: createProgress,
+    snapshot: createReport,
+    finish() {
+      if (state.status !== 'succeeded' && state.status !== 'failed' && state.status !== 'cancelled') {
+        throw new Error('cooperative execution cannot finish before run settles');
+      }
+      return createReport();
+    },
+  });
+}
+
+({
+  MAP_READ: globalThis.GPUBufferUsage?.MAP_READ ?? 1,
+  COPY_SRC: globalThis.GPUBufferUsage?.COPY_SRC ?? 4,
+  COPY_DST: globalThis.GPUBufferUsage?.COPY_DST ?? 8,
+  STORAGE: globalThis.GPUBufferUsage?.STORAGE ?? 128,
+  UNIFORM: globalThis.GPUBufferUsage?.UNIFORM ?? 64,
+});
+
+const GELU_HELPERS = `
+fn mlx_expm1f(x: f32) -> f32 {
+  var j = fma(1.442695, x, 12582912.0);
+  j = j - 12582912.0;
+  let exponent = i32(j);
+  let reduced = fma(j, -6.93145752e-1, x);
+  var squared = reduced * reduced;
+  if (x == 0.0) { squared = x; }
+  var polynomial = 1.97350979e-4;
+  polynomial = fma(polynomial, reduced, 1.39309070e-3);
+  polynomial = fma(polynomial, reduced, 8.33343994e-3);
+  polynomial = fma(polynomial, reduced, 4.16668020e-2);
+  polynomial = fma(polynomial, reduced, 1.66666716e-1);
+  polynomial = fma(polynomial, reduced, 4.99999970e-1);
+  let base = select(reduced, reduced + 0.5, j == 1.0);
+  let approximation = fma(polynomial, squared, base);
+  let half = 0.5;
+  let scaled = ldexp(half, exponent);
+  let high = scaled - half;
+  let low = (scaled - high) - half;
+  var result = fma(approximation, scaled, low) + high;
+  result = result + result;
+  if (j == 0.0) { result = approximation; }
+  if (j == 1.0) { result = approximation + approximation; }
+  if (abs(x - 1.0) > 88.0) {
+    let power = exp2(x);
+    result = fma(power, power, -1.0);
+  }
+  return result;
+}
+
+fn mlx_erf(x: f32) -> f32 {
+  let magnitude = abs(x);
+  let squared = x * x;
+  var result: f32;
+  if (magnitude > 0.927734375) {
+    result = fma(-1.72853470e-5, magnitude, 3.83197126e-4);
+    let companion = fma(-3.88396438e-3, magnitude, 2.42546219e-2);
+    result = fma(result, squared, companion);
+    result = fma(result, magnitude, -1.06777877e-1);
+    result = fma(result, magnitude, -6.34846687e-1);
+    result = fma(result, magnitude, -1.28717512e-1);
+    result = fma(result, magnitude, -magnitude);
+    result = -mlx_expm1f(result);
+    result = select(-abs(result), abs(result), x >= 0.0);
+  } else {
+    result = -5.96761703e-4;
+    result = fma(result, squared, 4.99119423e-3);
+    result = fma(result, squared, -2.67681349e-2);
+    result = fma(result, squared, 1.12819925e-1);
+    result = fma(result, squared, -3.76125336e-1);
+    result = fma(result, squared, 1.28379166e-1);
+    result = fma(result, x, x);
+  }
+  return result;
+}
+
+fn gelu_exact_approx(x: f32) -> f32 {
+  if (x < -10.0) { return 0.0; }
+  if (x > 10.0) { return x; }
+  return 0.5 * x * (1.0 + mlx_erf(x * 0.7071067811865476));
+}
+`;
+
+function shader({ activation, helpers = '' }) {
+  return createWebGpuLinearShader({
+    variant: 'sequential4', activationExpression: activation, activationHelpers: helpers,
+  });
+}
+
+shader({ activation: 'value' });
+shader({ activation: 'max(value, 0.0)' });
+shader({ activation: 'gelu_exact_approx(value)', helpers: GELU_HELPERS });
+
+const REQUIRED_STAGES$1 = [
+  'load-image-fpn-neck-tensors',
+  'fpn-neck-transpose-conv-0-scale0',
+  'fpn-neck-gelu-0',
+  'fpn-neck-transpose-conv-0-scale1',
+  'fpn-neck-proj1-0',
+  'fpn-neck-proj2-0',
+  'fpn-neck-transpose-conv-1',
+  'fpn-neck-proj1-1',
+  'fpn-neck-proj2-1',
+  'fpn-neck-proj1-2',
+  'fpn-neck-proj2-2',
+  'fpn-neck-maxpool-3',
+  'fpn-neck-proj1-3',
+  'fpn-neck-proj2-3',
+  'readback-fpn-neck-features',
+];
+REQUIRED_STAGES$1.filter(stage => !stage.endsWith('-3'));
+
+const REQUIRED_STAGES = [
+  'load-memory-encoder-tensors',
+  'memory-mask-resample',
+  'memory-mask-downsample-0',
+  'memory-mask-downsample-0-layernorm',
+  'memory-mask-downsample-0-gelu',
+  'memory-mask-downsample-1',
+  'memory-mask-downsample-1-layernorm',
+  'memory-mask-downsample-1-gelu',
+  'memory-mask-downsample-2',
+  'memory-mask-downsample-2-layernorm',
+  'memory-mask-downsample-2-gelu',
+  'memory-mask-downsample-3',
+  'memory-mask-downsample-3-layernorm',
+  'memory-mask-downsample-3-gelu',
+  'memory-mask-final-projection',
+  'memory-feature-projection',
+  'memory-feature-mask-add',
+  'memory-fuser-0-depthwise',
+  'memory-fuser-0-layernorm',
+  'memory-fuser-0-pointwise-1-gelu',
+  'memory-fuser-0-pointwise-2-scale-residual',
+  'memory-fuser-1-depthwise',
+  'memory-fuser-1-layernorm',
+  'memory-fuser-1-pointwise-1-gelu',
+  'memory-fuser-1-pointwise-2-scale-residual',
+  'memory-no-object-spatial-add',
+  'memory-position-encoding',
+  'readback-memory-encoder-features',
+];
+
+Object.freeze({
+  layout: 'B,H,W,C',
+  sourceLayout: 'B,C,H,W',
+  maskLogitsLayout: 'B,M,H,W',
+  maskChannels: 'multiplex mask channels followed by multiplex conditioning channels',
+  requiredStages: REQUIRED_STAGES,
+  bufferUsage: WEBGPU_BUFFER_USAGE.storage | WEBGPU_BUFFER_USAGE.copyDst | WEBGPU_BUFFER_USAGE.copySrc,
+  shaderVisibility: WEBGPU_SHADER_STAGE.compute,
+});
+
+const TWO_FRAME_REFERENCE = Object.freeze({
+  modelId: 'facebook/sam3.1',
+  modelRevision: 'daa63191845a41281374e725f4c9e51c7a824460',
+  checkpointSha256: 'sha256:0567debeec80ba4ac6369540c6c248025283cb3ff2b92827509e57e2b3541cb6',
+  sourceRepository: 'facebookresearch/sam3',
+  sourceCommit: '5dd401d1c5c1d5c3eedff06d41b77af824517619',
+});
+
+Object.freeze({
+  manifestSchema: 'kaminos.sam31-two-image-ingress-meta-packet.v0',
+  receiptSchema: 'kaminos.sam31-two-image-ingress-meta-reference-receipt.v0',
+  boundary: 'sam31-two-distinct-raw-images-to-interactive-propagation-backbone-features',
+  modelId: 'facebook/sam3.1',
+  modelRevision: TWO_FRAME_REFERENCE.modelRevision,
+  checkpointSha256: TWO_FRAME_REFERENCE.checkpointSha256,
+  sourceCommit: TWO_FRAME_REFERENCE.sourceCommit,
+  routeIds: Object.freeze([
+    'sam3.image-preprocess.phase-program.webgpu-local.v0',
+    'sam3.image-patch-embed.phase-program.webgpu-local.v0',
+    'sam3.image-vit-prefix.phase-program.webgpu-local.v0',
+    'sam3.image-vit-block-stack.phase-program.webgpu-local.v0',
+    'sam3.1.interactive-neck.phase-program.webgpu-local.v0',
+    'sam3.1.image-propagation-neck.phase-program.webgpu-local.v0',
+    'sam3.1.decoder-high-resolution-projection.phase-program.webgpu-local.v0',
+  ]),
+});
+
+const TWO_FRAME_EPISODE_SHAPE = Object.freeze({
+  batch: 1,
+  multiplexCount: 16,
+  queryHeight: 2,
+  queryWidth: 2,
+  queryTokens: 4,
+  memorySpatialTokens: 4,
+  numObjPtrTokens: 16,
+  memoryTokens: 20,
+  channels: 256,
+  maskHeight: 8,
+  maskWidth: 8,
+  sourceImageHeight: 28,
+  sourceImageWidth: 28,
+  sourceMaskHeight: 32,
+  sourceMaskWidth: 32,
+  promptMaskHeight: 8,
+  promptMaskWidth: 8,
+  decoderMaskHeight: 8,
+  decoderMaskWidth: 8,
+  memoryInputMaskHeight: 8,
+  memoryInputMaskWidth: 8,
+});
+
+Object.freeze({
+  ...TWO_FRAME_EPISODE_SHAPE,
+  memoryInputMaskHeight: 32,
+  memoryInputMaskWidth: 32,
+});
+
+const SF3D_IMAGE_TO_MESH_ROUTE_ID = 'sf3d.image-to-mesh.webgpu-local.v0';
+const SF3D_MODEL_ID = 'stabilityai/stable-fast-3d';
+const OUTPUT_ROLES = [
+  { key: 'meshGlb', role: 'mesh-glb', required: true },
+  { key: 'albedoTexture', role: 'albedo-texture', required: true },
+  { key: 'normalMap', role: 'normal-map', required: true },
+  { key: 'meshObj', role: 'mesh-obj', required: false },
+];
+
+function createSf3dImageToMeshRouteReceipt(input) {
+  if (!input || typeof input !== 'object') throw new Error('input must be an object');
+  if (!input.input?.artifactId || !input.input?.sha256) {
+    throw new Error('input image artifactId and sha256 are required');
+  }
+  if (!input.outputs?.meshGlb) throw new Error('meshGlb output is required');
+  if (!input.outputs?.albedoTexture) throw new Error('albedoTexture output is required');
+  if (!input.outputs?.normalMap) throw new Error('normalMap output is required');
+
+  return createWebGpuRouteReceiptFromArtifacts({
+    requestedRouteId: SF3D_IMAGE_TO_MESH_ROUTE_ID,
+    effectiveRouteId: input.effectiveRouteId || SF3D_IMAGE_TO_MESH_ROUTE_ID,
+    status: input.status || (input.fallbackReason ? 'fallback' : 'real'),
+    fallbackReason: input.fallbackReason || null,
+    backend: input.backend,
+    model: {
+      id: SF3D_MODEL_ID,
+      revision: input.model?.revision,
+      weightsHash: input.model?.weightsHash,
+      dtype: input.model?.dtype || 'fp16',
+    },
+    kernel: createKernelProfileMetadata(input.kernel, { requireProfile: true }),
+    inputs: [
+      createRouteReceiptInputArtifact('source-image', input.input),
+    ],
+    outputs: createRouteReceiptArtifacts({ artifacts: input.outputs, roles: OUTPUT_ROLES }),
+    profile: input.profile,
+  });
+}
+
+// Logical format components, not Metal allocation sizes. The WebGPU spec
+// permits depth24plus to use depth32float; reserve eight component bytes for
+// the combined depth/stencil case. Padding, swapchains and private backing
+// remain outside this ledger and are separately observed by the parent.
+// https://gpuweb.github.io/gpuweb/#texture-format-caps
+const texelBytes={r8unorm:1,r8snorm:1,r8uint:1,r8sint:1,r16uint:2,r16sint:2,r16float:2,
+  rg8unorm:2,rg8snorm:2,rg8uint:2,rg8sint:2,r32uint:4,r32sint:4,r32float:4,
+  rg16uint:4,rg16sint:4,rg16float:4,rgba8unorm:4,'rgba8unorm-srgb':4,rgba8snorm:4,rgba8uint:4,rgba8sint:4,
+  bgra8unorm:4,'bgra8unorm-srgb':4,rgb10a2unorm:4,rg11b10ufloat:4,rgb9e5ufloat:4,
+  rg32uint:8,rg32sint:8,rg32float:8,rgba16uint:8,rgba16sint:8,rgba16float:8,
+  rgba32uint:16,rgba32sint:16,rgba32float:16,depth16unorm:2,depth32float:4,depth24plus:4,
+  'depth24plus-stencil8':8,'depth32float-stencil8':8,stencil8:1};
+const positive=(n,label)=>{if(!Number.isSafeInteger(n)||n<1)throw Error('positive exact '+label+' required');return n;};
+function hostTexturePlan(input){
+  const descriptor={...input};
+  const raw=descriptor.size,iterable=raw?.[Symbol.iterator];
+  const size=iterable?[...raw]:[raw?.width,raw?.height??1,raw?.depthOrArrayLayers??1];
+  const [width,height,depth]=[positive(size[0],'texture width'),positive(size[1]??1,'texture height'),positive(size[2]??1,'texture depth')];
+  const dimension=descriptor.dimension??'2d',mips=positive(descriptor.mipLevelCount??1,'mips'),samples=positive(descriptor.sampleCount??1,'samples');
+  const stride=texelBytes[descriptor.format];
+  if(!stride||!['1d','2d','3d'].includes(dimension))throw Error('unaccounted host texture format/dimension '+descriptor.format+'/'+dimension);
+  if(mips>1+Math.floor(Math.log2(Math.max(width,height,dimension==='3d'?depth:1))))throw Error('impossible texture mip extent');
+  let bytes=0;
+  for(let level=0;level<mips;level++)bytes+=Math.max(1,Math.floor(width/2**level))*Math.max(1,Math.floor(height/2**level))*(dimension==='3d'?Math.max(1,Math.floor(depth/2**level)):depth)*stride*samples;
+  if(!Number.isSafeInteger(bytes))throw Error('texture store byte count overflow');
+  return {bytes,descriptor:{...descriptor,size:{width,height,depthOrArrayLayers:depth},dimension,mipLevelCount:mips,sampleCount:samples}};
+}
+
+// SF3D resize_foreground at ff21fc4: inclusive alpha bounds, 0.85 occupancy,
+// transparent square padding, then Pillow-compatible bicubic RGBA resampling.
+const PRECISION = 2 ** 22;
+const byte = value => Math.max(0, Math.min(255, value));
+
+function cubic(x) {
+  x = Math.abs(x);
+  if (x < 1) return ((1.5 * x - 2.5) * x) * x + 1;
+  if (x < 2) return ((-0.5 * x + 2.5) * x - 4) * x + 2;
+  return 0;
+}
+
+function coefficients(sourceSize, targetSize) {
+  const scale = sourceSize / targetSize;
+  const filterScale = Math.max(1, scale);
+  const support = 2 * filterScale;
+  return Array.from({ length: targetSize }, (_, target) => {
+    const center = (target + 0.5) * scale;
+    const start = Math.max(0, Math.trunc(center - support + 0.5));
+    const end = Math.min(sourceSize, Math.trunc(center + support + 0.5));
+    const weights = Array.from({ length: end - start }, (_, i) => cubic((start + i - center + 0.5) / filterScale));
+    const sum = weights.reduce((a, b) => a + b, 0);
+    return { start, weights: weights.map(w => Math.trunc(w / sum * PRECISION + (w < 0 ? -0.5 : 0.5))) };
+  });
+}
+
+function resizeRgba(source, side, size) {
+  if (side === size) return source;
+  // Pillow resizes RGBA in premultiplied RGBa, quantizing after each pass.
+  for (let i = 0; i < source.length; i += 4) {
+    for (let c = 0; c < 3; c++) source[i + c] = Math.round(source[i + c] * source[i + 3] / 255);
+  }
+  const kernel = coefficients(side, size);
+  const horizontal = new Uint8Array(size * side * 4);
+  const output = new Uint8Array(size * size * 4);
+  for (let y = 0; y < side; y++) {
+    for (let x = 0; x < size; x++) {
+      const { start, weights } = kernel[x];
+      for (let c = 0; c < 4; c++) {
+        let sum = PRECISION / 2;
+        for (let i = 0; i < weights.length; i++) sum += source[(y * side + start + i) * 4 + c] * weights[i];
+        horizontal[(y * size + x) * 4 + c] = byte(Math.floor(sum / PRECISION));
+      }
+    }
+  }
+  for (let y = 0; y < size; y++) {
+    const { start, weights } = kernel[y];
+    for (let x = 0; x < size; x++) {
+      for (let c = 0; c < 4; c++) {
+        let sum = PRECISION / 2;
+        for (let i = 0; i < weights.length; i++) sum += horizontal[((start + i) * size + x) * 4 + c] * weights[i];
+        output[(y * size + x) * 4 + c] = byte(Math.floor(sum / PRECISION));
+      }
+    }
+  }
+  for (let i = 0; i < output.length; i += 4) {
+    const alpha = output[i + 3];
+    if (alpha && alpha < 255) {
+      for (let c = 0; c < 3; c++) output[i + c] = byte(Math.floor(output[i + c] * 255 / alpha));
+    }
+  }
+  return output;
+}
+
+function prepareForeground(data, width, height, size = 512) {
+  if (![width, height, size].every(x => Number.isSafeInteger(x) && x > 0)
+      || !(data instanceof Uint8Array || data instanceof Uint8ClampedArray)
+      || data.length !== width * height * 4) throw new TypeError('Expected positive dimensions and matching RGBA bytes');
+  let x1 = width, y1 = height, x2 = -1, y2 = -1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (data[(y * width + x) * 4 + 3] > 0) {
+        x1 = Math.min(x1, x); x2 = Math.max(x2, x);
+        y1 = Math.min(y1, y); y2 = Math.max(y2, y);
+      }
+    }
+  }
+  if (x2 < 0) throw new Error('Empty foreground mask');
+  const scale = Math.max(x2 - x1, y2 - y1) / 0.85;
+  const side = Math.trunc(scale);
+  if (side < 1) throw new Error('Foreground crop is empty');
+  const left = Math.trunc((x1 + x2 - scale) / 2) || 0;
+  const top = Math.trunc((y1 + y2 - scale) / 2) || 0;
+  const cropped = new Uint8Array(side * side * 4);
+  for (let y = Math.max(0, top); y < Math.min(height, top + side); y++) {
+    const from = Math.max(0, left), to = Math.min(width, left + side);
+    cropped.set(data.subarray((y * width + from) * 4, (y * width + to) * 4), ((y - top) * side + from - left) * 4);
+  }
+  return { data: resizeRgba(cropped, side, size), width: size, height: size,
+    crop: [left, top, left + side, top + side] };
+}
+
+/**
+ * preprocess_core.js — pure, DOM-free image-preprocess math.
+ *
+ * Extracted from inference.js so the exact same Lanczos-3 resize + alpha-blend +
+ * ImageNet-normalize runs on either the main thread OR a Web Worker, guaranteeing
+ * byte-identical output. No canvas/DOM here: the caller supplies raw float32 RGBA
+ * source pixels (from getImageData) and gets back the CHW float32 tensor.
+ *
+ * This is the tail-collapse target: image-preprocess is the largest foreground
+ * gap (~700ms, main-thread Lanczos), and it has ZERO GPU sync — moving it to a
+ * worker removes it from the main thread entirely with no per-duty fence floor.
+ */
+
+const SF3D_IMAGE_PREPROCESS = Object.freeze({
+  condImageSize:512, bgColor:Object.freeze([0.5,0.5,0.5]),
+  imageMean:Object.freeze([0.485,0.456,0.406]), imageStd:Object.freeze([0.229,0.224,0.225]),
+});
+
+function lanczosKernel(x, a = 3) {
+  if (x === 0) return 1;
+  if (Math.abs(x) >= a) return 0;
+  const px = Math.PI * x;
+  return (a * Math.sin(px) * Math.sin(px / a)) / (px * px);
+}
+
+function lanczosResize(src, srcW, srcH, dstW, dstH) {
+  // src is Float32Array [srcH, srcW, 4] RGBA
+  const a = 3; // Lanczos-3
+  const dst = new Float32Array(dstH * dstW * 4);
+  const tmp = new Float32Array(dstW * srcH * 4);
+
+  // Horizontal pass
+  const xScale = srcW / dstW;
+  for (let y = 0; y < srcH; y++) {
+    for (let x = 0; x < dstW; x++) {
+      const center = (x + 0.5) * xScale - 0.5;
+      const left = Math.ceil(center - a);
+      const right = Math.floor(center + a);
+      let sumR = 0, sumG = 0, sumB = 0, sumA = 0, sumW = 0;
+      for (let i = left; i <= right; i++) {
+        const si = Math.min(Math.max(i, 0), srcW - 1);
+        const w = lanczosKernel(center - i, a);
+        const off = (y * srcW + si) * 4;
+        sumR += src[off] * w;
+        sumG += src[off + 1] * w;
+        sumB += src[off + 2] * w;
+        sumA += src[off + 3] * w;
+        sumW += w;
+      }
+      const off = (y * dstW + x) * 4;
+      tmp[off] = sumR / sumW;
+      tmp[off + 1] = sumG / sumW;
+      tmp[off + 2] = sumB / sumW;
+      tmp[off + 3] = sumA / sumW;
+    }
+  }
+
+  // Vertical pass
+  const yScale = srcH / dstH;
+  for (let y = 0; y < dstH; y++) {
+    const center = (y + 0.5) * yScale - 0.5;
+    const top = Math.ceil(center - a);
+    const bottom = Math.floor(center + a);
+    for (let x = 0; x < dstW; x++) {
+      let sumR = 0, sumG = 0, sumB = 0, sumA = 0, sumW = 0;
+      for (let j = top; j <= bottom; j++) {
+        const sj = Math.min(Math.max(j, 0), srcH - 1);
+        const w = lanczosKernel(center - j, a);
+        const off = (sj * dstW + x) * 4;
+        sumR += tmp[off] * w;
+        sumG += tmp[off + 1] * w;
+        sumB += tmp[off + 2] * w;
+        sumA += tmp[off + 3] * w;
+        sumW += w;
+      }
+      const off = (y * dstW + x) * 4;
+      dst[off] = sumR / sumW;
+      dst[off + 1] = sumG / sumW;
+      dst[off + 2] = sumB / sumW;
+      dst[off + 3] = sumA / sumW;
+    }
+  }
+  return dst;
+}
+
+/**
+ * Resize + alpha-blend + ImageNet-normalize raw float32 RGBA source pixels into
+ * a CHW float32 tensor. Pure — identical on main thread and worker.
+ *
+ * @param {Float32Array} srcFloat  [srcH*srcW*4] float32 RGBA in [0,1]
+ * @param {number} srcW
+ * @param {number} srcH
+ * @param {number} size            output size (512)
+ * @param {number[]} bg            background color [r,g,b]
+ * @param {number[]} imageMean
+ * @param {number[]} imageStd
+ * @returns {Float32Array} CHW [3*size*size]
+ */
+function resizeBlendNormalize(srcFloat, srcW, srcH, size, bg, imageMean, imageStd) {
+  const resized = lanczosResize(srcFloat, srcW, srcH, size, size);
+  const chw = new Float32Array(3 * size * size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const off = (y * size + x) * 4;
+      const r = resized[off];
+      const g = resized[off + 1];
+      const b = resized[off + 2];
+      const a = Math.max(0, Math.min(1, resized[off + 3]));
+      const blendR = bg[0] * (1 - a) + r * a;
+      const blendG = bg[1] * (1 - a) + g * a;
+      const blendB = bg[2] * (1 - a) + b * a;
+      chw[0 * size * size + y * size + x] = (blendR - imageMean[0]) / imageStd[0];
+      chw[1 * size * size + y * size + x] = (blendG - imageMean[1]) / imageStd[1];
+      chw[2 * size * size + y * size + x] = (blendB - imageMean[2]) / imageStd[2];
+    }
+  }
+  return chw;
+}
+
+/**
+ * Pure validators for Web Worker replies at SF3D's fail-loud worker
+ * boundaries (preprocess, UV unwrap). A malformed reply throws here and never
+ * reaches the GPU or the texture baker as an apparently successful offload;
+ * the caller (callWorker) rejects and no main-thread retry is attempted.
+ *
+ * Review 2026-09-16 (HIGH): length-correct non-finite preprocessing output and
+ * truncated / non-finite / out-of-range UV geometry were previously accepted.
+ */
+
+/**
+ * unwrapUV returns faceAssignment as an Int32Array of atlas slots per face:
+ * 0-5 primary box-projection charts, 6-11 first overlap tier, 12 remaining
+ * (sub-cell grid). Valid values are 0..12 inclusive.
+ */
+const UV_ATLAS_SLOT_COUNT = 13;
+
+function requireBuffer(reply, key, label) {
+  if (!(reply?.[key] instanceof ArrayBuffer)) throw new Error(`${label} reply must carry ${key} ArrayBuffer`);
+  return reply[key];
+}
+
+function requireFinite(arr, label) {
+  for (let i = 0; i < arr.length; i++) {
+    if (!Number.isFinite(arr[i])) throw new Error(`${label} value non-finite at ${i}`);
+  }
+}
+
+/** Preprocess worker reply → Float32Array CHW of exactly expectedLen finite values. */
+function validatePreprocessReply(reply, expectedLen) {
+  const chw = new Float32Array(requireBuffer(reply, 'chwBuffer', 'preprocess'));
+  if (chw.length !== expectedLen) throw new Error(`CHW length ${chw.length} != expected ${expectedLen}`);
+  requireFinite(chw, 'preprocess CHW');
+  return chw;
+}
+
+/**
+ * UV-unwrap worker reply → { uvs, newVertices, newNormals, newFaces,
+ * faceAssignment, newNumVertices, newNumFaces } with every array at its
+ * declared length, finite floats, in-range face indices and chart ids.
+ */
+function validateUvUnwrapReply(reply) {
+  const nv = reply?.newNumVertices;
+  const nf = reply?.newNumFaces;
+  if (!Number.isSafeInteger(nv) || nv <= 0) throw new Error(`uv-unwrap newNumVertices invalid: ${nv}`);
+  if (!Number.isSafeInteger(nf) || nf <= 0) throw new Error(`uv-unwrap newNumFaces invalid: ${nf}`);
+  const assignmentBuffer = requireBuffer(reply, 'faceAssignment', 'uv-unwrap');
+  if (assignmentBuffer.byteLength % 4 !== 0) {
+    throw new Error(`uv-unwrap faceAssignment byte length ${assignmentBuffer.byteLength} is not a multiple of 4 (expected Int32 atlas slots)`);
+  }
+  const r = {
+    uvs: new Float32Array(requireBuffer(reply, 'uvs', 'uv-unwrap')),
+    newVertices: new Float32Array(requireBuffer(reply, 'newVertices', 'uv-unwrap')),
+    newNormals: new Float32Array(requireBuffer(reply, 'newNormals', 'uv-unwrap')),
+    newFaces: new Uint32Array(requireBuffer(reply, 'newFaces', 'uv-unwrap')),
+    faceAssignment: new Int32Array(assignmentBuffer),
+    newNumVertices: nv,
+    newNumFaces: nf,
+  };
+  const expectLen = (arr, expected, label) => {
+    if (arr.length !== expected) throw new Error(`uv-unwrap ${label} length ${arr.length} != ${expected}`);
+  };
+  expectLen(r.newVertices, nv * 3, 'newVertices');
+  expectLen(r.newNormals, nv * 3, 'newNormals');
+  expectLen(r.uvs, nv * 2, 'uvs');
+  expectLen(r.newFaces, nf * 3, 'newFaces');
+  expectLen(r.faceAssignment, nf, 'faceAssignment');
+  requireFinite(r.newVertices, 'uv-unwrap newVertices');
+  requireFinite(r.newNormals, 'uv-unwrap newNormals');
+  requireFinite(r.uvs, 'uv-unwrap uvs');
+  for (let i = 0; i < r.newFaces.length; i++) {
+    if (r.newFaces[i] >= nv) throw new Error(`uv-unwrap face index ${r.newFaces[i]} out of range (${nv} vertices) at ${i}`);
+  }
+  for (let i = 0; i < r.faceAssignment.length; i++) {
+    const v = r.faceAssignment[i];
+    if (v < 0 || v >= UV_ATLAS_SLOT_COUNT) {
+      throw new Error(`uv-unwrap faceAssignment value ${v} out of range (${UV_ATLAS_SLOT_COUNT} atlas slots) at ${i}`);
+    }
+  }
+  return r;
+}
+
+// One source preparation feeds both geometry and CLIP material estimation.
+function prepareConditionImage(srcFloat, srcW, srcH, size, bg, imageMean, imageStd) {
+  const rgba = Uint8Array.from(srcFloat, x => Math.round(x * 255));
+  const framed = prepareForeground(rgba, srcW, srcH, size);
+  const normalized = Float32Array.from(framed.data, x => x / 255);
+  return {
+    chw: resizeBlendNormalize(normalized, size, size, size, bg, imageMean, imageStd),
+    rgba: framed.data,
+  };
+}
+
+function validateConditionReply(reply, size) {
+  const chw = validatePreprocessReply(reply, 3 * size * size);
+  if (!(reply.rgbaBuffer instanceof ArrayBuffer) || reply.rgbaBuffer.byteLength !== 4 * size * size) {
+    throw new Error('condition image reply must carry matching RGBA bytes');
+  }
+  return { chw, rgba: new Uint8Array(reply.rgbaBuffer) };
+}
+
+/**
+ * worker_call.js — fail-loud request/response over a Web Worker.
+ *
+ * Productionizes the CPU-offload workers' failure lifecycle. Every failure path
+ * rejects loudly and never hangs or silently falls back:
+ *   - worker posts { ok:false, error }        → reject with the error
+ *   - worker posts { ok:true } but malformed   → reject (output validation)
+ *   - worker top-level throw (onerror)         → reject
+ *   - message deserialization fails (onmessageerror) → reject
+ *   - worker wedged / never replies            → reject after timeoutMs
+ * Listeners are always torn down (success, failure, timeout). The caller decides
+ * whether to fall back to a main-thread path — this helper never does so
+ * silently.
+ *
+ * @param {Worker} worker
+ * @param {object} message           postMessage payload (must carry a unique id)
+ * @param {Transferable[]} transfer  transfer list
+ * @param {object} opts
+ * @param {number} [opts.timeoutMs=30000]
+ * @param {(data:any)=>any} opts.onResult   maps a validated { ok:true } reply to
+ *   the resolved value; THROW inside to reject on malformed output.
+ * @returns {Promise<any>}
+ */
+function callWorker(worker, message, transfer, { timeoutMs = 30000, onResult }) {
+  const id = message.id;
+  if (!id) throw new Error('callWorker: message.id is required');
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      worker.removeEventListener('message', onMessage);
+      worker.removeEventListener('error', onError);
+      worker.removeEventListener('messageerror', onMessageError);
+      clearTimeout(timer);
+    };
+    const done = (fn, arg) => { if (settled) return; settled = true; cleanup(); fn(arg); };
+
+    const onMessage = (e) => {
+      if (e.data?.id !== id) return; // not our reply
+      if (e.data.ok) {
+        try { done(resolve, onResult(e.data)); }
+        catch (err) { done(reject, new Error(`worker output invalid: ${err?.message || err}`)); }
+      } else {
+        done(reject, new Error(`worker failed: ${e.data?.error || 'unknown error'}`));
+      }
+    };
+    const onError = (e) => done(reject, new Error(`worker error: ${e?.message || 'top-level worker exception'}`));
+    const onMessageError = () => done(reject, new Error('worker messageerror: reply could not be deserialized'));
+
+    worker.addEventListener('message', onMessage);
+    worker.addEventListener('error', onError);
+    worker.addEventListener('messageerror', onMessageError);
+    const timer = setTimeout(() => done(reject, new Error(`worker timed out after ${timeoutMs}ms`)), timeoutMs);
+
+    try {
+      worker.postMessage(message, transfer);
+    } catch (err) {
+      done(reject, new Error(`worker postMessage failed: ${err?.message || err}`));
+    }
+  });
+}
+
+/**
+ * Run explicitly CPU/worker-only work in the foreground service's admitted
+ * window. GPU-mixed work must not use this helper: its existing cooperative
+ * command-duty boundary owns ordering instead.
+ */
+async function withForegroundScope(options, phase, work) {
+  if (typeof work !== 'function') throw new TypeError('foreground scope work must be a function');
+  if (typeof options?.withForeground !== 'function') return await work();
+  return await options.withForeground(phase, work);
+}
+
+const patchEmbedWGSL = "// DINOv2 patch embedding compute shader.\r\n// Takes an image [3, H, W] and produces (N+1, D) token embeddings:\r\n//   N patches (tokenH x tokenW grid of 14x14 patches) + 1 CLS token.\r\n//   Each patch is flattened (14*14*3 = 588) then linearly projected to D.\r\n//   Position embeddings are interpolated from the pretrained (1+370, D) table.\r\n//\r\n// DINOv2 differences from DeiT:\r\n//   - 14x14 patches (not 16x16)\r\n//   - Variable spatial dimensions (not fixed 224x224)\r\n//   - Position embedding interpolation for arbitrary token counts\r\n\r\nstruct Params {\r\n  imgH: u32,      // image height (tokenH * 14)\r\n  imgW: u32,      // image width (tokenW * 14)\r\n  patchSize: u32,  // 14\r\n  tokenH: u32,\r\n  tokenW: u32,\r\n  channels: u32,   // 3\r\n  D: u32,          // model dim (1024)\r\n  numTokens: u32,  // tokenH * tokenW + 1 (including CLS)\r\n  numWorkgroupsX: u32,\r\n}\r\n\r\n@group(0) @binding(0) var<uniform> params: Params;\r\n@group(0) @binding(1) var<storage, read> image: array<f32>;       // [3, imgH, imgW] CHW\r\n@group(0) @binding(2) var<storage, read> projWeight: array<f32>;  // [D, 3, 14, 14] = [D, 588]\r\n@group(0) @binding(3) var<storage, read> projBias: array<f32>;    // [D]\r\n@group(0) @binding(4) var<storage, read> clsToken: array<f32>;    // [1, 1, D]\r\n@group(0) @binding(5) var<storage, read> posEmbed: array<f32>;    // [1, 1+numPatchesPretrained, D]\r\n@group(0) @binding(6) var<storage, read_write> output: array<f32>; // [numTokens, D]\r\n\r\nconst WG_SIZE: u32 = 256;\r\n\r\n@compute @workgroup_size(WG_SIZE)\r\nfn main(\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n  @builtin(local_invocation_id) lid: vec3<u32>,\r\n) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n  let totalElements = params.numTokens * params.D;\r\n\r\n  if (idx >= totalElements) { return; }\r\n\r\n  let token = idx / params.D;\r\n  let d = idx % params.D;\r\n\r\n  var val = 0.0;\r\n\r\n  if (token == 0u) {\r\n    // CLS token\r\n    val = clsToken[d];\r\n  } else {\r\n    // Patch embedding\r\n    let patchIdx = token - 1u;\r\n    let patchRow = patchIdx / params.tokenW;\r\n    let patchCol = patchIdx % params.tokenW;\r\n    let startY = patchRow * params.patchSize;\r\n    let startX = patchCol * params.patchSize;\r\n\r\n    // Conv2d-style patch projection: weight is [D, 3, 14, 14]\r\n    val = projBias[d];\r\n    for (var c = 0u; c < params.channels; c++) {\r\n      for (var py = 0u; py < params.patchSize; py++) {\r\n        for (var px = 0u; px < params.patchSize; px++) {\r\n          let imgY = startY + py;\r\n          let imgX = startX + px;\r\n          // Image is CHW\r\n          let pixelVal = image[c * params.imgH * params.imgW + imgY * params.imgW + imgX];\r\n          // Weight is [D, C, pH, pW] → index [d, c, py, px]\r\n          let wIdx = d * params.channels * params.patchSize * params.patchSize\r\n                   + c * params.patchSize * params.patchSize\r\n                   + py * params.patchSize + px;\r\n          val += pixelVal * projWeight[wIdx];\r\n        }\r\n      }\r\n    }\r\n  }\r\n\r\n  // Add position embedding (CLS pos is at index 0, patch pos follow)\r\n  // For now: use position embedding directly if token count matches,\r\n  // otherwise skip (interpolation would need a separate pass)\r\n  val += posEmbed[idx];\r\n\r\n  output[idx] = val;\r\n}\r\n";
+
+const layerNormWGSL = "// Layer normalization for ViT backbone.\r\n// Each workgroup normalizes one row (token).\r\n// Thread 0 computes mean/variance serially, then all threads normalize in parallel.\r\n// Adapted from webgpu-samples visionTransformer with 2D dispatch support.\r\n\r\nstruct Params {\r\n  N: u32,       // number of rows (tokens)\r\n  D: u32,       // dimension per row\r\n  eps: f32,\r\n}\r\n\r\n@group(0) @binding(0) var<uniform> params: Params;\r\n@group(0) @binding(1) var<storage, read> input: array<f32>;\r\n@group(0) @binding(2) var<storage, read> gamma: array<f32>;\r\n@group(0) @binding(3) var<storage, read> beta: array<f32>;\r\n@group(0) @binding(4) var<storage, read_write> output: array<f32>;\r\n\r\nvar<workgroup> shared_mean: f32;\r\nvar<workgroup> shared_inv_std: f32;\r\n\r\n@compute @workgroup_size(256)\r\nfn main(\r\n  @builtin(workgroup_id) wg_id: vec3u,\r\n  @builtin(local_invocation_id) local_id: vec3u,\r\n) {\r\n  let row = wg_id.x;\r\n  let tid = local_id.x;\r\n  let D = params.D;\r\n  let base = row * D;\r\n\r\n  if (row >= params.N) { return; }\r\n\r\n  // Thread 0 computes mean and variance (two-pass for numerical stability).\r\n  // The one-pass formula E[x²]-E[x]² suffers catastrophic cancellation when\r\n  // values are large (±20 common in ViT), losing significant precision.\r\n  if (tid == 0u) {\r\n    var sum = 0.0;\r\n    for (var i = 0u; i < D; i++) {\r\n      sum += input[base + i];\r\n    }\r\n    let mean = sum / f32(D);\r\n    var var_sum = 0.0;\r\n    for (var i = 0u; i < D; i++) {\r\n      let diff = input[base + i] - mean;\r\n      var_sum += diff * diff;\r\n    }\r\n    let variance = var_sum / f32(D);\r\n    shared_mean = mean;\r\n    shared_inv_std = 1.0 / sqrt(variance + params.eps);\r\n  }\r\n  workgroupBarrier();\r\n\r\n  let mean = shared_mean;\r\n  let inv_std = shared_inv_std;\r\n\r\n  // All threads normalize and apply affine transform in parallel\r\n  for (var i = tid; i < D; i += 256u) {\r\n    let val = input[base + i];\r\n    output[base + i] = (val - mean) * inv_std * gamma[i] + beta[i];\r\n  }\r\n}\r\n";
+
+const attentionWGSL = "// Multi-head self-attention compute shaders for DINOv2 ViT.\r\n// Adapted from webgpu-samples visionTransformer with 2D dispatch.\r\n//\r\n// Three entry points:\r\n//   computeScores: Q·K^T scaled dot product → scores\r\n//   softmax: row-wise numerically stable softmax\r\n//   applyAttn: scores @ V → output\r\n\r\nstruct ScoreParams {\r\n  N: u32,        // number of tokens\r\n  D: u32,        // model dimension\r\n  numHeads: u32,\r\n  headDim: u32,\r\n  scale: f32,\r\n  numWorkgroupsX: u32,\r\n}\r\n\r\nstruct SoftmaxParams {\r\n  N: u32,\r\n  numHeads: u32,\r\n  numWorkgroupsX: u32,\r\n}\r\n\r\nstruct ApplyParams {\r\n  N: u32,\r\n  D: u32,\r\n  numHeads: u32,\r\n  headDim: u32,\r\n  numWorkgroupsX: u32,\r\n}\r\n\r\n// --- Attention scores ---\r\n@group(0) @binding(0) var<uniform> scoreParams: ScoreParams;\r\n@group(0) @binding(1) var<storage, read> qBuf: array<f32>;\r\n@group(0) @binding(2) var<storage, read> kBuf: array<f32>;\r\n@group(0) @binding(3) var<storage, read_write> scoreBuf: array<f32>;\r\n\r\n@compute @workgroup_size(256)\r\nfn computeScores(\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n  @builtin(local_invocation_id) lid: vec3<u32>,\r\n) {\r\n  let linearWG = wgid.x + wgid.y * scoreParams.numWorkgroupsX;\r\n  let idx = linearWG * 256u + lid.x;\r\n\r\n  let N = scoreParams.N;\r\n  let numHeads = scoreParams.numHeads;\r\n  let headDim = scoreParams.headDim;\r\n  let D = scoreParams.D;\r\n  let totalScores = numHeads * N * N;\r\n\r\n  if (idx >= totalScores) { return; }\r\n\r\n  let head = idx / (N * N);\r\n  let remainder = idx % (N * N);\r\n  let qi = remainder / N;\r\n  let ki = remainder % N;\r\n  let headOffset = head * headDim;\r\n\r\n  // headDim is 64, so 4-way split gives 16-element chains.\r\n  var d0 = 0.0;\r\n  var d1 = 0.0;\r\n  var d2 = 0.0;\r\n  var d3 = 0.0;\r\n  let qBase = qi * D + headOffset;\r\n  let kBase = ki * D + headOffset;\r\n  let hd4 = (headDim / 4u) * 4u;\r\n  for (var d = 0u; d < hd4; d += 4u) {\r\n    d0 += qBuf[qBase + d]      * kBuf[kBase + d];\r\n    d1 += qBuf[qBase + d + 1u] * kBuf[kBase + d + 1u];\r\n    d2 += qBuf[qBase + d + 2u] * kBuf[kBase + d + 2u];\r\n    d3 += qBuf[qBase + d + 3u] * kBuf[kBase + d + 3u];\r\n  }\r\n  for (var d = hd4; d < headDim; d++) {\r\n    d0 += qBuf[qBase + d] * kBuf[kBase + d];\r\n  }\r\n\r\n  scoreBuf[idx] = ((d0 + d1) + (d2 + d3)) * scoreParams.scale;\r\n}\r\n\r\n// --- Softmax ---\r\n// Uses separate bind group with SoftmaxParams\r\n@group(0) @binding(0) var<uniform> softmaxParams: SoftmaxParams;\r\n@group(0) @binding(1) var<storage, read_write> softmaxScoreBuf: array<f32>;\r\n\r\n@compute @workgroup_size(256)\r\nfn softmax(\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n  @builtin(local_invocation_id) lid: vec3<u32>,\r\n) {\r\n  let linearWG = wgid.x + wgid.y * softmaxParams.numWorkgroupsX;\r\n  let idx = linearWG * 256u + lid.x;\r\n\r\n  let N = softmaxParams.N;\r\n  let totalRows = softmaxParams.numHeads * N;\r\n\r\n  if (idx >= totalRows) { return; }\r\n\r\n  let base = idx * N;\r\n\r\n  // Find max\r\n  var m = -1e30;\r\n  for (var i = 0u; i < N; i++) {\r\n    m = max(m, softmaxScoreBuf[base + i]);\r\n  }\r\n\r\n  // Exp and sum\r\n  var s = 0.0;\r\n  for (var i = 0u; i < N; i++) {\r\n    let e = exp(softmaxScoreBuf[base + i] - m);\r\n    softmaxScoreBuf[base + i] = e;\r\n    s += e;\r\n  }\r\n\r\n  // Normalize\r\n  for (var i = 0u; i < N; i++) {\r\n    softmaxScoreBuf[base + i] = softmaxScoreBuf[base + i] / s;\r\n  }\r\n}\r\n\r\n// --- Apply attention ---\r\n@group(0) @binding(0) var<uniform> applyParams: ApplyParams;\r\n@group(0) @binding(1) var<storage, read> applyScoreBuf: array<f32>;\r\n@group(0) @binding(2) var<storage, read> vBuf: array<f32>;\r\n@group(0) @binding(3) var<storage, read_write> attnOutput: array<f32>;\r\n\r\n@compute @workgroup_size(256)\r\nfn applyAttn(\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n  @builtin(local_invocation_id) lid: vec3<u32>,\r\n) {\r\n  let linearWG = wgid.x + wgid.y * applyParams.numWorkgroupsX;\r\n  let idx = linearWG * 256u + lid.x;\r\n\r\n  let N = applyParams.N;\r\n  let D = applyParams.D;\r\n  let numHeads = applyParams.numHeads;\r\n  let headDim = applyParams.headDim;\r\n\r\n  if (idx >= N * D) { return; }\r\n\r\n  let row = idx / D;\r\n  let col = idx % D;\r\n  let head = col / headDim;\r\n  let d = col % headDim;\r\n\r\n  // N is ~1370 tokens, 4-way split gives ~342-element chains.\r\n  var v0 = 0.0;\r\n  var v1 = 0.0;\r\n  var v2 = 0.0;\r\n  var v3 = 0.0;\r\n  let scoreBase = head * N * N + row * N;\r\n  let vCol = head * headDim + d;\r\n  let n4 = (N / 4u) * 4u;\r\n  for (var j = 0u; j < n4; j += 4u) {\r\n    v0 += applyScoreBuf[scoreBase + j]      * vBuf[(j)      * D + vCol];\r\n    v1 += applyScoreBuf[scoreBase + j + 1u] * vBuf[(j + 1u) * D + vCol];\r\n    v2 += applyScoreBuf[scoreBase + j + 2u] * vBuf[(j + 2u) * D + vCol];\r\n    v3 += applyScoreBuf[scoreBase + j + 3u] * vBuf[(j + 3u) * D + vCol];\r\n  }\r\n  for (var j = n4; j < N; j++) {\r\n    v0 += applyScoreBuf[scoreBase + j] * vBuf[j * D + vCol];\r\n  }\r\n  attnOutput[idx] = (v0 + v1) + (v2 + v3);\r\n}\r\n";
+
+const linearWGSL = "// Linear projection: output = input @ weight + bias\r\n// Adapted from webgpu-samples visionTransformer mlp.wgsl with 2D dispatch.\r\n//\r\n// Weight layout controlled by params.transposed:\r\n//   transposed=1 (default): weight is [inDim, outDim], access weight[k * outDim + col]\r\n//   transposed=0: weight is [outDim, inDim] (PyTorch native), access weight[col * inDim + k]\r\n\r\nstruct Params {\r\n  numRows: u32,\r\n  inDim: u32,\r\n  outDim: u32,\r\n  numWorkgroupsX: u32,\r\n  transposed: u32,  // 1=transposed [inDim, outDim], 0=native [outDim, inDim]\r\n}\r\n\r\n@group(0) @binding(0) var<uniform> params: Params;\r\n@group(0) @binding(1) var<storage, read> input: array<f32>;\r\n@group(0) @binding(2) var<storage, read> weight: array<f32>;\r\n@group(0) @binding(3) var<storage, read> bias: array<f32>;\r\n@group(0) @binding(4) var<storage, read_write> output: array<f32>;\r\n\r\nconst WG_SIZE: u32 = 256;\r\n\r\n@compute @workgroup_size(WG_SIZE)\r\nfn main(\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n  @builtin(local_invocation_id) lid: vec3<u32>,\r\n) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n\r\n  if (idx >= params.numRows * params.outDim) { return; }\r\n\r\n  let row = idx / params.outDim;\r\n  let col = idx % params.outDim;\r\n\r\n  // 4-way split accumulation for better fp32 precision on large dot products.\r\n  var s0 = 0.0;\r\n  var s1 = 0.0;\r\n  var s2 = 0.0;\r\n  var s3 = 0.0;\r\n  let inBase = row * params.inDim;\r\n  let len4 = (params.inDim / 4u) * 4u;\r\n\r\n  if (params.transposed == 1u) {\r\n    // Transposed layout: weight[k, col] = weight[k * outDim + col]\r\n    let wBase = col;\r\n    let stride = params.outDim;\r\n    for (var k = 0u; k < len4; k += 4u) {\r\n      s0 += input[inBase + k]      * weight[(k)      * stride + wBase];\r\n      s1 += input[inBase + k + 1u] * weight[(k + 1u) * stride + wBase];\r\n      s2 += input[inBase + k + 2u] * weight[(k + 2u) * stride + wBase];\r\n      s3 += input[inBase + k + 3u] * weight[(k + 3u) * stride + wBase];\r\n    }\r\n    for (var k = len4; k < params.inDim; k++) {\r\n      s0 += input[inBase + k] * weight[k * stride + wBase];\r\n    }\r\n  } else {\r\n    // Native layout: weight[col, k] = weight[col * inDim + k]\r\n    let wBase = col * params.inDim;\r\n    for (var k = 0u; k < len4; k += 4u) {\r\n      s0 += input[inBase + k]      * weight[wBase + k];\r\n      s1 += input[inBase + k + 1u] * weight[wBase + k + 1u];\r\n      s2 += input[inBase + k + 2u] * weight[wBase + k + 2u];\r\n      s3 += input[inBase + k + 3u] * weight[wBase + k + 3u];\r\n    }\r\n    for (var k = len4; k < params.inDim; k++) {\r\n      s0 += input[inBase + k] * weight[wBase + k];\r\n    }\r\n  }\r\n  output[idx] = (s0 + s1) + (s2 + s3) + bias[col];\r\n}\r\n";
+
+const linearGeluWGSL = "// Linear projection + GELU activation: output = GELU(input @ weight + bias)\r\n// Used for MLP fc1 in DINOv2 ViT blocks.\r\n// NaN guard: Apple Metal may produce NaN from finite accumulations; sanitized via bitcast.\r\n\r\nstruct Params {\r\n  numRows: u32,\r\n  inDim: u32,\r\n  outDim: u32,\r\n  numWorkgroupsX: u32,\r\n}\r\n\r\n@group(0) @binding(0) var<uniform> params: Params;\r\n@group(0) @binding(1) var<storage, read> input: array<f32>;\r\n@group(0) @binding(2) var<storage, read> weight: array<f32>;\r\n@group(0) @binding(3) var<storage, read> bias: array<f32>;\r\n@group(0) @binding(4) var<storage, read_write> output: array<f32>;\r\n\r\nconst WG_SIZE: u32 = 256;\r\n\r\nfn gelu(x: f32) -> f32 {\r\n  // GELU via erf approximation (Abramowitz & Stegun 7.1.26, max error ~1.5e-7).\r\n  // Avoids tanh() which has precision issues on Apple Metal fast-math.\r\n  if (x > 10.0) { return x; }\r\n  if (x < -10.0) { return 0.0; }\r\n  let a = x * 0.7071067811865476; // x / sqrt(2)\r\n  let s = sign(a);\r\n  let t_abs = abs(a);\r\n  let p = 0.3275911;\r\n  let t = 1.0 / (1.0 + p * t_abs);\r\n  let t2 = t * t;\r\n  let t3 = t2 * t;\r\n  let t4 = t3 * t;\r\n  let t5 = t4 * t;\r\n  let erf_abs = 1.0 - (0.254829592 * t - 0.284496736 * t2 + 1.421413741 * t3 - 1.453152027 * t4 + 1.061405429 * t5) * exp(-t_abs * t_abs);\r\n  let erf_val = s * erf_abs;\r\n  return 0.5 * x * (1.0 + erf_val);\r\n}\r\n\r\n@compute @workgroup_size(WG_SIZE)\r\nfn main(\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n  @builtin(local_invocation_id) lid: vec3<u32>,\r\n) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n\r\n  if (idx >= params.numRows * params.outDim) { return; }\r\n\r\n  let row = idx / params.outDim;\r\n  let col = idx % params.outDim;\r\n\r\n  // Split accumulation (see linear.wgsl for rationale).\r\n  var s0 = 0.0;\r\n  var s1 = 0.0;\r\n  var s2 = 0.0;\r\n  var s3 = 0.0;\r\n  let inBase = row * params.inDim;\r\n  let wBase = col;\r\n  let stride = params.outDim;\r\n  let len4 = (params.inDim / 4u) * 4u;\r\n  for (var k = 0u; k < len4; k += 4u) {\r\n    s0 += input[inBase + k]      * weight[(k)      * stride + wBase];\r\n    s1 += input[inBase + k + 1u] * weight[(k + 1u) * stride + wBase];\r\n    s2 += input[inBase + k + 2u] * weight[(k + 2u) * stride + wBase];\r\n    s3 += input[inBase + k + 3u] * weight[(k + 3u) * stride + wBase];\r\n  }\r\n  for (var k = len4; k < params.inDim; k++) {\r\n    s0 += input[inBase + k] * weight[k * stride + wBase];\r\n  }\r\n  output[idx] = gelu((s0 + s1) + (s2 + s3) + bias[col]);\r\n}\r\n";
+
+const layerscaleWGSL = "// LayerScale: element-wise multiply by learned gamma, then add residual.\r\n// DINOv2 applies this after attention and after FFN:\r\n//   x = x + gamma * sublayer(norm(x))\r\n//\r\n// This shader does: output[i] = residual[i] + gamma[i % D] * input[i]\r\n\r\nstruct Params {\r\n  count: u32,   // total elements (N * D)\r\n  D: u32,       // model dim (for gamma indexing)\r\n  numWorkgroupsX: u32,\r\n}\r\n\r\n@group(0) @binding(0) var<uniform> params: Params;\r\n@group(0) @binding(1) var<storage, read> input: array<f32>;      // sublayer output\r\n@group(0) @binding(2) var<storage, read> gamma: array<f32>;       // [D] learned scale\r\n@group(0) @binding(3) var<storage, read> residual: array<f32>;    // pre-sublayer x\r\n@group(0) @binding(4) var<storage, read_write> output: array<f32>;\r\n\r\nconst WG_SIZE: u32 = 256;\r\n\r\n@compute @workgroup_size(WG_SIZE)\r\nfn main(\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n  @builtin(local_invocation_id) lid: vec3<u32>,\r\n) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n\r\n  if (idx >= params.count) { return; }\r\n\r\n  let d = idx % params.D;\r\n  output[idx] = residual[idx] + gamma[d] * input[idx];\r\n}\r\n";
+
+const activationsWGSL = "// activations.wgsl — Element-wise activation functions\r\n//\r\n// ReLU, SiLU, and element-wise add (for skip connections).\r\n// Each function operates in-place or writes to a separate output buffer.\r\n\r\nstruct ActivationParams {\r\n  count: u32,     // total number of elements\r\n  op: u32,        // 0=relu, 1=silu, 2=add, 3=add_relu, 4=sigmoid\r\n  numWorkgroupsX: u32,\r\n};\r\n\r\n@group(0) @binding(0) var<uniform> params: ActivationParams;\r\n@group(0) @binding(1) var<storage, read> input_a: array<f32>;\r\n@group(0) @binding(2) var<storage, read> input_b: array<f32>;  // used for add ops\r\n@group(0) @binding(3) var<storage, read_write> output: array<f32>;\r\n\r\nconst WG_SIZE: u32 = 256;\r\n\r\n@compute @workgroup_size(WG_SIZE)\r\nfn activation_main(\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n  @builtin(local_invocation_id) lid: vec3<u32>,\r\n) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n  if (idx >= params.count) {\r\n    return;\r\n  }\r\n\r\n  let a = input_a[idx];\r\n\r\n  switch params.op {\r\n    case 0u: { // ReLU\r\n      output[idx] = max(a, 0.0);\r\n    }\r\n    case 1u: { // SiLU (x * sigmoid(x))\r\n      output[idx] = a / (1.0 + exp(-a));\r\n    }\r\n    case 2u: { // Add (skip connection)\r\n      output[idx] = a + input_b[idx];\r\n    }\r\n    case 3u: { // Add + ReLU\r\n      output[idx] = max(a + input_b[idx], 0.0);\r\n    }\r\n    case 4u: { // Sigmoid\r\n      output[idx] = 1.0 / (1.0 + exp(-a));\r\n    }\r\n    default: {\r\n      output[idx] = a;\r\n    }\r\n  }\r\n}\r\n";
+
+/**
+ * sf3d_backbone.js — DINOv2 ViT-Large backbone adapted for SF3D.
+ *
+ * Key differences from MOGE's DINOv2:
+ *   - Separate Q/K/V projections (not fused QKV)
+ *   - AdaNorm modulation: each layer has norm1_modulation and norm2_modulation
+ *     that take camera embeddings and produce scale/shift for LayerNorm outputs
+ *   - Standard GELU MLP (verified from checkpoint config: use_swiglu_ffn=False)
+ *   - Final layernorm after encoder
+ *   - Output is last_hidden_state permuted to [N_v, C, N_t] tokens (no intermediate extraction)
+ *
+ * Produces: [N_tokens, dim] image features for the two-stream backbone
+ */
+
+
+const MAX_WG$2 = 65535;
+const WG_SIZE$3 = 256;
+function splitWG$3(total) {
+  if (total <= MAX_WG$2) return [total, 1];
+  return [MAX_WG$2, Math.ceil(total / MAX_WG$2)];
+}
+function ceilDiv$3(a, b) { return Math.ceil(a / b); }
+
+function makeUniform(device, data) {
+  const buf = device.createBuffer({
+    size: Math.max(data.byteLength, 16),
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true,
+  });
+  new Uint8Array(buf.getMappedRange()).set(new Uint8Array(data.buffer || data));
+  buf.unmap();
+  return buf;
+}
+
+const VIT_CONFIG = {
+  dim: 1024,
+  numHeads: 16,
+  headDim: 64,
+  numLayers: 24,
+  patchSize: 14,
+  // Standard GELU MLP (not SwiGLU — verified from checkpoint config)
+  mlpHiddenDim: 4096,
+  scale: 1.0 / Math.sqrt(64),
+  eps: 1e-6,
+};
+
+class SF3DImageTokenizer {
+  constructor(device) {
+    this.device = device;
+    this.pipelines = {};
+    this._uniformCache = new Map();
+  }
+
+  init() {
+    const device = this.device;
+    const make = (code, entry) => device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: device.createShaderModule({ code }), entryPoint: entry },
+    });
+
+    this.pipelines.patchEmbed = make(patchEmbedWGSL, 'main');
+    this.pipelines.layerNorm = make(layerNormWGSL, 'main');
+    this.pipelines.attnScores = make(attentionWGSL, 'computeScores');
+    this.pipelines.attnSoftmax = make(attentionWGSL, 'softmax');
+    this.pipelines.attnApply = make(attentionWGSL, 'applyAttn');
+    this.pipelines.linear = make(linearWGSL, 'main');
+    this.pipelines.linearGelu = make(linearGeluWGSL, 'main');
+    this.pipelines.layerScale = make(layerscaleWGSL, 'main');
+    this.pipelines.activation = make(activationsWGSL, 'activation_main');
+
+    // Inline add shader
+    this.pipelines.add = make(`
+      @group(0) @binding(0) var<storage, read_write> dst: array<f32>;
+      @group(0) @binding(1) var<storage, read> src: array<f32>;
+      struct P { count: u32, numWgX: u32 }
+      @group(0) @binding(2) var<uniform> p: P;
+      @compute @workgroup_size(256)
+      fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+        let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+        if (idx >= p.count) { return; }
+        dst[idx] = dst[idx] + src[idx];
+      }
+    `, 'main');
+
+    // Modulated LayerNorm: output = (1 + scale) * LN(input) + shift
+    // scale, shift come from linear(cameraEmbed) → [2*D], split into scale and shift
+    this.pipelines.modulatedLN = make(`
+      struct P { N: u32, D: u32, numWgX: u32 }
+      @group(0) @binding(0) var<uniform> p: P;
+      @group(0) @binding(1) var<storage, read> input: array<f32>;
+      @group(0) @binding(2) var<storage, read> gamma: array<f32>;
+      @group(0) @binding(3) var<storage, read> beta: array<f32>;
+      @group(0) @binding(4) var<storage, read> modulation: array<f32>;
+      @group(0) @binding(5) var<storage, read_write> output: array<f32>;
+
+      @compute @workgroup_size(1)
+      fn main(@builtin(global_invocation_id) gid: vec3u) {
+        let row = gid.x;
+        if (row >= p.N) { return; }
+        let D = p.D;
+        let base = row * D;
+        var sum: f32 = 0.0;
+        for (var d: u32 = 0; d < D; d++) { sum += input[base + d]; }
+        let mean = sum / f32(D);
+        var varSum: f32 = 0.0;
+        for (var d: u32 = 0; d < D; d++) { let diff = input[base + d] - mean; varSum += diff * diff; }
+        let invStd = 1.0 / sqrt(varSum / f32(D) + 1e-6);
+        for (var d: u32 = 0; d < D; d++) {
+          let normalized = (input[base + d] - mean) * invStd;
+          let ln_out = gamma[d] * normalized + beta[d];
+          let scale = modulation[d];
+          let shift = modulation[D + d];
+          output[base + d] = (1.0 + scale) * ln_out + shift;
+        }
+      }
+    `, 'main');
+
+    this.pipelines.linearGelu = make(linearGeluWGSL, 'main');
+  }
+
+  _cachedUniform(data) {
+    const bytes = new Uint8Array(data.buffer || data);
+    let h = 0;
+    for (let i = 0; i < bytes.length; i++) h = (h * 31 + bytes[i]) | 0;
+    const key = `u_${bytes.length}_${h}`;
+    if (this._uniformCache.has(key)) return this._uniformCache.get(key);
+    const buf = makeUniform(this.device, data);
+    this._uniformCache.set(key, buf);
+    return buf;
+  }
+
+  /**
+   * Run the SF3D DINOv2 image tokenizer.
+   *
+   * @param {GPUCommandEncoder} encoder
+   * @param {GPUBuffer} imageBuf - [3, 512, 512] normalized image
+   * @param {GPUBuffer} cameraEmbedBuf - [768] camera embedding
+   * @param {Object} weights - imageTokenizer weights from loadWeights
+   * @returns {GPUBuffer} - [N_tokens, 1024] image token features (permuted for backbone)
+   */
+  /**
+   * Legacy single-command-buffer encode. Records patch embed, all 24 ViT
+   * blocks, and the final LayerNorm into the caller-supplied `encoder`; the
+   * caller submits it once. Behavior-preserving over the pre-cooperative port.
+   */
+  encode(encoder, imageBuf, cameraEmbedBuf, weights) {
+    const ctx = this._setupEncode(encoder, imageBuf, cameraEmbedBuf, weights);
+    for (let l = 0; l < VIT_CONFIG.numLayers; l++) {
+      this._encodeBlock(encoder, l, ctx, weights);
+    }
+    return this._finalizeEncode(encoder, ctx, weights);
+  }
+
+  /**
+   * Cooperative encode driven by the Kaminos cooperative porting spine.
+   *
+   * Numerically identical to encode(): the exact same dispatch sequence over
+   * the exact same device-owned work buffers (tokenBufA/tokenBufB ping-pong
+   * persists across chunks because buffers are device-owned, not encoder-owned).
+   * The only difference is command-buffer granularity — each fixed chunk of
+   * `chunkBlocks` blocks is recorded into its own encoder and handed to the
+   * driver to submit + yield, instead of all 24 blocks in one command buffer.
+   *
+   * Setup (patch embed + SiLU) rides in the first chunk's encoder; the final
+   * LayerNorm rides in the last chunk's encoder. Every dispatch executes in the
+   * same queue order it would under encode(), so GPU results are byte-identical.
+   *
+   * @param {object} o
+   * @param {GPUBuffer} o.imageBuf
+   * @param {GPUBuffer} o.cameraEmbedBuf
+   * @param {object} o.weights
+   * @param {number} o.numBlocks
+   * @param {number} o.chunkBlocks
+   * @param {(blockStart:number, blockEnd:number, encodeChunk:(enc:GPUCommandEncoder)=>void)=>Promise<void>} o.driver
+   */
+  async encodeCooperative({ imageBuf, cameraEmbedBuf, weights, numBlocks, chunkBlocks, driver, withChunkWeights = null, retireIntermediateBuffers = false }) {
+    if(this._capturedWorkOwner)throw Error('DINO work-buffer cleanup is quarantined');
+    if (numBlocks !== VIT_CONFIG.numLayers) {
+      throw new Error(
+        `encodeCooperative numBlocks ${numBlocks} must equal VIT_CONFIG.numLayers ${VIT_CONFIG.numLayers}`,
+      );
+    }
+    if(withChunkWeights!==null&&typeof withChunkWeights!=='function')throw TypeError('withChunkWeights must be a function');
+    // ctx (work buffers + currentTokens ping-pong pointer) is created once and
+    // survives every chunk. Setup dispatches are deferred into the first chunk.
+    let ctx = null;
+    let result = null;
+    const allocations=[];
+    let failure,failed=false;
+
+    try{
+    for (let start = 0; start < numBlocks; start += chunkBlocks) {
+      const end = Math.min(start + chunkBlocks, numBlocks);
+      const isFirst = start === 0;
+      const isLast = end === numBlocks;
+      // eslint-disable-next-line no-await-in-loop
+      const encode = chunkWeights => driver(start, end, encoder => {
+        const record = () => {
+        if (isFirst) {
+          ctx = this._setupEncode(encoder, imageBuf, cameraEmbedBuf, chunkWeights);
+        }
+        for (let l = start; l < end; l++) {
+          this._encodeBlock(encoder, l, ctx, chunkWeights);
+        }
+        if (isLast) {
+          result = this._finalizeEncode(encoder, ctx, chunkWeights);
+        }
+        };
+        if(retireIntermediateBuffers)captureGpuBufferAllocations(record,{ownedAllocations:allocations});
+        else record();
+      });
+      if(withChunkWeights)await withChunkWeights({blockStart:start,blockEnd:end,isFirst,isLast},encode);
+      else await encode(weights);
+    }
+
+    if (!result) throw new Error('encodeCooperative produced no result');
+    return result;
+    }catch(error){failed=true;failure=error;throw error;}
+    finally{
+      if(retireIntermediateBuffers){
+        // Capture only synchronous model encoding, never a yielding host turn.
+        // Do not retire backing still referenced by an unresolved queue prefix.
+        this._capturedWorkOwner={buffers:new Set(allocations.map(a=>a.buffer)),keep:failed?null:result?.tokensBuf};
+        try{await this.retireCapturedWorkBuffers();}
+        catch(error){
+          // The output was never returned when finally rejects: recovery owns
+          // it too. Keep the entire unresolved inventory on this tokenizer.
+          if(this._capturedWorkOwner)this._capturedWorkOwner.keep=null;
+          throw failed?new AggregateError([failure,error],'DINO failed and work-buffer cleanup is unresolved',{cause:failure}):error;
+        }
+      }
+    }
+  }
+
+  /** Recover only after a new actual drain; unresolved backing stays owned. */
+  async retireCapturedWorkBuffers(){
+    const owner=this._capturedWorkOwner;if(!owner)return;
+    await this.device.queue.onSubmittedWorkDone();
+    const errors=[];
+    for(const buffer of owner.buffers)if(buffer!==owner.keep){
+      try{
+        buffer.destroy();owner.buffers.delete(buffer);
+        for(const [name,diag] of Object.entries(this._dinov2Diag??{}))if(diag===buffer)delete this._dinov2Diag[name];
+      }catch(error){errors.push(error);}
+    }
+    if(errors.length)throw new AggregateError(errors,'DINO work-buffer retirement failed');
+    this._capturedWorkOwner=null;
+  }
+
+  /**
+   * Allocate work buffers and record patch embedding + SiLU(cameraEmbed) into
+   * `encoder`. Returns the mutable context (work buffers + currentTokens
+   * pointer) shared across the block loop.
+   */
+  _setupEncode(encoder, imageBuf, cameraEmbedBuf, weights) {
+    const device = this.device;
+    const D = VIT_CONFIG.dim;
+    const ps = VIT_CONFIG.patchSize;
+    const imgSize = 512;
+    const tokenH = Math.floor(imgSize / ps); // 36 (512/14 = 36.57, DINOv2 uses floor)
+    const tokenW = Math.floor(imgSize / ps);
+    // numPatches = 36*36 = 1296, N = 1297 (with CLS)
+    const numPatches = tokenH * tokenW;
+    const N = numPatches + 1;
+    const T = N * D;
+
+    // Work buffers (device-owned; persist across all command buffers)
+    const tokenBufA = createEmptyBuffer(device, T * 4);
+    const tokenBufB = createEmptyBuffer(device, T * 4);
+    const normBuf = createEmptyBuffer(device, T * 4);
+    const qBuf = createEmptyBuffer(device, T * 4);
+    const kBuf = createEmptyBuffer(device, T * 4);
+    const vBuf = createEmptyBuffer(device, T * 4);
+    const scoreBuf = createEmptyBuffer(device, VIT_CONFIG.numHeads * N * N * 4);
+    const attnOutBuf = createEmptyBuffer(device, T * 4);
+    const projBuf = createEmptyBuffer(device, T * 4);
+    const hiddenBuf = createEmptyBuffer(device, N * VIT_CONFIG.mlpHiddenDim * 4);
+    const ffnOutBuf = createEmptyBuffer(device, T * 4);
+    const modBuf = createEmptyBuffer(device, 2 * D * 4); // modulation output [2*D]
+
+    // 1. Patch embedding
+    this._dispatchPatchEmbed(encoder, imageBuf, weights, tokenBufA, tokenH, tokenW);
+
+    // Save patch embedding output for diagnostics
+    {
+      if (!this._dinov2Diag) this._dinov2Diag = {};
+      const diagBuf = createEmptyBuffer(device, T * 4);
+      encoder.copyBufferToBuffer(tokenBufA, 0, diagBuf, 0, T * 4);
+      this._dinov2Diag['patchEmbed'] = diagBuf;
+    }
+
+    // Compute SiLU(cameraEmbed) once — PyTorch: linear2(silu(condition))
+    const siluCameraEmbedBuf = createEmptyBuffer(device, 768 * 4);
+    this._dispatchSiLU(encoder, cameraEmbedBuf, siluCameraEmbedBuf, 768);
+
+    return {
+      D, N, T, tokenH, tokenW,
+      tokenBufA, tokenBufB, normBuf, qBuf, kBuf, vBuf, scoreBuf,
+      attnOutBuf, projBuf, hiddenBuf, ffnOutBuf, modBuf, siluCameraEmbedBuf,
+      currentTokens: tokenBufA,
+    };
+  }
+
+  /**
+   * Record one transformer block's dispatches into `encoder`, advancing
+   * ctx.currentTokens through the ping-pong. Exact per-block body from the
+   * pre-cooperative port; must remain byte-identical between encode() and
+   * encodeCooperative().
+   */
+  _encodeBlock(encoder, l, ctx, weights) {
+    const device = this.device;
+    const { D, N, T, tokenBufA, tokenBufB, normBuf, qBuf, kBuf, vBuf, scoreBuf,
+      attnOutBuf, projBuf, hiddenBuf, ffnOutBuf, modBuf, siluCameraEmbedBuf } = ctx;
+    const block = weights.blocks[l];
+
+    // Compute modulation for norm1: linear(silu(cameraEmbed)) → [2*D]
+    this._dispatchLinear(encoder, siluCameraEmbedBuf, modBuf, block.norm1Mod.weight, block.norm1Mod.bias, 1, 768, 2 * D);
+
+    // Modulated LayerNorm1
+    this._dispatchModulatedLN(encoder, ctx.currentTokens, normBuf, block.norm1, modBuf, N);
+
+    // Self-attention with separate Q/K/V projections
+    this._dispatchLinear(encoder, normBuf, qBuf, block.attn.q.weight, block.attn.q.bias, N, D, D);
+    this._dispatchLinear(encoder, normBuf, kBuf, block.attn.k.weight, block.attn.k.bias, N, D, D);
+    this._dispatchLinear(encoder, normBuf, vBuf, block.attn.v.weight, block.attn.v.bias, N, D, D);
+
+    // Attention
+    this._dispatchAttnScores(encoder, qBuf, kBuf, scoreBuf, N);
+    this._dispatchAttnSoftmax(encoder, scoreBuf, N);
+    this._dispatchAttnApply(encoder, scoreBuf, vBuf, attnOutBuf, N);
+
+    // Output projection
+    this._dispatchLinear(encoder, attnOutBuf, projBuf, block.attn.proj.weight, block.attn.proj.bias, N, D, D);
+
+    // LayerScale1 + residual
+    const attnOut = (ctx.currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+    this._dispatchLayerScaleResidual(encoder, projBuf, ctx.currentTokens, attnOut, block.layerScale1, T, D);
+    ctx.currentTokens = attnOut;
+
+    // Compute modulation for norm2: linear(silu(cameraEmbed)) → [2*D]
+    this._dispatchLinear(encoder, siluCameraEmbedBuf, modBuf, block.norm2Mod.weight, block.norm2Mod.bias, 1, 768, 2 * D);
+
+    // Modulated LayerNorm2
+    this._dispatchModulatedLN(encoder, ctx.currentTokens, normBuf, block.norm2, modBuf, N);
+
+    // GELU MLP: fc1 (linear + GELU) → fc2 (linear)
+    this._dispatchLinearGelu(encoder, normBuf, hiddenBuf,
+      block.mlp.fc1.weight, block.mlp.fc1.bias, N, D, VIT_CONFIG.mlpHiddenDim);
+    this._dispatchLinear(encoder, hiddenBuf, ffnOutBuf,
+      block.mlp.fc2.weight, block.mlp.fc2.bias, N, VIT_CONFIG.mlpHiddenDim, D);
+
+    // LayerScale2 + residual
+    const ffnOut = (ctx.currentTokens === tokenBufA) ? tokenBufB : tokenBufA;
+    this._dispatchLayerScaleResidual(encoder, ffnOutBuf, ctx.currentTokens, ffnOut, block.layerScale2, T, D);
+    ctx.currentTokens = ffnOut;
+
+    // Save diagnostic refs for first few blocks
+    if (l < 3 || l === 23) {
+      if (!this._dinov2Diag) this._dinov2Diag = {};
+      // Copy current state to a persistent buffer for readback
+      const diagBuf = createEmptyBuffer(device, T * 4);
+      encoder.copyBufferToBuffer(ctx.currentTokens, 0, diagBuf, 0, T * 4);
+      this._dinov2Diag[`block${l}`] = diagBuf;
+    }
+  }
+
+  /** Final LayerNorm + return the DINOv2 token output. */
+  _finalizeEncode(encoder, ctx, weights) {
+    const { N, normBuf, tokenH, tokenW } = ctx;
+
+    // 3. Final LayerNorm
+    this._dispatchLayerNorm(encoder, ctx.currentTokens, normBuf, weights.layernorm, N);
+
+    // Output: normBuf contains [N, D] where N = 1297 (CLS + 1296 patches)
+    // The backbone expects [N_tokens, D] — we return all tokens including CLS
+    // The two-stream backbone will use this via permute to [C, N_t]
+    return {
+      tokensBuf: normBuf,
+      N,
+      tokenH,
+      tokenW,
+    };
+  }
+
+  // --- Dispatch helpers ---
+
+  _dispatchPatchEmbed(encoder, imageBuf, weights, outputBuf, tokenH, tokenW) {
+    const device = this.device;
+    const D = VIT_CONFIG.dim;
+    const ps = VIT_CONFIG.patchSize;
+    const numTokens = tokenH * tokenW + 1;
+    const totalWG = ceilDiv$3(numTokens * D, WG_SIZE$3);
+    const [wgX, wgY] = splitWG$3(totalWG);
+
+    // imgH/imgW must be the ACTUAL image size (512), not tokenH*ps (504)
+    // because the image buffer is [3, 512, 512] and channel offsets use imgH*imgW
+    const imgSize = 512 ; // TODO: pass actual image size
+    const params = this._cachedUniform(new Uint32Array([
+      imgSize, imgSize, ps, tokenH, tokenW, 3, D, numTokens, wgX,
+    ]));
+
+    const bg = device.createBindGroup({
+      layout: this.pipelines.patchEmbed.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: imageBuf } },
+        { binding: 2, resource: { buffer: weights.patchEmbed.weight } },
+        { binding: 3, resource: { buffer: weights.patchEmbed.bias } },
+        { binding: 4, resource: { buffer: weights.clsToken } },
+        { binding: 5, resource: { buffer: weights.posEmbed } },
+        { binding: 6, resource: { buffer: outputBuf } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.patchEmbed);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _dispatchLinear(encoder, input, output, weight, bias, rows, inDim, outDim) {
+    const device = this.device;
+    const totalWG = ceilDiv$3(rows * outDim, WG_SIZE$3);
+    const [wgX, wgY] = splitWG$3(totalWG);
+    const params = this._cachedUniform(new Uint32Array([rows, inDim, outDim, wgX, 1]));
+
+    const bg = device.createBindGroup({
+      layout: this.pipelines.linear.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: weight } },
+        { binding: 3, resource: { buffer: bias } },
+        { binding: 4, resource: { buffer: output } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.linear);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _dispatchLayerNorm(encoder, input, output, norm, N) {
+    const device = this.device;
+    const D = VIT_CONFIG.dim;
+    const paramsData = new ArrayBuffer(16);
+    const v = new DataView(paramsData);
+    v.setUint32(0, N, true);
+    v.setUint32(4, D, true);
+    v.setFloat32(8, VIT_CONFIG.eps, true);
+    const params = this._cachedUniform(new Uint8Array(paramsData));
+
+    const bg = device.createBindGroup({
+      layout: this.pipelines.layerNorm.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: norm.weight } },
+        { binding: 3, resource: { buffer: norm.bias } },
+        { binding: 4, resource: { buffer: output } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.layerNorm);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(N);
+    pass.end();
+  }
+
+  _dispatchModulatedLN(encoder, input, output, norm, modBuf, N) {
+    const device = this.device;
+    const D = VIT_CONFIG.dim;
+    const params = this._cachedUniform(new Uint32Array([N, D, 0]));
+
+    const bg = device.createBindGroup({
+      layout: this.pipelines.modulatedLN.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: norm.weight } },
+        { binding: 3, resource: { buffer: norm.bias } },
+        { binding: 4, resource: { buffer: modBuf } },
+        { binding: 5, resource: { buffer: output } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.modulatedLN);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(N);
+    pass.end();
+  }
+
+  _dispatchAttnScores(encoder, qBuf, kBuf, scoreBuf, N) {
+    const device = this.device;
+    const { numHeads, dim, headDim, scale } = VIT_CONFIG;
+    const total = numHeads * N * N;
+    const totalWG = ceilDiv$3(total, WG_SIZE$3);
+    const [wgX, wgY] = splitWG$3(totalWG);
+
+    const paramsData = new ArrayBuffer(24);
+    const v = new DataView(paramsData);
+    v.setUint32(0, N, true);
+    v.setUint32(4, dim, true);
+    v.setUint32(8, numHeads, true);
+    v.setUint32(12, headDim, true);
+    v.setFloat32(16, scale, true);
+    v.setUint32(20, wgX, true);
+    const params = this._cachedUniform(new Uint8Array(paramsData));
+
+    const bg = device.createBindGroup({
+      layout: this.pipelines.attnScores.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: qBuf } },
+        { binding: 2, resource: { buffer: kBuf } },
+        { binding: 3, resource: { buffer: scoreBuf } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.attnScores);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _dispatchAttnSoftmax(encoder, scoreBuf, N) {
+    const totalRows = VIT_CONFIG.numHeads * N;
+    const totalWG = ceilDiv$3(totalRows, WG_SIZE$3);
+    const [wgX, wgY] = splitWG$3(totalWG);
+    const params = this._cachedUniform(new Uint32Array([N, VIT_CONFIG.numHeads, wgX]));
+
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.attnSoftmax.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: scoreBuf } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.attnSoftmax);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _dispatchAttnApply(encoder, scoreBuf, vBuf, output, N) {
+    const D = VIT_CONFIG.dim;
+    const totalWG = ceilDiv$3(N * D, WG_SIZE$3);
+    const [wgX, wgY] = splitWG$3(totalWG);
+    const params = this._cachedUniform(new Uint32Array([N, D, VIT_CONFIG.numHeads, VIT_CONFIG.headDim, wgX]));
+
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.attnApply.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: scoreBuf } },
+        { binding: 2, resource: { buffer: vBuf } },
+        { binding: 3, resource: { buffer: output } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.attnApply);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _dispatchLayerScaleResidual(encoder, input, residual, output, gamma, count, D) {
+    const totalWG = ceilDiv$3(count, WG_SIZE$3);
+    const [wgX, wgY] = splitWG$3(totalWG);
+    const params = this._cachedUniform(new Uint32Array([count, D, wgX]));
+
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.layerScale.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: gamma } },
+        { binding: 3, resource: { buffer: residual } },
+        { binding: 4, resource: { buffer: output } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.layerScale);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _dispatchLinearGelu(encoder, input, output, weight, bias, rows, inDim, outDim) {
+    const totalWG = ceilDiv$3(rows * outDim, WG_SIZE$3);
+    const [wgX, wgY] = splitWG$3(totalWG);
+    const params = this._cachedUniform(new Uint32Array([rows, inDim, outDim, wgX, 1]));
+
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.linearGelu.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: weight } },
+        { binding: 3, resource: { buffer: bias } },
+        { binding: 4, resource: { buffer: output } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.linearGelu);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+  _dispatchSiLU(encoder, input, output, count) {
+    const totalWG = ceilDiv$3(count, WG_SIZE$3);
+    const [wgX, wgY] = splitWG$3(totalWG);
+    const params = this._cachedUniform(new Uint32Array([count, 1, wgX])); // op=1 is SiLU
+    const dummyBuf = createEmptyBuffer(this.device, 4);
+
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.activation.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: dummyBuf } },
+        { binding: 3, resource: { buffer: output } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.activation);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+}
+
+/**
+ * Cooperative DINO encoder boundary — first uptake of the Kaminos WebGPU
+ * Inference Kit cooperative porting spine (@kaminos/webgpu-inference-kit@^0.1.36)
+ * in the sf3d.image-to-mesh.webgpu-local.v0 route.
+ *
+ * Scope (session 7, cranial-depth-enema directive
+ * `adopt-cooperative-porting-spine-0136-in-sf3d`): wire ONLY the DINOv2 ViT
+ * encoder — a strictly sequential 24-block loop in sf3d_backbone.js — through
+ * the kit's cooperative execution facade as one gpu-command boundary
+ * (unit: vit-block, totalItems: 24). This is a scheduling-granularity change,
+ * NOT a numerical change: the exact per-block dispatch sequence and tokenBufA/
+ * tokenBufB ping-pong are preserved; the only difference from the legacy path
+ * is that each block (or fixed chunk of blocks) is submitted as its own command
+ * buffer with a browser yield between duties, instead of all 24 blocks landing
+ * in one command buffer with one submit.
+ *
+ * The runtime here is adapter-owned and thin: it wraps the real GPUDevice.queue
+ * and exposes exactly the surface createWebGpuCooperativeExecution() consumes
+ * (routeId, queue.submit/onSubmittedWorkDone, runInvocation, commandDuties
+ * .measureSubmission, hostPhases, yieldToBrowser). No kit inference-runtime,
+ * session, or resource-residency machinery is pulled in for this first slice —
+ * those are separate pending directives, deliberately kept out to avoid
+ * ambiguous parity/perf regression attribution.
+ */
+
+
+const SF3D_ROUTE_ID = 'sf3d.image-to-mesh.webgpu-local.v0';
+const DINO_COOPERATIVE_MANIFEST_ID = 'sf3d.dino-encoder-cooperative-boundaries.v0';
+const DINO_BOUNDARY_ID = 'dino-vit-blocks';
+
+/**
+ * Declare the DINO encoder cooperative boundary manifest.
+ *
+ * One phase, one gpu-command boundary over the 24 ViT blocks. Fixed chunking
+ * by default (chunkBlocks blocks per submitted duty). progressWeight equals the
+ * block count so denominator-bearing progress reads as fraction-of-blocks; no
+ * hidden cap — totalItems is exactly the declared block count.
+ *
+ * @param {number} numBlocks   total ViT blocks (24 for SF3D DINOv2-large)
+ * @param {number} chunkBlocks blocks per submitted GPU duty (>=1)
+ */
+function defineDinoEncoderManifest(numBlocks, chunkBlocks = 1) {
+  if (!Number.isSafeInteger(numBlocks) || numBlocks <= 0) {
+    throw new TypeError('numBlocks must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(chunkBlocks) || chunkBlocks <= 0) {
+    throw new TypeError('chunkBlocks must be a positive safe integer');
+  }
+  return defineWebGpuCooperativeBoundaryManifest({
+    manifestId: DINO_COOPERATIVE_MANIFEST_ID,
+    routeId: SF3D_ROUTE_ID,
+    phases: [
+      {
+        phaseId: 'dinov2-tokenizer',
+        boundaries: [
+          {
+            boundaryId: DINO_BOUNDARY_ID,
+            kind: 'gpu-command',
+            unit: 'vit-block',
+            totalItems: numBlocks,
+            progressWeight: numBlocks,
+            commandDutyKind: 'compute',
+            chunking: { mode: 'fixed', chunkItems: chunkBlocks },
+            yieldPolicy: 'after-duty',
+            resources: {
+              retain: ['dinov2.weights'],
+              produce: ['dinov2.tokens'],
+              release: [],
+            },
+          },
+        ],
+      },
+    ],
+    metadata: { source: 'sf3d-webgpu-cooperative-dino-uptake' },
+  });
+}
+
+/**
+ * Adapter-owned thin runtime over the real GPUDevice.queue.
+ *
+ * `yieldToBrowser` is a real macrotask yield (MessageChannel) so the browser
+ * event loop can service a frame between submitted block duties — this is the
+ * cooperative behavior the operator smoke measures. In scheduling-disabled A/B
+ * the facade never calls yieldToBrowser, so both arms declare identical work
+ * but only the cooperative arm actually cedes the main thread per duty.
+ */
+function createSf3dCooperativeRuntime(device, hooks = {}) {
+  const now = () => globalThis.performance?.now?.() ?? Date.now();
+  // Optional kit foreground-opportunity interlock (the shape returned by
+  // createWebGpuForegroundOpportunityInterlock). When present, pending host
+  // demand — e.g. the kiln's flame frame — is serviced at every cooperative
+  // pre-encode boundary exactly as the kit's own runtime does, so the host's
+  // command buffers reach the shared queue ahead of the next inference duty.
+  const foregroundOpportunities = hooks.foregroundOpportunities ?? null;
+  if (foregroundOpportunities != null) {
+    for (const method of ['serviceAtBoundary', 'snapshot']) {
+      if (typeof foregroundOpportunities[method] !== 'function') {
+        throw new Error(`foregroundOpportunities must expose ${method}()`);
+      }
+    }
+  }
+  let foregroundBoundarySequence = 0;
+  const hasForegroundPressure = (snapshot) => snapshot.pendingRequestCount > 0
+    || snapshot.activeRequestCount > 0
+    || snapshot.activeServiceCount > 0
+    || snapshot.queuedServiceCount > 0;
+  const queue = {
+    submit(commandBuffers) {
+      device.queue.submit(commandBuffers);
+    },
+    async onSubmittedWorkDone() {
+      const startedAtMs = now();
+      const result = await device.queue.onSubmittedWorkDone();
+      const completedAtMs = now();
+      if (typeof hooks.onQueueFenceResolved === 'function') {
+        await hooks.onQueueFenceResolved({
+          startedAtMs,
+          completedAtMs,
+          queueWaitMs: completedAtMs - startedAtMs,
+        });
+      }
+      return result;
+    },
+  };
+
+  return {
+    routeId: SF3D_ROUTE_ID,
+    runtimeLabel: 'sf3d-webgpu-cooperative-dino',
+    queue,
+    hostPhases: {
+      snapshot() {
+        return { status: 'not-instrumented', phase: 'dinov2-tokenizer' };
+      },
+    },
+    commandDuties: {
+      // Observe/route the submission only — do NOT impose our own queue fence
+      // here. The facade owns fence policy: in cooperative mode it fences the
+      // queue prefix per duty (per-gpu-duty-prefix-fence); in disabled mode it
+      // takes exactly one terminal fence. Fencing here would double-fence the
+      // cooperative arm and, worse, force per-duty fences onto the disabled arm,
+      // destroying the scheduling A/B over identical declared work.
+      async measureSubmission(descriptor, submit) {
+        return submit();
+      },
+    },
+    foregroundOpportunities,
+    // The facade awaits this hook before each cooperative GPU encode. Without
+    // an interlock it is an honest pass-through (cooperation is the post-duty
+    // browser yield + per-duty queue fence). With an interlock, pending host
+    // demand is serviced here, before the next inference duty is encoded,
+    // mirroring the kit runtime: no demand → no synthetic service turn; a
+    // failed service refuses the encode; demand without an invocation
+    // identity refuses.
+    async prepareCommandDutyAtBoundary(descriptor, schedulerInvocation = null) {
+      if (!foregroundOpportunities) return descriptor;
+      const pressure = typeof foregroundOpportunities.pressureSnapshot === 'function'
+        ? foregroundOpportunities.pressureSnapshot()
+        : foregroundOpportunities.snapshot();
+      if (!hasForegroundPressure(pressure)) return descriptor;
+      const invocationId = schedulerInvocation?.invocationId;
+      if (typeof invocationId !== 'string' || !invocationId.trim()) {
+        throw new Error('foreground opportunity service requires an active invocation identity');
+      }
+      foregroundBoundarySequence += 1;
+      const service = await foregroundOpportunities.serviceAtBoundary({
+        invocationId,
+        boundaryId: `${invocationId}:foreground-boundary:${foregroundBoundarySequence}`,
+        dutyId: descriptor?.dutyId || `${invocationId}:command-duty:${foregroundBoundarySequence}`,
+        phase: descriptor?.phase || 'sf3d-cooperative-duty',
+        position: 'before-encode',
+        metadata: {
+          runtimeLabel: 'sf3d-webgpu-cooperative',
+          schedulerRevision: schedulerInvocation.schedulerRevision ?? null,
+        },
+      });
+      const prepared = {
+        ...descriptor,
+        metadata: { ...(descriptor?.metadata || {}), foregroundOpportunityService: service },
+      };
+      if (service.status === 'failed') {
+        const first = service.failures?.[0];
+        throw new Error(first?.failure?.error?.message || 'foreground opportunity failed');
+      }
+      return prepared;
+    },
+    settleCommandDuty() {
+      // No scheduler-owned duty ledger in this slice; settlement is a no-op.
+    },
+    async runInvocation({ invocationId }, fn) {
+      return fn({
+        invocationId,
+        schedulerRevision: null,
+        scheduler: {
+          mode: 'cooperative',
+          yieldMs: 0,
+          waitForSubmittedWorkDone: true,
+          phaseChunkSize: {},
+        },
+        async yieldToBrowser() {
+          const start = now();
+          await macrotaskYield();
+          const end = now();
+          const result = { reason: 'cooperative-boundary-duty-complete', elapsedMs: end - start };
+          if (typeof hooks.onBrowserYield === 'function') {
+            await hooks.onBrowserYield({
+              startedAtMs: start,
+              completedAtMs: end,
+              elapsedMs: end - start,
+            });
+          }
+          return result;
+        },
+      });
+    },
+  };
+}
+
+/**
+ * Yield to the browser macrotask queue so a foreground frame can run.
+ * MessageChannel gives a true macrotask (unlike microtask await), which is
+ * what lets the compositor paint between block duties.
+ */
+function macrotaskYield() {
+  if (typeof MessageChannel === 'function') {
+    return new Promise(resolve => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => {
+        channel.port1.close();
+        resolve();
+      };
+      channel.port2.postMessage(null);
+    });
+  }
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+/**
+ * Run the DINO encoder cooperatively.
+ *
+ * @param {object}   opts
+ * @param {GPUDevice} opts.device
+ * @param {object}   opts.tokenizer            SF3DImageTokenizer instance
+ * @param {GPUBuffer} opts.imageBuf
+ * @param {GPUBuffer} opts.cameraEmbedBuf
+ * @param {object}   opts.weights              weights.imageTokenizer
+ * @param {number}   opts.numBlocks            24 for SF3D
+ * @param {number}  [opts.chunkBlocks=1]       blocks per submitted duty
+ * @param {'cooperative'|'disabled'} [opts.schedulingMode='cooperative']
+ * @param {(progress:object)=>void} [opts.onProgress]
+ * @param {AbortSignal} [opts.signal]
+ * @param {string}   [opts.invocationId]
+ * @returns {Promise<{ result: object, report: object }>}
+ *          result is the tokenizer.encode() output ({ tokensBuf, N, tokenH, tokenW });
+ *          report is the kit cooperative execution report.
+ */
+async function runCooperativeDino(opts) {
+  const {
+    device,
+    tokenizer,
+    imageBuf,
+    cameraEmbedBuf,
+    weights,
+    numBlocks,
+    chunkBlocks = 1,
+    schedulingMode = 'cooperative',
+    onProgress,
+    signal,
+    invocationId = `sf3d:dino:${schedulingMode}`,
+  } = opts;
+  if(opts.withChunkWeights!=null&&schedulingMode!=='cooperative')
+    throw Error('phase weight residency requires cooperative queue-prefix fences');
+
+  const manifest = defineDinoEncoderManifest(numBlocks, chunkBlocks);
+  const runtime = createSf3dCooperativeRuntime(device, {
+    foregroundOpportunities: opts.foregroundOpportunities ?? null,
+  });
+  const execution = createWebGpuCooperativeExecution({
+    runtime,
+    manifest,
+    invocationId,
+    schedulingMode,
+    onProgress,
+    signal,
+  });
+
+  let result = null;
+
+  // Production run: create a real execution and drive the SHARED boundary
+  // driver against the facade the execution hands to run(). The driver's
+  // encode/submit produce real WebGPU command buffers on the real device queue.
+  await execution.run(async cooperative => {
+    result = await driveDinoCooperativeBoundary(cooperative, {
+      encodeChunk: ({ blockStart, blockEnd, encodeInto }) => {
+        const encoder = device.createCommandEncoder({
+          label: `dino-blocks-${blockStart}-${blockEnd}`,
+        });
+        encodeInto(encoder);
+        return encoder.finish();
+      },
+      // kit >=0.1.41: encode() returns the command buffer and the kit owns
+      // queue.submit; no producer-side submit callback.
+      encodeTokenizer: (driver) => tokenizer.encodeCooperative({
+        imageBuf, cameraEmbedBuf, weights, numBlocks, chunkBlocks, driver,
+        withChunkWeights:opts.withChunkWeights??null,
+        retireIntermediateBuffers:opts.retireIntermediateBuffers===true,
+      }),
+    });
+  });
+
+  return { result, report: execution.finish() };
+}
+
+/**
+ * SHARED cooperative-DINO boundary driver.
+ *
+ * Consumes the supplied cooperative facade DIRECTLY (the object passed to
+ * `execution.run`'s callback — with `startBoundary`). It does NOT create a
+ * nested cooperative execution: production and conformance both hand this driver
+ * a facade whose runtime they own, so all declared work, cancellation, failure
+ * injection, progress, and settlement stay inside that one facade's authority.
+ *
+ * The driver decides WHERE the command buffer is cut (per fixed chunk of blocks)
+ * and delegates HOW a chunk is encoded/submitted to the caller via injected
+ * `encodeChunk`/`submitChunk`. This is the only seam that differs between:
+ *   - production: real GPUCommandEncoder + real device.queue.submit;
+ *   - conformance: deterministic instrumented encode/submit tokens (no GPU).
+ *
+ * Block order, chunk boundaries, and the tokenizer's ping-pong are identical on
+ * both paths, so the canonical orchestration trace (and its fingerprint) match.
+ *
+ * @param {object} cooperative                 facade from execution.run callback
+ * @param {object} o
+ * @param {number} o.numBlocks
+ * @param {number} o.chunkBlocks
+ * @param {(ctx:{blockStart:number,blockEnd:number,encodeInto:(enc:any)=>void})=>any} o.encodeChunk
+ *        returns the "command buffer" (real GPUCommandBuffer or a deterministic token)
+ * @param {(driver:Function)=>Promise<any>} o.encodeTokenizer
+ *        invokes tokenizer.encodeCooperative with the per-chunk driver we build
+ * @returns {Promise<any>} the tokenizer.encode() output ({ tokensBuf, N, tokenH, tokenW })
+ */
+async function driveDinoCooperativeBoundary(cooperative, o) {
+  const { encodeChunk, encodeTokenizer } = o;
+  const gpu = cooperative.startBoundary(DINO_BOUNDARY_ID);
+
+  // The tokenizer calls this once per fixed chunk of blocks, in order. We map
+  // each chunk to exactly one cooperative range + gpu duty.
+  const perChunkDriver = async (blockStart, blockEnd, encodeInto) => {
+    const range = gpu.nextRange();
+    if (!range) {
+      throw new Error(`cooperative DINO boundary exhausted ranges before block ${blockStart}`);
+    }
+    await gpu.runGpuDuty(range, {
+      encode() {
+        return encodeChunk({ blockStart, blockEnd, encodeInto });
+      },
+    });
+  };
+
+  const result = await encodeTokenizer(perChunkDriver);
+
+  // Boundary must be fully consumed for the facade to accept completion.
+  if (gpu.nextRange() != null) {
+    throw new Error('cooperative DINO boundary left ranges unconsumed');
+  }
+  return result;
+}
+
+const linearRangeWGSL = "// Row-range linear projection: output[row] = input[row] @ weight + bias.\r\n// The accumulation order and weight layout match linear.wgsl exactly.\r\n\r\nstruct Params {\r\n  totalRows: u32,\r\n  inDim: u32,\r\n  outDim: u32,\r\n  rowStart: u32,\r\n  rowCount: u32,\r\n  numWorkgroupsX: u32,\r\n  transposed: u32,\r\n  _padding: u32,\r\n}\r\n\r\n@group(0) @binding(0) var<uniform> params: Params;\r\n@group(0) @binding(1) var<storage, read> input: array<f32>;\r\n@group(0) @binding(2) var<storage, read> weight: array<f32>;\r\n@group(0) @binding(3) var<storage, read> bias: array<f32>;\r\n@group(0) @binding(4) var<storage, read_write> output: array<f32>;\r\n\r\nconst WG_SIZE: u32 = 256;\r\n\r\n@compute @workgroup_size(WG_SIZE)\r\nfn main(\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n  @builtin(local_invocation_id) lid: vec3<u32>,\r\n) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let localIdx = linearWG * WG_SIZE + lid.x;\r\n  if (localIdx >= params.rowCount * params.outDim) { return; }\r\n\r\n  let localRow = localIdx / params.outDim;\r\n  let col = localIdx % params.outDim;\r\n  let row = params.rowStart + localRow;\r\n  if (row >= params.totalRows) { return; }\r\n  let idx = row * params.outDim + col;\r\n\r\n  var s0 = 0.0;\r\n  var s1 = 0.0;\r\n  var s2 = 0.0;\r\n  var s3 = 0.0;\r\n  let inBase = row * params.inDim;\r\n  let len4 = (params.inDim / 4u) * 4u;\r\n\r\n  if (params.transposed == 1u) {\r\n    let wBase = col;\r\n    let stride = params.outDim;\r\n    for (var k = 0u; k < len4; k += 4u) {\r\n      s0 += input[inBase + k]      * weight[(k)      * stride + wBase];\r\n      s1 += input[inBase + k + 1u] * weight[(k + 1u) * stride + wBase];\r\n      s2 += input[inBase + k + 2u] * weight[(k + 2u) * stride + wBase];\r\n      s3 += input[inBase + k + 3u] * weight[(k + 3u) * stride + wBase];\r\n    }\r\n    for (var k = len4; k < params.inDim; k++) {\r\n      s0 += input[inBase + k] * weight[k * stride + wBase];\r\n    }\r\n  } else {\r\n    let wBase = col * params.inDim;\r\n    for (var k = 0u; k < len4; k += 4u) {\r\n      s0 += input[inBase + k]      * weight[wBase + k];\r\n      s1 += input[inBase + k + 1u] * weight[wBase + k + 1u];\r\n      s2 += input[inBase + k + 2u] * weight[wBase + k + 2u];\r\n      s3 += input[inBase + k + 3u] * weight[wBase + k + 3u];\r\n    }\r\n    for (var k = len4; k < params.inDim; k++) {\r\n      s0 += input[inBase + k] * weight[wBase + k];\r\n    }\r\n  }\r\n  output[idx] = (s0 + s1) + (s2 + s3) + bias[col];\r\n}\r\n";
+
+const crossAttentionWGSL = "/**\r\n * Cross-attention compute shader.\r\n *\r\n * Computes attention where Q comes from one sequence and K,V from another.\r\n * Used in SF3D's FuseBlock (fuse triplane ↔ image tokens) and\r\n * BasicBlock's attn2 (cross-attend latents to encoder hidden states).\r\n *\r\n * Three entry points matching the self-attention pattern:\r\n *   - computeCrossScores: Q·K^T with scaling\r\n *   - softmaxCross: row-wise softmax (same as self-attention)\r\n *   - applyCrossAttn: scores @ V\r\n */\r\n\r\nstruct Params {\r\n  N_q: u32,     // query sequence length\r\n  N_kv: u32,    // key/value sequence length\r\n  D: u32,       // head dimension\r\n  numHeads: u32,\r\n  numWorkgroupsX: u32,\r\n}\r\n\r\n@group(0) @binding(0) var<uniform> params: Params;\r\n@group(0) @binding(1) var<storage, read> Q: array<f32>;       // [N_q, numHeads, D]\r\n@group(0) @binding(2) var<storage, read> K: array<f32>;       // [N_kv, numHeads, D]\r\n@group(0) @binding(3) var<storage, read> V: array<f32>;       // [N_kv, numHeads, D]\r\n@group(0) @binding(4) var<storage, read_write> scores: array<f32>; // [numHeads, N_q, N_kv]\r\n@group(0) @binding(5) var<storage, read_write> output: array<f32>; // [N_q, numHeads, D]\r\n\r\nconst WG_SIZE: u32 = 256;\r\n\r\n/**\r\n * Compute cross-attention scores: score[h, qi, ki] = Q[qi, h, :] · K[ki, h, :] / sqrt(D)\r\n */\r\n@compute @workgroup_size(WG_SIZE)\r\nfn computeCrossScores(@builtin(global_invocation_id) gid: vec3<u32>,\r\n                      @builtin(workgroup_id) wgid: vec3<u32>,\r\n                      @builtin(local_invocation_id) lid: vec3<u32>) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n\r\n  let totalScores = params.numHeads * params.N_q * params.N_kv;\r\n  if (idx >= totalScores) { return; }\r\n\r\n  let h = idx / (params.N_q * params.N_kv);\r\n  let rem = idx % (params.N_q * params.N_kv);\r\n  let qi = rem / params.N_kv;\r\n  let ki = rem % params.N_kv;\r\n\r\n  let D = params.D;\r\n  let scale = 1.0 / sqrt(f32(D));\r\n\r\n  // Q layout: [N_q, numHeads, D] → Q[qi * numHeads * D + h * D + d]\r\n  // K layout: [N_kv, numHeads, D] → K[ki * numHeads * D + h * D + d]\r\n  let qBase = qi * params.numHeads * D + h * D;\r\n  let kBase = ki * params.numHeads * D + h * D;\r\n\r\n  // 4-way split accumulation\r\n  var s0: f32 = 0.0; var s1: f32 = 0.0;\r\n  var s2: f32 = 0.0; var s3: f32 = 0.0;\r\n  let steps = D / 4u;\r\n  for (var i: u32 = 0u; i < steps; i++) {\r\n    let d = i * 4u;\r\n    s0 += Q[qBase + d]     * K[kBase + d];\r\n    s1 += Q[qBase + d + 1] * K[kBase + d + 1];\r\n    s2 += Q[qBase + d + 2] * K[kBase + d + 2];\r\n    s3 += Q[qBase + d + 3] * K[kBase + d + 3];\r\n  }\r\n  // Handle remainder\r\n  let rem_start = steps * 4u;\r\n  var s_rem: f32 = 0.0;\r\n  for (var d = rem_start; d < D; d++) {\r\n    s_rem += Q[qBase + d] * K[kBase + d];\r\n  }\r\n\r\n  let dot = ((s0 + s1) + (s2 + s3)) + s_rem;\r\n\r\n  // scores layout: [numHeads, N_q, N_kv]\r\n  scores[h * params.N_q * params.N_kv + qi * params.N_kv + ki] = dot * scale;\r\n}\r\n\r\n/**\r\n * Row-wise softmax over KV dimension.\r\n * One thread per (head, query) row.\r\n */\r\n@compute @workgroup_size(WG_SIZE)\r\nfn softmaxCross(@builtin(global_invocation_id) gid: vec3<u32>,\r\n                @builtin(workgroup_id) wgid: vec3<u32>,\r\n                @builtin(local_invocation_id) lid: vec3<u32>) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n\r\n  let totalRows = params.numHeads * params.N_q;\r\n  if (idx >= totalRows) { return; }\r\n\r\n  let base = idx * params.N_kv;\r\n\r\n  // Find max\r\n  var maxVal: f32 = scores[base];\r\n  for (var i: u32 = 1u; i < params.N_kv; i++) {\r\n    maxVal = max(maxVal, scores[base + i]);\r\n  }\r\n\r\n  // Exp and sum\r\n  var sumExp: f32 = 0.0;\r\n  for (var i: u32 = 0u; i < params.N_kv; i++) {\r\n    let e = exp(scores[base + i] - maxVal);\r\n    scores[base + i] = e;\r\n    sumExp += e;\r\n  }\r\n\r\n  // Normalize\r\n  let invSum = 1.0 / sumExp;\r\n  for (var i: u32 = 0u; i < params.N_kv; i++) {\r\n    scores[base + i] *= invSum;\r\n  }\r\n}\r\n\r\n/**\r\n * Apply cross-attention: output[qi, h, d] = sum_ki scores[h, qi, ki] * V[ki, h, d]\r\n */\r\n@compute @workgroup_size(WG_SIZE)\r\nfn applyCrossAttn(@builtin(global_invocation_id) gid: vec3<u32>,\r\n                  @builtin(workgroup_id) wgid: vec3<u32>,\r\n                  @builtin(local_invocation_id) lid: vec3<u32>) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n\r\n  let totalOut = params.N_q * params.numHeads * params.D;\r\n  if (idx >= totalOut) { return; }\r\n\r\n  let qi = idx / (params.numHeads * params.D);\r\n  let rem = idx % (params.numHeads * params.D);\r\n  let h = rem / params.D;\r\n  let d = rem % params.D;\r\n\r\n  let scoreBase = h * params.N_q * params.N_kv + qi * params.N_kv;\r\n\r\n  // 4-way accumulation over KV positions\r\n  var s0: f32 = 0.0; var s1: f32 = 0.0;\r\n  var s2: f32 = 0.0; var s3: f32 = 0.0;\r\n  let steps = params.N_kv / 4u;\r\n  for (var i: u32 = 0u; i < steps; i++) {\r\n    let ki = i * 4u;\r\n    // V layout: [N_kv, numHeads, D]\r\n    s0 += scores[scoreBase + ki]     * V[(ki)     * params.numHeads * params.D + h * params.D + d];\r\n    s1 += scores[scoreBase + ki + 1] * V[(ki + 1) * params.numHeads * params.D + h * params.D + d];\r\n    s2 += scores[scoreBase + ki + 2] * V[(ki + 2) * params.numHeads * params.D + h * params.D + d];\r\n    s3 += scores[scoreBase + ki + 3] * V[(ki + 3) * params.numHeads * params.D + h * params.D + d];\r\n  }\r\n  let rem_start = steps * 4u;\r\n  var s_rem: f32 = 0.0;\r\n  for (var ki = rem_start; ki < params.N_kv; ki++) {\r\n    s_rem += scores[scoreBase + ki] * V[ki * params.numHeads * params.D + h * params.D + d];\r\n  }\r\n\r\n  output[qi * params.numHeads * params.D + h * params.D + d] = ((s0 + s1) + (s2 + s3)) + s_rem;\r\n}\r\n";
+
+const gegluWGSL = "/**\r\n * GEGLU activation shader.\r\n *\r\n * GEGLU(x, W) = chunk(x @ W, 2)[0] * GELU(chunk(x @ W, 2)[1])\r\n *\r\n * Input: result of linear projection [N, 2*innerDim]\r\n * Output: [N, innerDim]\r\n *\r\n * The projection produces two halves: hidden_states and gate.\r\n * Output = hidden_states * GELU(gate)\r\n */\r\n\r\nstruct Params {\r\n  N: u32,         // sequence length\r\n  innerDim: u32,  // output dimension (half of input)\r\n  numWorkgroupsX: u32,\r\n}\r\n\r\n@group(0) @binding(0) var<uniform> params: Params;\r\n@group(0) @binding(1) var<storage, read> input: array<f32>;  // [N, 2*innerDim]\r\n@group(0) @binding(2) var<storage, read_write> output: array<f32>; // [N, innerDim]\r\n\r\nconst WG_SIZE: u32 = 256;\r\n\r\nfn gelu(x: f32) -> f32 {\r\n  // Exact GELU via erf approximation (Abramowitz & Stegun 7.1.26)\r\n  if (x > 10.0) { return x; }\r\n  if (x < -10.0) { return 0.0; }\r\n  let a = x * 0.7071067811865476; // x / sqrt(2)\r\n  let abs_a = abs(a);\r\n  let t = 1.0 / (1.0 + 0.3275911 * abs_a);\r\n  let poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));\r\n  var erf_val = 1.0 - poly * exp(-abs_a * abs_a);\r\n  if (a < 0.0) { erf_val = -erf_val; }\r\n  return 0.5 * x * (1.0 + erf_val);\r\n}\r\n\r\n@compute @workgroup_size(WG_SIZE)\r\nfn geglu_main(@builtin(global_invocation_id) gid: vec3<u32>,\r\n              @builtin(workgroup_id) wgid: vec3<u32>,\r\n              @builtin(local_invocation_id) lid: vec3<u32>) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n\r\n  let total = params.N * params.innerDim;\r\n  if (idx >= total) { return; }\r\n\r\n  let row = idx / params.innerDim;\r\n  let col = idx % params.innerDim;\r\n\r\n  let doubleInnerDim = params.innerDim * 2u;\r\n  // First half: hidden_states\r\n  let hidden = input[row * doubleInnerDim + col];\r\n  // Second half: gate\r\n  let gate = input[row * doubleInnerDim + params.innerDim + col];\r\n\r\n  output[idx] = hidden * gelu(gate);\r\n}\r\n";
+
+const groupnormWGSL = "// groupnorm.wgsl — Group Normalization compute shader\r\n//\r\n// Implements nn.GroupNorm: divide channels into groups, normalize each group\r\n// independently over (C/num_groups, H, W), then apply learnable scale+bias.\r\n//\r\n// Special case: num_groups=1 → LayerNorm over spatial+channel\r\n// Special case: num_groups=C → InstanceNorm\r\n//\r\n// MoGe-2 uses:\r\n//   - GroupNorm(C//32, C) → 32 channels per group\r\n//   - GroupNorm(1, C) → \"layer norm\" mode (all channels in one group)\r\n//\r\n// Two-pass approach:\r\n//   Pass 1: compute mean and variance per group\r\n//   Pass 2: normalize and apply scale+bias\r\n//\r\n// Memory layout (CHW, row-major):\r\n//   input:   [C, H, W]      — f32\r\n//   scale:   [C]             — f32 (learnable gamma)\r\n//   bias:    [C]             — f32 (learnable beta)\r\n//   output:  [C, H, W]      — f32\r\n\r\nstruct GroupNormParams {\r\n  C: u32,\r\n  H: u32,\r\n  W: u32,\r\n  numGroups: u32,\r\n  eps: f32,\r\n  numWorkgroupsX: u32,\r\n};\r\n\r\n@group(0) @binding(0) var<uniform> params: GroupNormParams;\r\n@group(0) @binding(1) var<storage, read> input: array<f32>;\r\n@group(0) @binding(2) var<storage, read> scale: array<f32>;\r\n@group(0) @binding(3) var<storage, read> gnbias: array<f32>;\r\n@group(0) @binding(4) var<storage, read_write> output: array<f32>;\r\n\r\n// Intermediate buffer for per-group mean and variance\r\n// Layout: [numGroups * 2] — first numGroups entries are means, next are vars\r\n@group(0) @binding(5) var<storage, read_write> stats: array<f32>;\r\n\r\nconst WG_SIZE: u32 = 256;\r\n\r\n// Pass 1: Compute mean and variance for each group\r\n@compute @workgroup_size(WG_SIZE)\r\nfn groupnorm_stats(\r\n  @builtin(global_invocation_id) gid: vec3<u32>,\r\n) {\r\n  let groupIdx = gid.x;\r\n  if (groupIdx >= params.numGroups) {\r\n    return;\r\n  }\r\n\r\n  let channelsPerGroup = params.C / params.numGroups;\r\n  let spatialSize = params.H * params.W;\r\n  let groupSize = channelsPerGroup * spatialSize;\r\n\r\n  let startCh = groupIdx * channelsPerGroup;\r\n\r\n  // Compute mean\r\n  var sum: f32 = 0.0;\r\n  for (var c: u32 = 0; c < channelsPerGroup; c++) {\r\n    let ch = startCh + c;\r\n    for (var sp: u32 = 0; sp < spatialSize; sp++) {\r\n      sum += input[ch * spatialSize + sp];\r\n    }\r\n  }\r\n  let mean = sum / f32(groupSize);\r\n  stats[groupIdx] = mean;\r\n\r\n  // Compute variance\r\n  var varSum: f32 = 0.0;\r\n  for (var c: u32 = 0; c < channelsPerGroup; c++) {\r\n    let ch = startCh + c;\r\n    for (var sp: u32 = 0; sp < spatialSize; sp++) {\r\n      let diff = input[ch * spatialSize + sp] - mean;\r\n      varSum += diff * diff;\r\n    }\r\n  }\r\n  stats[params.numGroups + groupIdx] = varSum / f32(groupSize);\r\n}\r\n\r\n// Pass 2: Normalize each element using group stats, apply scale+bias\r\n@compute @workgroup_size(WG_SIZE)\r\nfn groupnorm_normalize(\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n  @builtin(local_invocation_id) lid: vec3<u32>,\r\n) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n  let totalSize = params.C * params.H * params.W;\r\n  if (idx >= totalSize) {\r\n    return;\r\n  }\r\n\r\n  let spatialSize = params.H * params.W;\r\n  let ch = idx / spatialSize;\r\n  let channelsPerGroup = params.C / params.numGroups;\r\n  let groupIdx = ch / channelsPerGroup;\r\n\r\n  let mean = stats[groupIdx];\r\n  let variance = stats[params.numGroups + groupIdx];\r\n  let invStd = 1.0 / sqrt(variance + params.eps);\r\n\r\n  let normalized = (input[idx] - mean) * invStd;\r\n  output[idx] = normalized * scale[ch] + gnbias[ch];\r\n}\r\n";
+
+/**
+ * two_stream.js — TwoStreamInterleaveTransformer dispatch for SF3D.
+ *
+ * Architecture (from backbone.py):
+ *   Input:
+ *     - triplane tokens [3*96*96, 1024] from tokenizer (GroupNorm → proj)
+ *     - image tokens [N_img, 1024] from DINOv2 (LayerNorm → proj)
+ *     - latent_init [1792, 1024] (learned, LayerNorm → proj)
+ *     - latent = concat(image_tokens, latent_init) [N_img+1792, 1024]
+ *
+ *   4 TwoStreamBlocks, each:
+ *     - fuse_block_in: fuse(latent ← triplane) via cross-attention + GEGLU FFN
+ *     - 3 BasicBlocks: self-attention + cross-attention(latent ← encoder) + GEGLU FFN
+ *     - fuse_block_out: fuse(triplane ← latent) via cross-attention + GEGLU FFN
+ *
+ *   Output: proj_out(triplane_tokens) + residual → [3*96*96, 1024]
+ *
+ * All attention uses separate Q/K/V (not fused QKV).
+ * FFN uses GEGLU: linear → chunk → gate*GELU(hidden) → linear.
+ */
+
+
+const WG_SIZE$2 = 256;
+const MAX_WG$1 = 65535;
+function splitWG$2(total) {
+  if (total <= MAX_WG$1) return [total, 1];
+  return [MAX_WG$1, Math.ceil(total / MAX_WG$1)];
+}
+function ceilDiv$2(a, b) { return Math.ceil(a / b); }
+
+const CONFIG$1 = {
+  dim: 1024,         // latent/triplane dim
+  numHeads: 16,
+  headDim: 64,
+  numBlocks: 4,
+  numBasicBlocks: 3,
+  numLatents: 1792,
+  planeSize: 96,
+  triplaneTokens: 3 * 96 * 96, // 27648
+  gegluInnerDim: 4096,  // GEGLU inner = dim * mult = 1024 * 4 = 4096
+  eps: 1e-5,
+};
+
+const TWO_STREAM_STAGE_IDS = Object.freeze([
+  'setup',
+  ...Array.from({ length: CONFIG$1.numBlocks }, (_, block) => [
+    `block-${block}-fuse-in`,
+    ...Array.from(
+      { length: CONFIG$1.numBasicBlocks },
+      (_, basic) => `block-${block}-basic-${basic}`,
+    ),
+    `block-${block}-fuse-out`,
+  ]).flat(),
+  'final',
+]);
+
+function normalizeLinearRowRange(totalRows, rowStart, rowCount) {
+  if (!Number.isSafeInteger(totalRows) || totalRows <= 0) {
+    throw new TypeError('totalRows must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(rowStart) || rowStart < 0) {
+    throw new TypeError('rowStart must be a non-negative safe integer');
+  }
+  if (!Number.isSafeInteger(rowCount) || rowCount <= 0) {
+    throw new TypeError('rowCount must be a positive safe integer');
+  }
+  const rowEnd = rowStart + rowCount;
+  if (!Number.isSafeInteger(rowEnd) || rowEnd > totalRows) {
+    throw new RangeError(
+      `linear row range ${rowStart}-${rowEnd} exceeds totalRows ${totalRows}`,
+    );
+  }
+  return Object.freeze({ totalRows, rowStart, rowCount, rowEnd });
+}
+
+function createLinearRowRanges(totalRows, rowsPerDuty) {
+  if (!Number.isSafeInteger(rowsPerDuty) || rowsPerDuty <= 0) {
+    throw new TypeError('rowsPerDuty must be a positive safe integer');
+  }
+  normalizeLinearRowRange(totalRows, 0, Math.min(totalRows, rowsPerDuty));
+  const ranges = [];
+  for (let rowStart = 0; rowStart < totalRows; rowStart += rowsPerDuty) {
+    const range = normalizeLinearRowRange(
+      totalRows,
+      rowStart,
+      Math.min(rowsPerDuty, totalRows - rowStart),
+    );
+    ranges.push(Object.freeze({ rangeIndex: ranges.length, ...range }));
+  }
+  return Object.freeze(ranges);
+}
+
+function createTwoStreamAttentionDutyPlan(N_img, options = {}) {
+  if (!Number.isSafeInteger(N_img) || N_img <= 0) {
+    throw new TypeError('N_img must be a positive safe integer');
+  }
+  const linearRowsPerDuty = options.linearRowsPerDuty ?? 128;
+  const attentionRowsPerDuty = options.attentionRowsPerDuty ?? 128;
+  const residentFFN = options.residentFFN ?? false;
+  if (typeof residentFFN !== 'boolean') throw TypeError('residentFFN must be boolean');
+  if (!Number.isSafeInteger(linearRowsPerDuty) || linearRowsPerDuty <= 0) {
+    throw new TypeError('linearRowsPerDuty must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(attentionRowsPerDuty) || attentionRowsPerDuty <= 0)
+    throw new TypeError('attentionRowsPerDuty must be a positive safe integer');
+  const duties = [];
+  const append = duty => {
+    duties.push(Object.freeze({
+      dutyIndex: duties.length,
+      dutyId: duty.dutyId,
+      ...duty,
+    }));
+  };
+  const appendAttention = (ownerId, tileCount) => {
+    for (let tileIndex = 0; tileIndex < tileCount; tileIndex++) {
+      append({
+        dutyId: `${ownerId}-tile-${tileIndex}`,
+        kind: 'attention-tile',
+        ownerId,
+        tileIndex,
+        tileCount,
+      });
+    }
+  };
+  const appendLinearRanges = (ownerId, kind, block, ranges) => {
+    for (const range of ranges) {
+      append({
+        dutyId: `${ownerId}-range-${range.rangeIndex}`,
+        kind,
+        ownerId,
+        block,
+        direction: 'out',
+        rangeIndex: range.rangeIndex,
+        rangeCount: ranges.length,
+        totalRows: range.totalRows,
+        rowStart: range.rowStart,
+        rowCount: range.rowCount,
+        rowEnd: range.rowEnd,
+      });
+    }
+  };
+  const latentTiles = ceilDiv$2(N_img + CONFIG$1.numLatents, attentionRowsPerDuty);
+  const triplaneTiles = ceilDiv$2(CONFIG$1.triplaneTokens, attentionRowsPerDuty);
+  const triplaneRowRanges = createLinearRowRanges(
+    CONFIG$1.triplaneTokens,
+    linearRowsPerDuty,
+  );
+
+  append({ dutyId: 'setup', kind: 'setup' });
+  for (let block = 0; block < CONFIG$1.numBlocks; block++) {
+    const fuseIn = `block-${block}-fuse-in`;
+    append({ dutyId: `${fuseIn}-prepare`, kind: 'fuse-prepare', block, direction: 'in' });
+    appendAttention(fuseIn, latentTiles);
+    append({ dutyId: `${fuseIn}-finish`, kind: 'fuse-finish', block, direction: 'in' });
+
+    for (let basic = 0; basic < CONFIG$1.numBasicBlocks; basic++) {
+      const ownerId = `block-${block}-basic-${basic}`;
+      const selfOwner = `${ownerId}-self`;
+      const crossOwner = `${ownerId}-cross`;
+      append({
+        dutyId: `${selfOwner}-prepare`,
+        kind: 'basic-self-prepare',
+        block,
+        basic,
+      });
+      appendAttention(selfOwner, latentTiles);
+      append({
+        dutyId: `${crossOwner}-prepare`,
+        kind: 'basic-cross-prepare',
+        block,
+        basic,
+      });
+      appendAttention(crossOwner, latentTiles);
+      append({
+        dutyId: `${ownerId}-finish`,
+        kind: 'basic-finish',
+        block,
+        basic,
+      });
+    }
+
+    const fuseOut = `block-${block}-fuse-out`;
+    append({ dutyId: `${fuseOut}-prepare`, kind: 'fuse-prepare', block, direction: 'out' });
+    appendAttention(fuseOut, triplaneTiles);
+    appendLinearRanges(
+      `${fuseOut}-attention-projection`,
+      'fuse-attention-linear-range',
+      block,
+      triplaneRowRanges,
+    );
+    append({
+      dutyId: `${fuseOut}-residual-norm`,
+      kind: 'fuse-residual-norm',
+      block,
+      direction: 'out',
+    });
+    if (residentFFN) appendLinearRanges(
+      `${fuseOut}-ffn-projection`,
+      'fuse-resident-ffn-range',
+      block,
+      triplaneRowRanges,
+    );
+    else {
+    appendLinearRanges(
+      `${fuseOut}-geglu-expansion`,
+      'fuse-geglu-linear-range',
+      block,
+      triplaneRowRanges,
+    );
+    append({
+      dutyId: `${fuseOut}-geglu-activate`,
+      kind: 'fuse-geglu-activate',
+      block,
+      direction: 'out',
+    });
+    appendLinearRanges(
+      `${fuseOut}-ffn-projection`,
+      'fuse-ffn-linear-range',
+      block,
+      triplaneRowRanges,
+    );
+    }
+    append({
+      dutyId: `${fuseOut}-final-residual`,
+      kind: 'fuse-final-residual',
+      block,
+      direction: 'out',
+    });
+  }
+  append({ dutyId: 'final', kind: 'final' });
+  return Object.freeze(duties);
+}
+
+class TwoStreamBackbone {
+  constructor(device) {
+    this.device = device;
+    this.pipelines = {};
+    this._uniformCache = new Map();
+  }
+
+  init() {
+    const device = this.device;
+    const make = (code, entry) => device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: device.createShaderModule({ code }), entryPoint: entry },
+    });
+
+    this.pipelines.linear = make(linearWGSL, 'main');
+    this.pipelines.linearRange = make(linearRangeWGSL, 'main');
+    this.pipelines.layerNorm = make(layerNormWGSL, 'main');
+    // Cross-attention pipelines share an explicit layout so all 6 bindings are available
+    // to all three entry points (auto-layout would omit unused bindings per entry point)
+    const crossAttnLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    });
+    const crossAttnPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [crossAttnLayout] });
+    this._crossAttnLayout = crossAttnLayout;
+
+    const crossAttnModule = device.createShaderModule({ code: crossAttentionWGSL });
+    const makeCA = (entry) => device.createComputePipeline({
+      layout: crossAttnPipelineLayout,
+      compute: { module: crossAttnModule, entryPoint: entry },
+    });
+    this.pipelines.crossAttnScores = makeCA('computeCrossScores');
+    this.pipelines.crossAttnSoftmax = makeCA('softmaxCross');
+    this.pipelines.crossAttnApply = makeCA('applyCrossAttn');
+    this.pipelines.geglu = make(gegluWGSL, 'geglu_main');
+
+    // GroupNorm pipelines — explicit shared layout for both entry points
+    const gnLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      ],
+    });
+    const gnPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [gnLayout] });
+    this._gnLayout = gnLayout;
+
+    const gnModule = device.createShaderModule({ code: groupnormWGSL });
+    this.pipelines.gnStats = device.createComputePipeline({
+      layout: gnPipelineLayout,
+      compute: { module: gnModule, entryPoint: 'groupnorm_stats' },
+    });
+    this.pipelines.gnNorm = device.createComputePipeline({
+      layout: gnPipelineLayout,
+      compute: { module: gnModule, entryPoint: 'groupnorm_normalize' },
+    });
+
+    // Element-wise add
+    this.pipelines.add = make(`
+      @group(0) @binding(0) var<storage, read_write> dst: array<f32>;
+      @group(0) @binding(1) var<storage, read> src: array<f32>;
+      struct P { count: u32, numWgX: u32 }
+      @group(0) @binding(2) var<uniform> p: P;
+      @compute @workgroup_size(256)
+      fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+        let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+        if (idx >= p.count) { return; }
+        dst[idx] = dst[idx] + src[idx];
+      }
+    `, 'main');
+
+    // Concat two buffers
+    this.pipelines.concat = make(`
+      @group(0) @binding(0) var<storage, read> a: array<f32>;
+      @group(0) @binding(1) var<storage, read> b: array<f32>;
+      @group(0) @binding(2) var<storage, read_write> out: array<f32>;
+      struct P { sizeA: u32, sizeB: u32, numWgX: u32 }
+      @group(0) @binding(3) var<uniform> p: P;
+      @compute @workgroup_size(256)
+      fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+        let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+        let total = p.sizeA + p.sizeB;
+        if (idx >= total) { return; }
+        if (idx < p.sizeA) { out[idx] = a[idx]; }
+        else { out[idx] = b[idx - p.sizeA]; }
+      }
+    `, 'main');
+  }
+
+  _cachedUniform(data) {
+    if(this._failedUniforms?.size)throw Error('two-stream uniform cleanup is quarantined');
+    const bytes = new Uint8Array(data.buffer || data);
+    let h = 0;
+    for (let i = 0; i < bytes.length; i++) h = (h * 31 + bytes[i]) | 0;
+    const key = `u_${bytes.length}_${h}`;
+    if (this._uniformCache.has(key)) return this._uniformCache.get(key);
+    const buf = this.device.createBuffer({
+      size: Math.max(bytes.byteLength, 16),
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    try{
+      new Uint8Array(buf.getMappedRange()).set(bytes);
+      buf.unmap();
+    }catch(error){
+      try{buf.destroy();}
+      catch(retirement){
+        (this._failedUniforms??=new Set()).add(buf);
+        throw new AggregateError([error,retirement],'uniform initialization failed and retirement is unresolved',{cause:error});
+      }
+      throw error;
+    }
+    this._uniformCache.set(key, buf);
+    return buf;
+  }
+
+  /**
+   * Run the two-stream interleave transformer.
+   *
+   * @param {GPUCommandEncoder} encoder
+   * @param {GPUBuffer} imageTokensBuf - [N_img, 1024] from DINOv2
+   * @param {GPUBuffer} triplaneEmbBuf - [3, 1024, 96, 96] triplane embeddings
+   * @param {Object} weights - backbone weights from loadWeights
+   * @param {number} N_img - number of image tokens
+   * @returns {GPUBuffer} - [3*96*96, 1024] refined triplane tokens
+   */
+  forward(encoder, imageTokensBuf, N_img, weights) {
+    const state = this.createForwardState(imageTokensBuf, N_img, weights);
+    for (let stageIndex = 0; stageIndex < TWO_STREAM_STAGE_IDS.length; stageIndex++) {
+      this.dispatchForwardStage(encoder, state, stageIndex);
+    }
+    return this.getForwardResult(state);
+  }
+
+  createForwardState(imageTokensBuf, N_img, weights) {
+    if (!Number.isSafeInteger(N_img) || N_img <= 0) {
+      throw new TypeError('N_img must be a positive safe integer');
+    }
+    this._diagnosticBuffers = {};
+    return {
+      imageTokensBuf,
+      N_img,
+      weights,
+      N_latent: N_img + CONFIG$1.numLatents,
+      currentLatent: null,
+      currentTriplane: null,
+      nextStageIndex: 0,
+      finePlan: null,
+      nextFineDutyIndex: 0,
+      activeOperation: null,
+      result: null,
+    };
+  }
+
+  createAttentionForwardState(imageTokensBuf, N_img, weights, options = {}) {
+    const reuse=options.reuseDeadTriplaneStorage??false;
+    const residualReuse=options.reuseAttentionResidualStorage??false;
+    const queryReuse=options.reuseAttentionQueryStorage===undefined?false:options.reuseAttentionQueryStorage;
+    if(typeof queryReuse!=='boolean'||(queryReuse&&options.residentFFN!==true))
+      throw TypeError('attention query storage reuse requires explicit resident FFN');
+    const setupReuse=options.reuseTokenizerSetupStorage??false;
+    if(typeof setupReuse!=='boolean'||(setupReuse&&
+      (options.residentFFN!==true||options.rematerializeTokenizerEmbedding!==true)))
+      throw TypeError('tokenizer setup reuse requires explicit resident FFN and canonical rematerialization');
+    if(typeof reuse!=='boolean'||(reuse&&options.residentFFN!==true))
+      throw TypeError('dead-triplane reuse requires explicit resident FFN');
+    if(typeof residualReuse!=='boolean'||(residualReuse&&(!reuse||options.residentFFN!==true)))
+      throw TypeError('attention residual reuse requires explicit resident FFN and dead-triplane reuse');
+    const state = this.createForwardState(imageTokensBuf, N_img, weights);
+    state.finePlan = createTwoStreamAttentionDutyPlan(N_img, options);
+    state.residentFFN = options.residentFFN ?? false;
+    state.ffnRowsPerTile = options.linearRowsPerDuty ?? 128;
+    state.attentionRowsPerDuty = options.attentionRowsPerDuty ?? 128;
+    state.reuseDeadTriplaneStorage=reuse;
+    state.reuseAttentionResidualStorage=residualReuse;
+    state.reuseAttentionQueryStorage=queryReuse;
+    const projectionReuse=options.reuseAttentionProjectionStorage??false;
+    if(typeof projectionReuse!=='boolean'||(projectionReuse&&(!queryReuse||!residualReuse||!reuse)))
+      throw TypeError('attention projection row reuse requires owned query, residual and dead-triplane reuse');
+    state.reuseAttentionProjectionStorage=projectionReuse;
+    state.reuseTokenizerSetupStorage=setupReuse;
+    state.rematerializeTokenizerEmbedding=options.rematerializeTokenizerEmbedding??false;
+    return state;
+  }
+
+  dispatchForwardStage(encoder, state, stageIndex) {
+    if (!Number.isSafeInteger(stageIndex)
+      || stageIndex < 0
+      || stageIndex >= TWO_STREAM_STAGE_IDS.length) {
+      throw new RangeError(`invalid two-stream stage index ${stageIndex}`);
+    }
+    if (stageIndex !== state.nextStageIndex) {
+      throw new Error(
+        `two-stream stage ${stageIndex} is out of order; expected ${state.nextStageIndex}`,
+      );
+    }
+
+    if (stageIndex === 0) {
+      this._dispatchForwardSetup(encoder, state);
+    } else if (stageIndex === TWO_STREAM_STAGE_IDS.length - 1) {
+      this._dispatchForwardFinal(encoder, state);
+    } else {
+      const blockStage = stageIndex - 1;
+      const stagesPerBlock = CONFIG$1.numBasicBlocks + 2;
+      const blockIndex = Math.floor(blockStage / stagesPerBlock);
+      const stageInBlock = blockStage % stagesPerBlock;
+      this._dispatchForwardBlockStage(
+        encoder,
+        state,
+        blockIndex,
+        stageInBlock,
+      );
+    }
+
+    state.nextStageIndex++;
+    return state;
+  }
+
+  getForwardResult(state) {
+    const stageComplete = state.nextStageIndex === TWO_STREAM_STAGE_IDS.length;
+    const fineComplete = state.finePlan != null
+      && state.nextFineDutyIndex === state.finePlan.length;
+    if ((!stageComplete && !fineComplete) || state.result == null) {
+      const completed = state.finePlan == null
+        ? `${state.nextStageIndex}/${TWO_STREAM_STAGE_IDS.length}`
+        : `${state.nextFineDutyIndex}/${state.finePlan.length}`;
+      throw new Error(
+        `two-stream forward is incomplete at stage ${completed}`,
+      );
+    }
+    return state.result;
+  }
+
+  dispatchAttentionForwardDuty(encoder, state, dutyIndex) {
+    if (state.finePlan == null) {
+      throw new Error('two-stream attention-duty state has no fine plan');
+    }
+    if (dutyIndex !== state.nextFineDutyIndex) {
+      throw new Error(
+        `two-stream attention duty ${dutyIndex} is out of order; `
+        + `expected ${state.nextFineDutyIndex}`,
+      );
+    }
+    const duty = state.finePlan[dutyIndex];
+    if (!duty) {
+      throw new RangeError(`invalid two-stream attention duty ${dutyIndex}`);
+    }
+
+    switch (duty.kind) {
+      case 'setup':
+        this._dispatchForwardSetup(encoder, state);
+        break;
+      case 'fuse-prepare':
+        this._dispatchFineFusePrepare(encoder, state, duty);
+        break;
+      case 'attention-tile':
+        this._dispatchFineAttentionTile(encoder, state, duty);
+        break;
+      case 'fuse-finish':
+        this._dispatchFineFuseFinish(encoder, state, duty);
+        break;
+      case 'fuse-attention-linear-range':
+        this._dispatchFineFuseAttentionLinearRange(encoder, state, duty);
+        break;
+      case 'fuse-residual-norm':
+        this._dispatchFineFuseResidualNorm(encoder, state, duty);
+        break;
+      case 'fuse-geglu-linear-range':
+        this._dispatchFineFuseGEGLULinearRange(encoder, state, duty);
+        break;
+      case 'fuse-geglu-activate':
+        this._dispatchFineFuseGEGLUActivate(encoder, state, duty);
+        break;
+      case 'fuse-ffn-linear-range':
+        this._dispatchFineFuseFFNLinearRange(encoder, state, duty);
+        break;
+      case 'fuse-resident-ffn-range':
+        this._dispatchFineFuseResidentFFNRange(encoder, state, duty);
+        break;
+      case 'fuse-final-residual':
+        this._dispatchFineFuseFinalResidual(encoder, state, duty);
+        break;
+      case 'basic-self-prepare':
+        this._dispatchFineBasicSelfPrepare(encoder, state, duty);
+        break;
+      case 'basic-cross-prepare':
+        this._dispatchFineBasicCrossPrepare(encoder, state, duty);
+        break;
+      case 'basic-finish':
+        this._dispatchFineBasicFinish(encoder, state, duty);
+        break;
+      case 'final':
+        if (state.activeOperation != null) {
+          throw new Error(`cannot finalize with active ${state.activeOperation.ownerId}`);
+        }
+        this._dispatchForwardFinal(encoder, state);
+        break;
+      default:
+        throw new Error(`unknown two-stream attention duty kind ${duty.kind}`);
+    }
+    state.nextFineDutyIndex++;
+    return duty;
+  }
+
+  _requireFineOperation(state, kind, ownerId) {
+    const operation = state.activeOperation;
+    if (operation?.kind !== kind || operation.ownerId !== ownerId) {
+      throw new Error(
+        `two-stream duty ${ownerId} requires active ${kind}; `
+        + `got ${operation?.kind ?? 'none'}:${operation?.ownerId ?? 'none'}`,
+      );
+    }
+    return operation;
+  }
+
+  _dispatchFineFusePrepare(encoder, state, duty) {
+    if (state.activeOperation != null) {
+      throw new Error(`cannot prepare ${duty.dutyId} with active ${state.activeOperation.ownerId}`);
+    }
+    const D = CONFIG$1.dim;
+    const N_tri = CONFIG$1.triplaneTokens;
+    const block = state.weights.mainBlocks[duty.block];
+    const incoming = duty.direction === 'in';
+    const zBuf = incoming ? state.currentLatent : state.currentTriplane;
+    const xBuf = incoming ? state.currentTriplane : state.currentLatent;
+    const N_z = incoming ? state.N_latent : N_tri;
+    const N_x = incoming ? N_tri : state.N_latent;
+    const weights = incoming ? block.fuseBlockIn : block.fuseBlockOut;
+    const zNormBuf = createEmptyBuffer(this.device, N_z * D * 4);
+    this._dispatchLayerNorm(encoder, zBuf, zNormBuf, weights.normZ1, N_z, D);
+    let xNormBuf = xBuf;
+    if (weights.normX) {
+      xNormBuf = createEmptyBuffer(this.device, N_x * D * 4);
+      this._dispatchLayerNorm(encoder, xBuf, xNormBuf, weights.normX, N_x, D);
+    }
+    const ownerId = `block-${duty.block}-fuse-${duty.direction}`;
+    state.activeOperation = {
+      kind: 'fuse',
+      ownerId,
+      block: duty.block,
+      direction: duty.direction,
+      zBuf,
+      weights,
+      N_z,
+      D,
+      attention: this._createAttentionState(
+        encoder,
+        zNormBuf,
+        xNormBuf,
+        weights.attn,
+        N_z,
+        N_x,
+        D,
+        state.attentionRowsPerDuty,
+        state.reuseAttentionQueryStorage,
+      ),
+    };
+  }
+
+  _dispatchFineAttentionTile(encoder, state, duty) {
+    const operation = state.activeOperation;
+    if (!operation || operation.ownerId !== duty.ownerId) {
+      throw new Error(
+        `attention tile ${duty.dutyId} requires active ${duty.ownerId}; `
+        + `got ${operation?.ownerId ?? 'none'}`,
+      );
+    }
+    if (operation.attention.tileCount !== duty.tileCount) {
+      throw new Error(
+        `attention tile count changed for ${duty.ownerId}: `
+        + `${operation.attention.tileCount} != ${duty.tileCount}`,
+      );
+    }
+    this._dispatchAttentionTile(encoder, operation.attention, duty.tileIndex);
+  }
+
+  _dispatchFineFuseFinish(encoder, state, duty) {
+    const ownerId = `block-${duty.block}-fuse-${duty.direction}`;
+    const operation = this._requireFineOperation(state, 'fuse', ownerId);
+    const attnOutBuf = this._finishAttention(encoder, operation.attention);
+    const z1Buf = createEmptyBuffer(this.device, operation.N_z * operation.D * 4);
+    encoder.copyBufferToBuffer(
+      operation.zBuf,
+      0,
+      z1Buf,
+      0,
+      operation.N_z * operation.D * 4,
+    );
+    this._dispatchAdd(encoder, z1Buf, attnOutBuf, operation.N_z * operation.D);
+    const z2NormBuf = createEmptyBuffer(this.device, operation.N_z * operation.D * 4);
+    this._dispatchLayerNorm(
+      encoder,
+      z1Buf,
+      z2NormBuf,
+      operation.weights.normZ2,
+      operation.N_z,
+      operation.D,
+    );
+    const ffnOutBuf = this._dispatchGEGLUFFN(
+      encoder,
+      z2NormBuf,
+      operation.weights.ff,
+      operation.N_z,
+      operation.D,
+      {rowsPerTile:state.residentFFN?state.ffnRowsPerTile:null},
+    );
+    const zOutBuf = createEmptyBuffer(this.device, operation.N_z * operation.D * 4);
+    encoder.copyBufferToBuffer(
+      z1Buf,
+      0,
+      zOutBuf,
+      0,
+      operation.N_z * operation.D * 4,
+    );
+    this._dispatchAdd(encoder, zOutBuf, ffnOutBuf, operation.N_z * operation.D);
+    if (duty.direction === 'in') {
+      state.currentLatent = zOutBuf;
+    } else {
+      state.currentTriplane = zOutBuf;
+      this._diagnosticBuffers[`block${duty.block}_latent`] = state.currentLatent;
+      this._diagnosticBuffers[`block${duty.block}_triplane`] = state.currentTriplane;
+    }
+    state.activeOperation = null;
+  }
+
+  _requireFineFuseOut(state, duty) {
+    const ownerId = `block-${duty.block}-fuse-out`;
+    return this._requireFineOperation(state, 'fuse', ownerId);
+  }
+
+  _validateFineLinearRange(operation,duty,phase) {
+    if(duty.ownerId!==phase.ownerId)throw Error('linear projection owner changed');
+    if(duty.rangeIndex!==phase.nextRangeIndex||duty.rangeCount!==phase.rangeCount||duty.totalRows!==operation.N_z)
+      throw Error('linear projection range order changed');
+    const range=normalizeLinearRowRange(operation.N_z,duty.rowStart,duty.rowCount);
+    if(duty.rowStart!==phase.nextRowStart||duty.rowEnd!==range.rowEnd)
+      throw Error('linear projection rows are not contiguous');
+    return range;
+  }
+
+  _dispatchFineLinearRange(
+    encoder,
+    operation,
+    duty,
+    phase,
+    input,
+    output,
+    weight,
+    bias,
+    inDim,
+    outDim,
+    rowCache=null,
+  ) {
+    if (duty.ownerId !== phase.ownerId) {
+      throw new Error(
+        `linear duty ${duty.dutyId} owner changed: `
+        + `${duty.ownerId} != ${phase.ownerId}`,
+      );
+    }
+    if (duty.rangeIndex !== phase.nextRangeIndex
+      || duty.rangeCount !== phase.rangeCount
+      || duty.totalRows !== operation.N_z) {
+      throw new Error(
+        `linear duty ${duty.dutyId} is out of range order; `
+        + `expected ${phase.nextRangeIndex}/${phase.rangeCount} `
+        + `over ${operation.N_z} rows`,
+      );
+    }
+    const range = normalizeLinearRowRange(
+      operation.N_z,
+      duty.rowStart,
+      duty.rowCount,
+    );
+    if (duty.rowStart !== phase.nextRowStart || duty.rowEnd !== range.rowEnd) {
+      throw new Error(
+        `linear duty ${duty.dutyId} is not contiguous; `
+        + `expected row ${phase.nextRowStart}, got `
+        + `${duty.rowStart}-${duty.rowEnd}`,
+      );
+    }
+    if(rowCache){
+      if(!Number.isSafeInteger(rowCache.capacity)||rowCache.capacity<range.rowCount||
+        rowCache.input.size!==rowCache.capacity*inDim*4||rowCache.output.size!==rowCache.capacity*outDim*4||
+        new Set([rowCache.input,rowCache.output,input,weight,bias]).size!==5||input!==output)
+        throw Error('exact disjoint projection row caches and owned output alias required');
+      // Copy each complete input row before its last read. The same linear
+      // range kernel computes into disjoint storage, then its complete rows
+      // overwrite only those consumed rows of the original attention result.
+      encoder.copyBufferToBuffer(input,range.rowStart*inDim*4,rowCache.input,0,range.rowCount*inDim*4);
+      this._dispatchLinearRange(encoder,rowCache.input,rowCache.output,weight,bias,
+        rowCache.capacity,inDim,outDim,0,range.rowCount);
+      encoder.copyBufferToBuffer(rowCache.output,0,output,range.rowStart*outDim*4,range.rowCount*outDim*4);
+    }else this._dispatchLinearRange(
+      encoder,
+      input,
+      output,
+      weight,
+      bias,
+      operation.N_z,
+      inDim,
+      outDim,
+      duty.rowStart,
+      duty.rowCount,
+    );
+    phase.nextRangeIndex++;
+    phase.nextRowStart = range.rowEnd;
+  }
+
+  _dispatchFineFuseAttentionLinearRange(encoder, state, duty) {
+    const operation = this._requireFineFuseOut(state, duty);
+    if (operation.attention.nextTileIndex !== operation.attention.tileCount) {
+      throw new Error(
+        `attention projection started before all tiles completed for ${operation.ownerId}`,
+      );
+    }
+    const reuse=state.reuseAttentionProjectionStorage??false;
+    if(typeof reuse!=='boolean')throw Error('exact projection row reuse mode required');
+    const input=operation.attention.attnOutBuf;
+    if(reuse){
+      const owned=this._residentWorkOwner?.buffers,bytes=operation.N_z*operation.D*4;
+      if(!state.residentFFN||!state.reuseAttentionQueryStorage||!state.reuseAttentionResidualStorage||!state.reuseDeadTriplaneStorage||
+        !owned?.has(input)||!owned.has(operation.zBuf)||input!==operation.attention.qBuf||input===operation.zBuf||input.size!==bytes||
+        !Number.isSafeInteger(state.ffnRowsPerTile)||state.ffnRowsPerTile<=0)
+        throw Error('owned complete attention query backing and projection reuse prerequisites required');
+      this._validateFineLinearRange(operation,duty,operation.attentionProjection??{
+        ownerId:`${operation.ownerId}-attention-projection`,nextRangeIndex:0,nextRowStart:0,rangeCount:duty.rangeCount});
+    }
+    if (!operation.attentionProjection) {
+      operation.attentionProjection = {
+        ownerId: `${operation.ownerId}-attention-projection`,
+        nextRangeIndex: 0,
+        nextRowStart: 0,
+        rangeCount: duty.rangeCount,
+        output: reuse?input:createEmptyBuffer(this.device, operation.N_z * operation.D * 4),
+        reuseAttentionProjectionStorage:reuse,
+      };
+      if(reuse){
+        // The phase enters reachable owned state before either allocation can
+        // fail; cooperative capture retains every successful new allocation.
+        const cache=operation.attentionProjection.rowCache={capacity:state.ffnRowsPerTile};
+        cache.input=createEmptyBuffer(this.device,cache.capacity*operation.D*4);
+        cache.output=createEmptyBuffer(this.device,cache.capacity*operation.D*4);
+      }
+    }
+    const phase = operation.attentionProjection;
+    if(phase.reuseAttentionProjectionStorage!==reuse)throw Error('projection row reuse changed during an active phase');
+    this._dispatchFineLinearRange(
+      encoder,
+      operation,
+      duty,
+      phase,
+      operation.attention.attnOutBuf,
+      phase.output,
+      operation.attention.attnWeights.proj.weight,
+      operation.attention.attnWeights.proj.bias,
+      operation.D,
+      operation.D,
+      phase.rowCache??null,
+    );
+  }
+
+  _markFineAttentionProjectionReusable(state,duty){
+    const operation=this._requireFineFuseOut(state,duty),phase=operation.attentionProjection,owned=this._residentWorkOwner?.buffers;
+    const bytes=operation.N_z*operation.D*4,cache=phase?.rowCache;
+    if(!state.reuseAttentionProjectionStorage||!phase?.reuseAttentionProjectionStorage||
+      duty.kind!=='fuse-attention-linear-range'||duty.rangeIndex!==duty.rangeCount-1||
+      state.nextFineDutyIndex!==duty.dutyIndex+1||phase.nextRangeIndex!==phase.rangeCount||phase.nextRowStart!==operation.N_z||
+      phase.output!==operation.attention?.attnOutBuf||phase.output!==operation.attention.qBuf||
+      phase.output===operation.zBuf||phase.output.size!==bytes||!owned?.has(phase.output)||
+      !owned.has(cache?.input)||!owned.has(cache?.output))
+      throw Error('owned complete projection row prefix required');
+    phase.completedPrefix={buffer:phase.output,afterDutyIndex:duty.dutyIndex};
+    return {block:duty.block,afterDutyIndex:duty.dutyIndex,bytes,totalRows:operation.N_z,
+      rowCapacity:cache.capacity,scratchBytes:cache.input.size+cache.output.size,
+      source:'owned-attention-result-after-each-complete-row-last-read'};
+  }
+
+  _dispatchFineFuseResidualNorm(encoder, state, duty) {
+    const operation = this._requireFineFuseOut(state, duty);
+    const phase = operation.attentionProjection;
+    if (!phase
+      || phase.nextRangeIndex !== phase.rangeCount
+      || phase.nextRowStart !== operation.N_z) {
+      throw new Error(`attention projection is incomplete for ${operation.ownerId}`);
+    }
+    const byteLength = operation.N_z * operation.D * 4;
+    let residualSource=phase.output;
+    if(state.reuseAttentionResidualStorage){
+      const token=operation.reusableAttentionResidualStorage,owned=this._residentWorkOwner?.buffers;
+      if(!token||token.buffer!==phase.output||token.afterDutyIndex!==duty.dutyIndex-1||
+        !owned?.has(phase.output)||!owned.has(operation.zBuf)||phase.output.size!==byteLength||
+        operation.zBuf.size!==byteLength||phase.output===operation.zBuf)
+        throw Error('owned attention projection residual reuse prefix/storage identity required');
+      // Complete per-element float32 addition is commutative. Preserve both
+      // inputs without copying over attention; the old triplane remains intact
+      // until the residual/norm prefix grants its later FFN overwrite.
+      operation.z1Buf=phase.output;residualSource=operation.zBuf;
+    }else {
+      operation.z1Buf = createEmptyBuffer(this.device, byteLength);
+      encoder.copyBufferToBuffer(operation.zBuf, 0, operation.z1Buf, 0, byteLength);
+    }
+    this._dispatchAdd(
+      encoder,
+      operation.z1Buf,
+      residualSource,
+      operation.N_z * operation.D,
+    );
+    operation.z2NormBuf = createEmptyBuffer(this.device, byteLength);
+    this._dispatchLayerNorm(
+      encoder,
+      operation.z1Buf,
+      operation.z2NormBuf,
+      operation.weights.normZ2,
+      operation.N_z,
+      operation.D,
+    );
+    if(state.residentFFN){
+      // The residual/norm command has recorded its last reads. A caller may
+      // retire these only after this duty's actual queue prefix completes.
+      operation.attention=null;operation.attentionProjection=null;
+    }
+  }
+
+  // Only the cooperative owner's completed final projection prefix may grant
+  // this transfer. Keep the exact buffer reachable through the active operation.
+  _markFineAttentionResidualReusable(state,duty){
+    const operation=this._requireFineFuseOut(state,duty),phase=operation.attentionProjection;
+    const bytes=operation.N_z*operation.D*4,owned=this._residentWorkOwner?.buffers;
+    if(!state.reuseAttentionResidualStorage||!state.reuseDeadTriplaneStorage||!state.residentFFN||
+      duty.kind!=='fuse-attention-linear-range'||duty.rangeIndex!==duty.rangeCount-1||
+      state.nextFineDutyIndex!==duty.dutyIndex+1||!phase||phase.nextRangeIndex!==phase.rangeCount||
+      phase.nextRowStart!==operation.N_z||!owned?.has(phase.output)||!owned.has(operation.zBuf)||
+      phase.output.size!==bytes||operation.zBuf.size!==bytes||phase.output===operation.zBuf||
+      (phase.output===operation.attention?.attnOutBuf&&
+        (!state.reuseAttentionProjectionStorage||phase.completedPrefix?.buffer!==phase.output||
+          phase.completedPrefix.afterDutyIndex!==duty.dutyIndex)))
+      throw Error('owned completed attention projection prefix required for residual reuse');
+    operation.reusableAttentionResidualStorage={buffer:phase.output,afterDutyIndex:duty.dutyIndex};
+    return {block:duty.block,afterDutyIndex:duty.dutyIndex,bytes,
+      source:'owned-projected-attention-after-gpu-prefix'};
+  }
+
+  _dispatchFineFuseGEGLULinearRange(encoder, state, duty) {
+    const operation = this._requireFineFuseOut(state, duty);
+    if (!operation.z2NormBuf) {
+      throw new Error(`GEGLU expansion started before residual norm for ${operation.ownerId}`);
+    }
+    const innerDim = CONFIG$1.gegluInnerDim;
+    if (!operation.gegluExpansion) {
+      operation.gegluExpansion = {
+        ownerId: `${operation.ownerId}-geglu-expansion`,
+        nextRangeIndex: 0,
+        nextRowStart: 0,
+        rangeCount: duty.rangeCount,
+        output: createEmptyBuffer(this.device, operation.N_z * 2 * innerDim * 4),
+      };
+    }
+    const phase = operation.gegluExpansion;
+    this._dispatchFineLinearRange(
+      encoder,
+      operation,
+      duty,
+      phase,
+      operation.z2NormBuf,
+      phase.output,
+      operation.weights.ff.geglu.weight,
+      operation.weights.ff.geglu.bias,
+      operation.D,
+      2 * innerDim,
+    );
+  }
+
+  _dispatchFineFuseGEGLUActivate(encoder, state, duty) {
+    const operation = this._requireFineFuseOut(state, duty);
+    const phase = operation.gegluExpansion;
+    if (!phase
+      || phase.nextRangeIndex !== phase.rangeCount
+      || phase.nextRowStart !== operation.N_z) {
+      throw new Error(`GEGLU expansion is incomplete for ${operation.ownerId}`);
+    }
+    operation.gegluOutput = createEmptyBuffer(
+      this.device,
+      operation.N_z * CONFIG$1.gegluInnerDim * 4,
+    );
+    this._dispatchGEGLUActivation(
+      encoder,
+      phase.output,
+      operation.gegluOutput,
+      operation.N_z,
+      CONFIG$1.gegluInnerDim,
+    );
+  }
+
+  _dispatchFineFuseFFNLinearRange(encoder, state, duty) {
+    const operation = this._requireFineFuseOut(state, duty);
+    if (!operation.gegluOutput) {
+      throw new Error(`FFN projection started before GEGLU activation for ${operation.ownerId}`);
+    }
+    if (!operation.ffnProjection) {
+      operation.ffnProjection = {
+        ownerId: `${operation.ownerId}-ffn-projection`,
+        nextRangeIndex: 0,
+        nextRowStart: 0,
+        rangeCount: duty.rangeCount,
+        output: createEmptyBuffer(this.device, operation.N_z * operation.D * 4),
+      };
+    }
+    const phase = operation.ffnProjection;
+    this._dispatchFineLinearRange(
+      encoder,
+      operation,
+      duty,
+      phase,
+      operation.gegluOutput,
+      phase.output,
+      operation.weights.ff.proj.weight,
+      operation.weights.ff.proj.bias,
+      CONFIG$1.gegluInnerDim,
+      operation.D,
+    );
+  }
+
+  _dispatchFineFuseFinalResidual(encoder, state, duty) {
+    const operation = this._requireFineFuseOut(state, duty);
+    const phase = operation.ffnProjection;
+    if (!phase
+      || phase.nextRangeIndex !== phase.rangeCount
+      || phase.nextRowStart !== operation.N_z) {
+      throw new Error(`FFN projection is incomplete for ${operation.ownerId}`);
+    }
+    const byteLength = operation.N_z * operation.D * 4;
+    let zOutBuf;
+    if(state.reuseDeadTriplaneStorage){
+      this._requireReusableFineFuseStorage(operation);
+      if(phase.output!==operation.zBuf)throw Error('owned reuse FFN output identity changed');
+      // The exact same z1 + FFN addition/order; z1 is already initialized.
+      // Never copy z1 over the FFN output we have just computed.
+      zOutBuf=operation.z1Buf;
+    }else {
+      zOutBuf=createEmptyBuffer(this.device,byteLength);
+      encoder.copyBufferToBuffer(operation.z1Buf,0,zOutBuf,0,byteLength);
+    }
+    this._dispatchAdd(
+      encoder,
+      zOutBuf,
+      phase.output,
+      operation.N_z * operation.D,
+    );
+    state.currentTriplane = zOutBuf;
+    this._diagnosticBuffers[`block${duty.block}_latent`] = state.currentLatent;
+    this._diagnosticBuffers[`block${duty.block}_triplane`] = state.currentTriplane;
+    state.activeOperation = null;
+  }
+
+  // Called by the cooperative owner only after this duty's real prefix fence.
+  // The old triplane's last reads were residual copy/add/norm. It remains in
+  // the private work inventory and can now be overwritten by every FFN row.
+  _markFineFuseStorageReusable(state,duty){
+    const operation=this._requireFineFuseOut(state,duty);
+    if(!state.reuseDeadTriplaneStorage||!state.residentFFN||duty.kind!=='fuse-residual-norm'||
+      state.nextFineDutyIndex!==duty.dutyIndex+1||operation.zBuf!==state.currentTriplane||
+      operation.attention!==null||operation.attentionProjection!==null||operation.ffnProjection)
+      throw Error('owned dead-triplane reuse requires completed residual/norm prefix');
+    const bytes=operation.N_z*operation.D*4,owned=this._residentWorkOwner?.buffers;
+    if(!owned?.has(operation.zBuf)||!owned.has(operation.z1Buf)||!owned.has(operation.z2NormBuf)||
+      operation.zBuf.size!==bytes||operation.z1Buf.size!==bytes||operation.z2NormBuf.size!==bytes||
+      new Set([operation.zBuf,operation.z1Buf,operation.z2NormBuf]).size!==3)
+      throw Error('owned distinct complete buffers required for dead-triplane reuse');
+    operation.reusableTriplaneStorage={buffer:operation.zBuf,afterDutyIndex:duty.dutyIndex};
+    return {block:duty.block,afterDutyIndex:duty.dutyIndex,bytes,
+      source:'owned-work-inventory-after-gpu-prefix'};
+  }
+
+  _requireReusableFineFuseStorage(operation){
+    const token=operation.reusableTriplaneStorage,owned=this._residentWorkOwner?.buffers;
+    if(!token||token.buffer!==operation.zBuf||!Number.isSafeInteger(token.afterDutyIndex)||
+      !owned?.has(operation.zBuf)||!owned.has(operation.z1Buf)||!owned.has(operation.z2NormBuf)||
+      operation.zBuf.size!==operation.N_z*operation.D*4||
+      new Set([operation.zBuf,operation.z1Buf,operation.z2NormBuf]).size!==3)
+      throw Error('owned dead-triplane reuse prefix/storage identity required');
+    return token.buffer;
+  }
+
+  _dispatchFineFuseResidentFFNRange(encoder,state,duty){
+    const operation=this._requireFineFuseOut(state,duty);
+    if(!state.residentFFN||!operation.z2NormBuf)throw Error('resident FFN requires completed residual norm');
+    let phase=operation.ffnProjection;
+    // Validate complete contiguous row provenance before allocating or dispatching.
+    const range=normalizeLinearRowRange(operation.N_z,duty.rowStart,duty.rowCount);
+    if(duty.ownerId!==`${operation.ownerId}-ffn-projection`||
+      duty.rangeIndex!==(phase?.nextRangeIndex??0)||
+      duty.rowStart!==(phase?.nextRowStart??0)||duty.rowEnd!==range.rowEnd||
+      duty.totalRows!==operation.N_z||duty.rangeCount!==Math.ceil(operation.N_z/state.ffnRowsPerTile)||
+      duty.rowCount!==Math.min(state.ffnRowsPerTile,operation.N_z-duty.rowStart))
+      throw Error('resident FFN duty is not the complete contiguous row plan');
+    let reuseOutput;
+    if(!phase&&state.reuseDeadTriplaneStorage){
+      reuseOutput=this._requireReusableFineFuseStorage(operation);
+      if(operation.reusableTriplaneStorage.afterDutyIndex!==duty.dutyIndex-1)
+        throw Error('owned reuse requires the immediately completed residual/norm prefix');
+    }
+    if(!phase)phase=operation.ffnProjection={
+      ownerId:duty.ownerId,nextRangeIndex:0,nextRowStart:0,rangeCount:duty.rangeCount,
+      output:reuseOutput??createEmptyBuffer(this.device,operation.N_z*operation.D*4),
+      scratch:this._createFFNScratch(Math.min(state.ffnRowsPerTile,operation.N_z),operation.D),
+    };
+    this._dispatchFFNRow(encoder,operation.z2NormBuf,phase.output,phase.scratch,
+      operation.weights.ff,duty.rowStart,duty.rowCount,operation.D);
+    phase.nextRangeIndex++;phase.nextRowStart=range.rowEnd;
+  }
+
+  _dispatchFineBasicSelfPrepare(encoder, state, duty) {
+    if (state.activeOperation != null) {
+      throw new Error(`cannot prepare ${duty.dutyId} with active ${state.activeOperation.ownerId}`);
+    }
+    const D = CONFIG$1.dim;
+    const weights = state.weights.mainBlocks[duty.block].transformerBlocks[duty.basic];
+    const norm1Buf = createEmptyBuffer(this.device, state.N_latent * D * 4);
+    this._dispatchLayerNorm(
+      encoder,
+      state.currentLatent,
+      norm1Buf,
+      weights.norm1,
+      state.N_latent,
+      D,
+    );
+    state.activeOperation = {
+      kind: 'basic-self',
+      ownerId: `block-${duty.block}-basic-${duty.basic}-self`,
+      block: duty.block,
+      basic: duty.basic,
+      zBuf: state.currentLatent,
+      weights,
+      D,
+      attention: this._createAttentionState(
+        encoder,
+        norm1Buf,
+        norm1Buf,
+        weights.attn1,
+        state.N_latent,
+        state.N_latent,
+        D,
+        state.attentionRowsPerDuty,
+        state.reuseAttentionQueryStorage,
+      ),
+    };
+  }
+
+  _dispatchFineBasicCrossPrepare(encoder, state, duty) {
+    const selfOwner = `block-${duty.block}-basic-${duty.basic}-self`;
+    const operation = this._requireFineOperation(state, 'basic-self', selfOwner);
+    const selfAttnBuf = this._finishAttention(encoder, operation.attention);
+    const z1Buf = createEmptyBuffer(this.device, state.N_latent * operation.D * 4);
+    encoder.copyBufferToBuffer(
+      operation.zBuf,
+      0,
+      z1Buf,
+      0,
+      state.N_latent * operation.D * 4,
+    );
+    this._dispatchAdd(encoder, z1Buf, selfAttnBuf, state.N_latent * operation.D);
+    const norm2Buf = createEmptyBuffer(this.device, state.N_latent * operation.D * 4);
+    this._dispatchLayerNorm(
+      encoder,
+      z1Buf,
+      norm2Buf,
+      operation.weights.norm2,
+      state.N_latent,
+      operation.D,
+    );
+    operation.kind = 'basic-cross';
+    operation.ownerId = `block-${duty.block}-basic-${duty.basic}-cross`;
+    operation.z1Buf = z1Buf;
+    operation.attention = this._createAttentionState(
+      encoder,
+      norm2Buf,
+      state.imageTokensBuf,
+      operation.weights.attn2,
+      state.N_latent,
+      state.N_img,
+      operation.D,
+      state.attentionRowsPerDuty,
+      state.reuseAttentionQueryStorage,
+    );
+  }
+
+  _dispatchFineBasicFinish(encoder, state, duty) {
+    const ownerId = `block-${duty.block}-basic-${duty.basic}-cross`;
+    const operation = this._requireFineOperation(state, 'basic-cross', ownerId);
+    const crossAttnBuf = this._finishAttention(encoder, operation.attention);
+    const z2Buf = createEmptyBuffer(this.device, state.N_latent * operation.D * 4);
+    encoder.copyBufferToBuffer(
+      operation.z1Buf,
+      0,
+      z2Buf,
+      0,
+      state.N_latent * operation.D * 4,
+    );
+    this._dispatchAdd(encoder, z2Buf, crossAttnBuf, state.N_latent * operation.D);
+    const norm3Buf = createEmptyBuffer(this.device, state.N_latent * operation.D * 4);
+    this._dispatchLayerNorm(
+      encoder,
+      z2Buf,
+      norm3Buf,
+      operation.weights.norm3,
+      state.N_latent,
+      operation.D,
+    );
+    const ffnOutBuf = this._dispatchGEGLUFFN(
+      encoder,
+      norm3Buf,
+      operation.weights.ff,
+      state.N_latent,
+      operation.D,
+      {rowsPerTile:state.residentFFN?state.ffnRowsPerTile:null},
+    );
+    const zOutBuf = createEmptyBuffer(this.device, state.N_latent * operation.D * 4);
+    encoder.copyBufferToBuffer(
+      z2Buf,
+      0,
+      zOutBuf,
+      0,
+      state.N_latent * operation.D * 4,
+    );
+    this._dispatchAdd(encoder, zOutBuf, ffnOutBuf, state.N_latent * operation.D);
+    state.currentLatent = zOutBuf;
+    state.activeOperation = null;
+  }
+
+  _dispatchForwardSetup(encoder, state) {
+    const device = this.device;
+    const D = CONFIG$1.dim;
+    const N_tri = CONFIG$1.triplaneTokens;
+    const N_latent_init = CONFIG$1.numLatents;
+    const { imageTokensBuf, N_img, weights } = state;
+
+    const reuse=state.reuseTokenizerSetupStorage??false,triBytes=N_tri*D*4;
+    if(typeof reuse!=='boolean')throw TypeError('explicit boolean tokenizer setup reuse required');
+    if(reuse&&(!state.residentFFN||state.rematerializeTokenizerEmbedding!==true||
+      state.nextFineDutyIndex!==0||!Array.isArray(this._residentWorkOwner?.allocations)||
+      !this._residentAdapterOwner?.allocations?.some(a=>a.buffer===weights.tokenizer_embeddings_buf&&a.size===triBytes)||
+      weights.tokenizer_embeddings_buf?.size!==triBytes||
+      !(weights.tokenizer_embeddings_buf.usage&GPUBufferUsage.STORAGE)||
+      weights.tokenizer_embeddings_buf===imageTokensBuf||weights.tokenizer_embeddings_buf===weights.latentInit))
+      throw Error('owned initial tokenizer setup storage and canonical rematerialization required');
+    const gnOutBuf = this._dispatchGroupNorm(encoder, weights.tokenizer_embeddings_buf,
+      weights.normTriplane, D, N_tri, 32);
+    // Separate ordered compute passes finish reading each original value before
+    // its backing is overwritten. No pass aliases its own input and output.
+    // The adapter retires its overwritten embedding after this setup prefix,
+    // then loads a fresh immutable canonical embedding for the final consumer.
+    const triPermBuf = reuse?weights.tokenizer_embeddings_buf:createEmptyBuffer(device, triBytes);
+    this._dispatchTranspose(encoder, gnOutBuf, triPermBuf, D, N_tri);
+    const triProjBuf = reuse?gnOutBuf:createEmptyBuffer(device, triBytes);
+    this._dispatchLinear(encoder, triPermBuf, triProjBuf,
+      weights.projTriplane.weight, weights.projTriplane.bias, N_tri, D, D);
+
+    const imgNormBuf = createEmptyBuffer(device, N_img * D * 4);
+    this._dispatchLayerNorm(encoder, imageTokensBuf, imgNormBuf, weights.normImage, N_img, D);
+    const imgProjBuf = createEmptyBuffer(device, N_img * D * 4);
+    this._dispatchLinear(encoder, imgNormBuf, imgProjBuf,
+      weights.projImage.weight, weights.projImage.bias, N_img, D, D);
+
+    const latentNormBuf = createEmptyBuffer(device, N_latent_init * D * 4);
+    this._dispatchLayerNorm(encoder, weights.latentInit, latentNormBuf,
+      weights.normLatent, N_latent_init, D);
+    const latentProjBuf = createEmptyBuffer(device, N_latent_init * D * 4);
+    this._dispatchLinear(encoder, latentNormBuf, latentProjBuf,
+      weights.projLatent.weight, weights.projLatent.bias, N_latent_init, D, D);
+
+    const N_latent = state.N_latent;
+    const latentBuf = createEmptyBuffer(device, N_latent * D * 4);
+    this._dispatchConcat(encoder, imgProjBuf, latentProjBuf, latentBuf,
+      N_img * D, N_latent_init * D);
+
+    state.currentLatent = latentBuf;
+    state.currentTriplane = triProjBuf;
+    if(!reuse)Object.assign(this._diagnosticBuffers,{gnOutBuf,triPermBuf});
+    if(reuse){
+      delete this._diagnosticBuffers.gnOutBuf;delete this._diagnosticBuffers.triPermBuf;
+      state.tokenizerSetupStorageReuse={status:'encoded',bytesPerBuffer:triBytes,
+        reusedTriplaneBuffers:2,newTriplaneBuffers:1,
+        source:'owned-tokenizer-after-groupnorm-read; owned-groupnorm-after-transpose-read'};
+    }
+    Object.assign(this._diagnosticBuffers, {
+      triProjBuf,
+      imgProjBuf,
+      latentProjBuf,
+      latentBuf,
+    });
+  }
+
+  _dispatchForwardBlockStage(encoder, state, blockIndex, stageInBlock) {
+    const D = CONFIG$1.dim;
+    const N_tri = CONFIG$1.triplaneTokens;
+    const block = state.weights.mainBlocks[blockIndex];
+
+    if (stageInBlock === 0) {
+      state.currentLatent = this._dispatchFuseBlock(
+        encoder,
+        state.currentLatent,
+        state.currentTriplane,
+        block.fuseBlockIn,
+        state.N_latent,
+        N_tri,
+        D,
+      );
+      return;
+    }
+
+    if (stageInBlock <= CONFIG$1.numBasicBlocks) {
+      const basicIndex = stageInBlock - 1;
+      state.currentLatent = this._dispatchBasicBlock(
+        encoder,
+        state.currentLatent,
+        state.imageTokensBuf,
+        block.transformerBlocks[basicIndex],
+        state.N_latent,
+        state.N_img,
+        D,
+      );
+      return;
+    }
+
+    state.currentTriplane = this._dispatchFuseBlock(
+      encoder,
+      state.currentTriplane,
+      state.currentLatent,
+      block.fuseBlockOut,
+      N_tri,
+      state.N_latent,
+      D,
+    );
+    this._diagnosticBuffers[`block${blockIndex}_latent`] = state.currentLatent;
+    this._diagnosticBuffers[`block${blockIndex}_triplane`] = state.currentTriplane;
+  }
+
+  _dispatchForwardFinal(encoder, state) {
+    const device = this.device;
+    const D = CONFIG$1.dim;
+    const N_tri = CONFIG$1.triplaneTokens;
+    const projOutBuf = createEmptyBuffer(device, N_tri * D * 4);
+    this._dispatchLinear(encoder, state.currentTriplane, projOutBuf,
+      state.weights.projOut.weight, state.weights.projOut.bias, N_tri, D, D);
+    const projOutPermBuf = createEmptyBuffer(device, D * N_tri * 4);
+    this._dispatchTranspose(encoder, projOutBuf, projOutPermBuf, N_tri, D);
+    this._dispatchAdd(
+      encoder,
+      projOutPermBuf,
+      state.weights.tokenizer_embeddings_buf,
+      D * N_tri,
+    );
+
+    this._diagnosticBuffers['projOutBuf'] = projOutBuf;
+    this._diagnosticBuffers['projOutPermBuf'] = projOutPermBuf;
+    this._diagnosticBuffers['rearrangedEmb'] = state.weights.tokenizer_embeddings_buf;
+    state.result = {
+      buffer: projOutPermBuf,
+      C: D,
+      N: N_tri,
+      planeSize: CONFIG$1.planeSize,
+    };
+  }
+
+  // --- FuseBlock: cross-attention fuse(z ← x) + GEGLU FFN ---
+  _dispatchFuseBlock(encoder, zBuf, xBuf, weights, N_z, N_x, D) {
+    const device = this.device;
+
+    // norm_z1
+    const zNormBuf = createEmptyBuffer(device, N_z * D * 4);
+    this._dispatchLayerNorm(encoder, zBuf, zNormBuf, weights.normZ1, N_z, D);
+
+    // norm_x (if present)
+    let xNormBuf = xBuf;
+    if (weights.normX) {
+      xNormBuf = createEmptyBuffer(device, N_x * D * 4);
+      this._dispatchLayerNorm(encoder, xBuf, xNormBuf, weights.normX, N_x, D);
+    }
+
+    // Cross-attention: Q from z, KV from x
+    const attnOutBuf = this._dispatchCrossAttention(encoder, zNormBuf, xNormBuf,
+      weights.attn, N_z, N_x, D);
+
+    // z = z + attn_out
+    const z1Buf = createEmptyBuffer(device, N_z * D * 4);
+    encoder.copyBufferToBuffer(zBuf, 0, z1Buf, 0, N_z * D * 4);
+    this._dispatchAdd(encoder, z1Buf, attnOutBuf, N_z * D);
+
+    // norm_z2 + GEGLU FFN
+    const z2NormBuf = createEmptyBuffer(device, N_z * D * 4);
+    this._dispatchLayerNorm(encoder, z1Buf, z2NormBuf, weights.normZ2, N_z, D);
+
+    const ffnOutBuf = this._dispatchGEGLUFFN(encoder, z2NormBuf, weights.ff, N_z, D);
+
+    // z = z1 + ffn_out
+    const zOutBuf = createEmptyBuffer(device, N_z * D * 4);
+    encoder.copyBufferToBuffer(z1Buf, 0, zOutBuf, 0, N_z * D * 4);
+    this._dispatchAdd(encoder, zOutBuf, ffnOutBuf, N_z * D);
+
+    return zOutBuf;
+  }
+
+  // --- BasicBlock: self-attn + cross-attn + GEGLU FFN ---
+  _dispatchBasicBlock(encoder, zBuf, xBuf, weights, N_z, N_x, D) {
+    const device = this.device;
+
+    // 1. Self-attention: norm1 → attn1(z, z)
+    const norm1Buf = createEmptyBuffer(device, N_z * D * 4);
+    this._dispatchLayerNorm(encoder, zBuf, norm1Buf, weights.norm1, N_z, D);
+
+    const selfAttnBuf = this._dispatchSelfAttention(encoder, norm1Buf,
+      weights.attn1, N_z, D);
+
+    const z1Buf = createEmptyBuffer(device, N_z * D * 4);
+    encoder.copyBufferToBuffer(zBuf, 0, z1Buf, 0, N_z * D * 4);
+    this._dispatchAdd(encoder, z1Buf, selfAttnBuf, N_z * D);
+
+    // 2. Cross-attention: norm2 → attn2(z, x)
+    const norm2Buf = createEmptyBuffer(device, N_z * D * 4);
+    this._dispatchLayerNorm(encoder, z1Buf, norm2Buf, weights.norm2, N_z, D);
+
+    const crossAttnBuf = this._dispatchCrossAttention(encoder, norm2Buf,
+      xBuf, weights.attn2, N_z, N_x, D);
+
+    const z2Buf = createEmptyBuffer(device, N_z * D * 4);
+    encoder.copyBufferToBuffer(z1Buf, 0, z2Buf, 0, N_z * D * 4);
+    this._dispatchAdd(encoder, z2Buf, crossAttnBuf, N_z * D);
+
+    // 3. GEGLU FFN: norm3 → geglu_ffn
+    const norm3Buf = createEmptyBuffer(device, N_z * D * 4);
+    this._dispatchLayerNorm(encoder, z2Buf, norm3Buf, weights.norm3, N_z, D);
+
+    const ffnOutBuf = this._dispatchGEGLUFFN(encoder, norm3Buf, weights.ff, N_z, D);
+
+    const zOutBuf = createEmptyBuffer(device, N_z * D * 4);
+    encoder.copyBufferToBuffer(z2Buf, 0, zOutBuf, 0, N_z * D * 4);
+    this._dispatchAdd(encoder, zOutBuf, ffnOutBuf, N_z * D);
+
+    return zOutBuf;
+  }
+
+  _createAttentionState(encoder, qInputBuf, kvInputBuf, attnWeights, N_q, N_kv, D, tileQCapacity = 128, reuseAttentionQueryStorage = false) {
+    if(typeof reuseAttentionQueryStorage!=='boolean')throw TypeError('attention query storage reuse requires a boolean');
+    if(!Number.isSafeInteger(tileQCapacity)||tileQCapacity<=0)throw TypeError('attentionRowsPerDuty must be a positive safe integer');
+    const device = this.device;
+    const numHeads = CONFIG$1.numHeads;
+    const qBuf = createEmptyBuffer(device, N_q * D * 4);
+    const kBuf = createEmptyBuffer(device, N_kv * D * 4);
+    const vBuf = createEmptyBuffer(device, N_kv * D * 4);
+    this._dispatchLinearNoBias(encoder, qInputBuf, qBuf, attnWeights.wq, N_q, D, D);
+    this._dispatchLinearNoBias(encoder, kvInputBuf, kBuf, attnWeights.wk, N_kv, D, D);
+    this._dispatchLinearNoBias(encoder, kvInputBuf, vBuf, attnWeights.wv, N_kv, D, D);
+
+    const scoreBufSize = numHeads * tileQCapacity * N_kv * 4;
+    const scoreBuf = createEmptyBuffer(device, scoreBufSize);
+    const tileAttnOutBuf = createEmptyBuffer(device, tileQCapacity * D * 4);
+    // Each tile reads only its query rows in three separate compute passes.
+    // The existing following copy overwrites only those already-consumed rows;
+    // future queries stay untouched. Compute still writes distinct tile scratch.
+    const attnOutBuf = reuseAttentionQueryStorage?qBuf:createEmptyBuffer(device, N_q * D * 4);
+
+    return {
+      attnWeights,
+      N_q,
+      N_kv,
+      D,
+      numHeads,
+      headDim: CONFIG$1.headDim,
+      tileQCapacity,
+      tileCount: ceilDiv$2(N_q, tileQCapacity),
+      nextTileIndex: 0,
+      qBuf,
+      kBuf,
+      vBuf,
+      scoreBuf,
+      tileAttnOutBuf,
+      attnOutBuf,
+      reuseAttentionQueryStorage,
+    };
+  }
+
+  _dispatchAttentionTile(encoder, state, tileIndex) {
+    if (tileIndex !== state.nextTileIndex) {
+      throw new Error(
+        `attention tile ${tileIndex} is out of order; expected ${state.nextTileIndex}`,
+      );
+    }
+    if (tileIndex < 0 || tileIndex >= state.tileCount) {
+      throw new RangeError(`invalid attention tile ${tileIndex}/${state.tileCount}`);
+    }
+
+    const device = this.device;
+    const {
+      N_q,
+      N_kv,
+      D,
+      numHeads,
+      headDim,
+      tileQCapacity,
+      qBuf,
+      kBuf,
+      vBuf,
+      scoreBuf,
+      tileAttnOutBuf,
+      attnOutBuf,
+    } = state;
+    const qStart = tileIndex * tileQCapacity;
+    const tileQ = Math.min(tileQCapacity, N_q - qStart);
+    const qOffsetBytes = qStart * D * 4;
+    const scoreSize = numHeads * tileQ * N_kv * 4;
+    const outputSize = tileQ * D * 4;
+
+    {
+      const totalWG = ceilDiv$2(numHeads * tileQ * N_kv, WG_SIZE$2);
+      const [wgX, wgY] = splitWG$2(totalWG);
+      const params = this._cachedUniform(
+        new Uint32Array([tileQ, N_kv, headDim, numHeads, wgX]),
+      );
+      const bg = device.createBindGroup({
+        layout: this._crossAttnLayout,
+        entries: [
+          { binding: 0, resource: { buffer: params } },
+          { binding: 1, resource: { buffer: qBuf, offset: qOffsetBytes, size: outputSize } },
+          { binding: 2, resource: { buffer: kBuf } },
+          { binding: 3, resource: { buffer: vBuf } },
+          { binding: 4, resource: { buffer: scoreBuf, size: scoreSize } },
+          { binding: 5, resource: { buffer: tileAttnOutBuf, size: outputSize } },
+        ],
+      });
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.pipelines.crossAttnScores);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(wgX, wgY);
+      pass.end();
+    }
+
+    {
+      const totalWG = ceilDiv$2(numHeads * tileQ, WG_SIZE$2);
+      const [wgX, wgY] = splitWG$2(totalWG);
+      const params = this._cachedUniform(
+        new Uint32Array([tileQ, N_kv, headDim, numHeads, wgX]),
+      );
+      const bg = device.createBindGroup({
+        layout: this._crossAttnLayout,
+        entries: [
+          { binding: 0, resource: { buffer: params } },
+          { binding: 1, resource: { buffer: qBuf, offset: qOffsetBytes, size: outputSize } },
+          { binding: 2, resource: { buffer: kBuf } },
+          { binding: 3, resource: { buffer: vBuf } },
+          { binding: 4, resource: { buffer: scoreBuf, size: scoreSize } },
+          { binding: 5, resource: { buffer: tileAttnOutBuf, size: outputSize } },
+        ],
+      });
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.pipelines.crossAttnSoftmax);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(wgX, wgY);
+      pass.end();
+    }
+
+    {
+      const totalWG = ceilDiv$2(tileQ * numHeads * headDim, WG_SIZE$2);
+      const [wgX, wgY] = splitWG$2(totalWG);
+      const params = this._cachedUniform(
+        new Uint32Array([tileQ, N_kv, headDim, numHeads, wgX]),
+      );
+      const bg = device.createBindGroup({
+        layout: this._crossAttnLayout,
+        entries: [
+          { binding: 0, resource: { buffer: params } },
+          { binding: 1, resource: { buffer: qBuf, offset: qOffsetBytes, size: outputSize } },
+          { binding: 2, resource: { buffer: kBuf } },
+          { binding: 3, resource: { buffer: vBuf } },
+          { binding: 4, resource: { buffer: scoreBuf, size: scoreSize } },
+          { binding: 5, resource: { buffer: tileAttnOutBuf, size: outputSize } },
+        ],
+      });
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.pipelines.crossAttnApply);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(wgX, wgY);
+      pass.end();
+    }
+
+    encoder.copyBufferToBuffer(tileAttnOutBuf, 0, attnOutBuf, qOffsetBytes, outputSize);
+    state.nextTileIndex++;
+  }
+
+  _finishAttention(encoder, state) {
+    if (state.nextTileIndex !== state.tileCount) {
+      throw new Error(
+        `attention is incomplete at tile ${state.nextTileIndex}/${state.tileCount}`,
+      );
+    }
+    const projOutBuf = createEmptyBuffer(this.device, state.N_q * state.D * 4);
+    this._dispatchLinear(
+      encoder,
+      state.attnOutBuf,
+      projOutBuf,
+      state.attnWeights.proj.weight,
+      state.attnWeights.proj.bias,
+      state.N_q,
+      state.D,
+      state.D,
+    );
+    return projOutBuf;
+  }
+
+  // --- Cross-attention dispatch (tiled over Q to fit WebGPU buffer limits) ---
+  _dispatchCrossAttention(encoder, qInputBuf, kvInputBuf, attnWeights, N_q, N_kv, D) {
+    const state = this._createAttentionState(
+      encoder,
+      qInputBuf,
+      kvInputBuf,
+      attnWeights,
+      N_q,
+      N_kv,
+      D,
+    );
+    for (let tileIndex = 0; tileIndex < state.tileCount; tileIndex++) {
+      this._dispatchAttentionTile(encoder, state, tileIndex);
+    }
+    return this._finishAttention(encoder, state);
+  }
+
+  _dispatchSelfAttention(encoder, inputBuf, attnWeights, N, D) {
+    return this._dispatchCrossAttention(
+      encoder,
+      inputBuf,
+      inputBuf,
+      attnWeights,
+      N,
+      N,
+      D,
+    );
+  }
+
+  // --- GEGLU FFN ---
+  _createFFNScratch(capacity,D){
+    return {input:createEmptyBuffer(this.device,capacity*D*4),
+      expanded:createEmptyBuffer(this.device,capacity*2*CONFIG$1.gegluInnerDim*4),
+      activated:createEmptyBuffer(this.device,capacity*CONFIG$1.gegluInnerDim*4),
+      projected:createEmptyBuffer(this.device,capacity*D*4)};
+  }
+
+  _dispatchFFNRow(encoder,input,output,scratch,ff,start,count,D){
+    const inner=CONFIG$1.gegluInnerDim;
+    encoder.copyBufferToBuffer(input,start*D*4,scratch.input,0,count*D*4);
+    this._dispatchLinear(encoder,scratch.input,scratch.expanded,ff.geglu.weight,ff.geglu.bias,count,D,2*inner);
+    this._dispatchGEGLUActivation(encoder,scratch.expanded,scratch.activated,count,inner);
+    this._dispatchLinear(encoder,scratch.activated,scratch.projected,ff.proj.weight,ff.proj.bias,count,inner,D);
+    encoder.copyBufferToBuffer(scratch.projected,0,output,start*D*4,count*D*4);
+  }
+
+  _dispatchGEGLUFFN(encoder, inputBuf, ffWeights, N, D, {rowsPerTile=null}={}) {
+    const device = this.device;
+    const innerDim = CONFIG$1.gegluInnerDim;
+
+    if(rowsPerTile!==null){
+      if(!Number.isSafeInteger(rowsPerTile)||rowsPerTile<=0)throw TypeError('rowsPerTile must be a positive safe integer');
+      if(!Number.isSafeInteger(N)||N<=0||!Number.isSafeInteger(D)||D<=0)throw TypeError('complete positive FFN dimensions required');
+      const capacity=Math.min(rowsPerTile,N);
+      const output=createEmptyBuffer(device,N*D*4);
+      const scratch=this._createFFNScratch(capacity,D);
+      // Rows have independent linear/GEGLU/linear reductions. Record the same
+      // existing kernels and global output placement, reusing scratch only
+      // after the preceding copy in this ordered command stream. No rows drop.
+      for(let start=0;start<N;start+=capacity){
+        const count=Math.min(capacity,N-start);
+        this._dispatchFFNRow(encoder,inputBuf,output,scratch,ffWeights,start,count,D);
+      }
+      // The model's command owner must drain and retire scratch; destroying it
+      // here would invalidate work that has not yet been submitted.
+      return output;
+    }
+
+    // Linear: [N, D] → [N, 2*innerDim] (GEGLU projection)
+    const geGluProjBuf = createEmptyBuffer(device, N * 2 * innerDim * 4);
+    this._dispatchLinear(encoder, inputBuf, geGluProjBuf,
+      ffWeights.geglu.weight, ffWeights.geglu.bias, N, D, 2 * innerDim);
+
+    // GEGLU activation: [N, 2*innerDim] → [N, innerDim]
+    const geGluOutBuf = createEmptyBuffer(device, N * innerDim * 4);
+    this._dispatchGEGLUActivation(encoder, geGluProjBuf, geGluOutBuf, N, innerDim);
+
+    // Linear: [N, innerDim] → [N, D]
+    const ffnOutBuf = createEmptyBuffer(device, N * D * 4);
+    this._dispatchLinear(encoder, geGluOutBuf, ffnOutBuf,
+      ffWeights.proj.weight, ffWeights.proj.bias, N, innerDim, D);
+
+    return ffnOutBuf;
+  }
+
+  _dispatchGEGLUActivation(encoder, input, output, rows, innerDim) {
+    const totalWG = ceilDiv$2(rows * innerDim, WG_SIZE$2);
+    const [wgX, wgY] = splitWG$2(totalWG);
+    const params = this._cachedUniform(new Uint32Array([rows, innerDim, wgX]));
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.geglu.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: output } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.geglu);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  // --- Low-level dispatch helpers ---
+
+  _dispatchLinear(encoder, input, output, weight, bias, rows, inDim, outDim) {
+    const totalWG = ceilDiv$2(rows * outDim, WG_SIZE$2);
+    const [wgX, wgY] = splitWG$2(totalWG);
+    const params = this._cachedUniform(
+      new Uint32Array([rows, inDim, outDim, wgX, 1]),
+    );
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.linear.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: weight } },
+        { binding: 3, resource: { buffer: bias } },
+        { binding: 4, resource: { buffer: output } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.linear);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _dispatchLinearRange(
+    encoder,
+    input,
+    output,
+    weight,
+    bias,
+    totalRows,
+    inDim,
+    outDim,
+    rowStart,
+    rowCount,
+  ) {
+    const range = normalizeLinearRowRange(totalRows, rowStart, rowCount);
+    const totalWG = ceilDiv$2(range.rowCount * outDim, WG_SIZE$2);
+    const [wgX, wgY] = splitWG$2(totalWG);
+    const params = this._cachedUniform(new Uint32Array([
+      range.totalRows,
+      inDim,
+      outDim,
+      range.rowStart,
+      range.rowCount,
+      wgX,
+      1,
+      0,
+    ]));
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.linearRange.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: weight } },
+        { binding: 3, resource: { buffer: bias } },
+        { binding: 4, resource: { buffer: output } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.linearRange);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _dispatchLinearNoBias(encoder, input, output, weight, rows, inDim, outDim) {
+    // Use a zero bias buffer, reallocating if a larger outDim is needed
+    if (!this._zeroBias || this._zeroBiasSize < outDim) {
+      this._zeroBiasSize = outDim;
+      this._zeroBias = createStorageBuffer(this.device, new Float32Array(outDim));
+    }
+    this._dispatchLinear(encoder, input, output, weight, this._zeroBias, rows, inDim, outDim);
+  }
+
+  _dispatchLayerNorm(encoder, input, output, norm, N, D) {
+    const paramsData = new ArrayBuffer(16);
+    const v = new DataView(paramsData);
+    v.setUint32(0, N, true); v.setUint32(4, D, true); v.setFloat32(8, CONFIG$1.eps, true);
+    const params = this._cachedUniform(new Uint8Array(paramsData));
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.layerNorm.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: norm.weight } },
+        { binding: 3, resource: { buffer: norm.bias } },
+        { binding: 4, resource: { buffer: output } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.layerNorm);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(N);
+    pass.end();
+  }
+
+  _dispatchGroupNorm(encoder, input, norm, C, spatialSize, numGroups) {
+    const device = this.device;
+    const total = C * spatialSize;
+
+    const normTotalWG = ceilDiv$2(total, WG_SIZE$2);
+    const [normWgX, normWgY] = splitWG$2(normTotalWG);
+    const uniformArr = new ArrayBuffer(24);
+    const u32View = new Uint32Array(uniformArr);
+    const f32View = new Float32Array(uniformArr);
+    u32View[0] = C; u32View[1] = 1; u32View[2] = spatialSize; u32View[3] = numGroups;
+    f32View[4] = CONFIG$1.eps; u32View[5] = normWgX;
+    const uniformBuf = this._cachedUniform(new Uint8Array(uniformArr));
+
+    const statsBuf = createEmptyBuffer(device, numGroups * 2 * 4);
+    const outputBuf = createEmptyBuffer(device, total * 4);
+
+    // Stats pass — all bindings via shared explicit layout
+    const statsBG = device.createBindGroup({
+      layout: this._gnLayout,
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuf } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: norm.weight } },
+        { binding: 3, resource: { buffer: norm.bias } },
+        { binding: 4, resource: { buffer: outputBuf } },
+        { binding: 5, resource: { buffer: statsBuf } },
+      ],
+    });
+    let pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.gnStats);
+    pass.setBindGroup(0, statsBG);
+    pass.dispatchWorkgroups(ceilDiv$2(numGroups, WG_SIZE$2));
+    pass.end();
+
+    // Normalize pass — all bindings via shared explicit layout
+    const normBG = device.createBindGroup({
+      layout: this._gnLayout,
+      entries: [
+        { binding: 0, resource: { buffer: uniformBuf } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: norm.weight } },
+        { binding: 3, resource: { buffer: norm.bias } },
+        { binding: 4, resource: { buffer: outputBuf } },
+        { binding: 5, resource: { buffer: statsBuf } },
+      ],
+    });
+    pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.gnNorm);
+    pass.setBindGroup(0, normBG);
+    pass.dispatchWorkgroups(normWgX, normWgY);
+    pass.end();
+
+    return outputBuf;
+  }
+
+  _dispatchTranspose(encoder, input, output, rows, cols) {
+    // Simple transpose: [rows, cols] → [cols, rows]
+    // Use inline shader since transpose_nd.wgsl may have different binding layout
+    if (!this.pipelines.transpose2d) {
+      this.pipelines.transpose2d = this.device.createComputePipeline({
+        layout: 'auto',
+        compute: {
+          module: this.device.createShaderModule({
+            code: `
+              struct P { rows: u32, cols: u32, numWgX: u32 }
+              @group(0) @binding(0) var<uniform> p: P;
+              @group(0) @binding(1) var<storage, read> input: array<f32>;
+              @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+              @compute @workgroup_size(256)
+              fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+                let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+                if (idx >= p.rows * p.cols) { return; }
+                let r = idx / p.cols;
+                let c = idx % p.cols;
+                output[c * p.rows + r] = input[r * p.cols + c];
+              }
+            `,
+          }),
+          entryPoint: 'main',
+        },
+      });
+    }
+
+    const total = rows * cols;
+    const totalWG = ceilDiv$2(total, WG_SIZE$2);
+    const [wgX, wgY] = splitWG$2(totalWG);
+    const params = this._cachedUniform(new Uint32Array([rows, cols, wgX]));
+
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.transpose2d.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: output } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.transpose2d);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _dispatchAdd(encoder, dst, src, count) {
+    const totalWG = ceilDiv$2(count, WG_SIZE$2);
+    const [wgX, wgY] = splitWG$2(totalWG);
+    const params = this._cachedUniform(new Uint32Array([count, wgX]));
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.add.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: dst } },
+        { binding: 1, resource: { buffer: src } },
+        { binding: 2, resource: { buffer: params } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.add);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _dispatchConcat(encoder, aBuf, bBuf, outBuf, sizeA, sizeB) {
+    const total = sizeA + sizeB;
+    const totalWG = ceilDiv$2(total, WG_SIZE$2);
+    const [wgX, wgY] = splitWG$2(totalWG);
+    const params = this._cachedUniform(new Uint32Array([sizeA, sizeB, wgX]));
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.concat.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: aBuf } },
+        { binding: 1, resource: { buffer: bBuf } },
+        { binding: 2, resource: { buffer: outBuf } },
+        { binding: 3, resource: { buffer: params } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.concat);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+}
+
+/**
+ * Cooperative execution for the SF3D two-stream interleave transformer.
+ *
+ * The graph is cut only at dependency-safe stage boundaries. Legacy forward()
+ * drives these same stages into one command encoder, so scheduling changes do
+ * not create a second numerical implementation.
+ */
+
+
+const TWO_STREAM_MANIFEST_ID = 'sf3d.two-stream-cooperative-boundaries.v0';
+const TWO_STREAM_BOUNDARY_ID = 'two-stream-stages';
+const TWO_STREAM_ATTENTION_MANIFEST_ID =
+  'sf3d.two-stream-attention-cooperative-boundaries.v0';
+const TWO_STREAM_ATTENTION_BOUNDARY_ID = 'two-stream-attention-duties';
+const TWO_STREAM_DUTY_COUNT = TWO_STREAM_STAGE_IDS.length;
+
+function defineTwoStreamManifest(options = {}) {
+  const {
+    dutyGranularity = 'stage',
+    N_img,
+    linearRowsPerDuty = 128,
+    attentionRowsPerDuty = 128,
+    residentFFN = false,
+    reuseDeadTriplaneStorage = false,
+    reuseAttentionResidualStorage = false,
+    reuseAttentionQueryStorage = false,
+    reuseAttentionProjectionStorage = false,
+    reuseTokenizerSetupStorage = false,
+  } = options;
+  if (!['stage', 'attention-tile'].includes(dutyGranularity)) {
+    throw new RangeError(`unknown two-stream duty granularity ${dutyGranularity}`);
+  }
+  const attentionPlan = dutyGranularity === 'attention-tile'
+    ? createTwoStreamAttentionDutyPlan(N_img, { linearRowsPerDuty, attentionRowsPerDuty, residentFFN })
+    : null;
+  const boundaryId = attentionPlan ? TWO_STREAM_ATTENTION_BOUNDARY_ID : TWO_STREAM_BOUNDARY_ID;
+  const totalItems = attentionPlan?.length ?? TWO_STREAM_DUTY_COUNT;
+  return defineWebGpuCooperativeBoundaryManifest({
+    manifestId: attentionPlan ? TWO_STREAM_ATTENTION_MANIFEST_ID : TWO_STREAM_MANIFEST_ID,
+    routeId: SF3D_ROUTE_ID,
+    phases: [
+      {
+        phaseId: 'two-stream-backbone',
+        boundaries: [
+          {
+            boundaryId,
+            kind: 'gpu-command',
+            unit: attentionPlan ? 'two-stream-attention-duty' : 'two-stream-stage',
+            totalItems,
+            progressWeight: totalItems,
+            commandDutyKind: 'compute',
+            chunking: { mode: 'fixed', chunkItems: 1 },
+            yieldPolicy: 'after-duty',
+            resources: {
+              retain: [
+                'dinov2.tokens',
+                'triplane.low-resolution',
+                'two-stream.weights',
+                'two-stream.intermediates',
+              ],
+              produce: ['two-stream.triplane-features'],
+              release: [],
+            },
+          },
+        ],
+      },
+    ],
+    metadata: {
+      source: 'sf3d-webgpu-cooperative-two-stream',
+      dutyGranularity,
+      linearRowsPerDuty: attentionPlan ? linearRowsPerDuty : null,
+      attentionRowsPerDuty: attentionPlan ? attentionRowsPerDuty : null,
+      residentFFN,
+      reuseDeadTriplaneStorage,
+      reuseAttentionResidualStorage,
+      reuseAttentionQueryStorage,
+      reuseAttentionProjectionStorage,
+      reuseTokenizerSetupStorage,
+    },
+  });
+}
+
+async function driveTwoStreamBoundary(cooperative, options) {
+  const {
+    encodeStage,
+    now = () => globalThis.performance?.now?.() ?? Date.now(),
+  } = options;
+  if (options.submitStage != null) {
+    throw new TypeError('submitStage is unsupported: the kit owns queue.submit (>=0.1.41); encodeStage must return the command buffer');
+  }
+  const gpu = cooperative.startBoundary(TWO_STREAM_BOUNDARY_ID);
+  const telemetry = [];
+
+  for (let stageIndex = 0; stageIndex < TWO_STREAM_DUTY_COUNT; stageIndex++) {
+    const range = gpu.nextRange();
+    if (!range) {
+      throw new Error(`cooperative two-stream exhausted ranges before stage ${stageIndex}`);
+    }
+    if (range.itemStart !== stageIndex || range.itemEnd !== stageIndex + 1) {
+      throw new Error(
+        `cooperative two-stream range ${range.itemStart}-${range.itemEnd} `
+        + `does not match stage ${stageIndex}`,
+      );
+    }
+
+    const stageId = TWO_STREAM_STAGE_IDS[stageIndex];
+    const timing = {
+      stageIndex,
+      stageId,
+      dutyStartedAtMs: now(),
+      encodeStartedAtMs: null,
+      encodeCompletedAtMs: null,
+      submitStartedAtMs: null,
+      submitCompletedAtMs: null,
+      dutyCompletedAtMs: null,
+      encodeMs: null,
+      submitMs: null,
+      dutyMs: null,
+    };
+
+    // kit >=0.1.41: encode returns the command buffer; the kit submits it and
+    // captures the queue-prefix fence. Submit timing stays null (kit-owned).
+    await gpu.runGpuDuty(range, {
+      encode() {
+        timing.encodeStartedAtMs = now();
+        const commandBuffer = encodeStage({ stageIndex, stageId, range });
+        timing.encodeCompletedAtMs = now();
+        timing.encodeMs = timing.encodeCompletedAtMs - timing.encodeStartedAtMs;
+        return commandBuffer;
+      },
+    });
+
+    timing.dutyCompletedAtMs = now();
+    timing.dutyMs = timing.dutyCompletedAtMs - timing.dutyStartedAtMs;
+    telemetry.push(Object.freeze(timing));
+  }
+
+  if (gpu.nextRange() != null) {
+    throw new Error('cooperative two-stream left ranges unconsumed');
+  }
+  return {
+    completedDuties: telemetry.length,
+    totalDuties: TWO_STREAM_DUTY_COUNT,
+    telemetry: Object.freeze(telemetry),
+  };
+}
+
+async function driveTwoStreamAttentionBoundary(cooperative, options) {
+  const {
+    plan,
+    encodeDuty,
+    now = () => globalThis.performance?.now?.() ?? Date.now(),
+  } = options;
+  if (options.submitDuty != null) {
+    throw new TypeError('submitDuty is unsupported: the kit owns queue.submit (>=0.1.41); encodeDuty must return the command buffer');
+  }
+  const gpu = cooperative.startBoundary(TWO_STREAM_ATTENTION_BOUNDARY_ID);
+  const telemetry = [];
+
+  const runDuty=async duty=>{
+    await options.beforeDuty?.(duty);
+    const range = gpu.nextRange();
+    if (!range) {
+      throw new Error(
+        `cooperative two-stream attention exhausted ranges before duty ${duty.dutyIndex}`,
+      );
+    }
+    if (range.itemStart !== duty.dutyIndex || range.itemEnd !== duty.dutyIndex + 1) {
+      throw new Error(
+        `cooperative two-stream attention range ${range.itemStart}-${range.itemEnd} `
+        + `does not match duty ${duty.dutyIndex}`,
+      );
+    }
+    const timing = {
+      dutyIndex: duty.dutyIndex,
+      dutyId: duty.dutyId,
+      kind: duty.kind,
+      ownerId: duty.ownerId ?? null,
+      tileIndex: duty.tileIndex ?? null,
+      tileCount: duty.tileCount ?? null,
+      rangeIndex: duty.rangeIndex ?? null,
+      rangeCount: duty.rangeCount ?? null,
+      rowStart: duty.rowStart ?? null,
+      rowCount: duty.rowCount ?? null,
+      rowEnd: duty.rowEnd ?? null,
+      dutyStartedAtMs: now(),
+      encodeStartedAtMs: null,
+      encodeCompletedAtMs: null,
+      submitStartedAtMs: null,
+      submitCompletedAtMs: null,
+      dutyCompletedAtMs: null,
+      encodeMs: null,
+      submitMs: null,
+      dutyMs: null,
+    };
+
+    // kit >=0.1.41: encode returns the command buffer; the kit submits it.
+    await gpu.runGpuDuty(range, {
+      encode() {
+        timing.encodeStartedAtMs = now();
+        const commandBuffer = encodeDuty({ duty, range });
+        timing.encodeCompletedAtMs = now();
+        timing.encodeMs = timing.encodeCompletedAtMs - timing.encodeStartedAtMs;
+        return commandBuffer;
+      },
+    });
+    timing.dutyCompletedAtMs = now();
+    timing.dutyMs = timing.dutyCompletedAtMs - timing.dutyStartedAtMs;
+    telemetry.push(Object.freeze(timing));
+    await options.afterDuty?.(duty);
+  };
+  for(const group of groupTwoStreamDuties(plan)){
+    const work=async()=>{for(const duty of group.duties)await runDuty(duty);};
+    if(options.withDutyGroup)await options.withDutyGroup(group,work);
+    else await work();
+  }
+
+  if (gpu.nextRange() != null) {
+    throw new Error('cooperative two-stream attention left ranges unconsumed');
+  }
+  return {
+    completedDuties: telemetry.length,
+    totalDuties: plan.length,
+    telemetry: Object.freeze(telemetry),
+  };
+}
+
+/** Exact existing stages remain the weight-lifetime groups of the fine plan. */
+function groupTwoStreamDuties(plan){
+  const groups=[];
+  for(const duty of plan){
+    const stageId=duty.kind==='setup'||duty.kind==='final'?duty.kind:
+      duty.basic!=null?`block-${duty.block}-basic-${duty.basic}`:
+      duty.kind==='attention-tile'?duty.ownerId.replace(/-(self|cross)$/,''):
+      `block-${duty.block}-fuse-${duty.direction}`;
+    if(groups.at(-1)?.stageId!==stageId)groups.push({stageId,duties:[]});
+    groups.at(-1).duties.push(duty);
+  }
+  return groups;
+}
+
+/** Unresolved queue/destruction failures stay reachable on the actual backbone. */
+async function retireTwoStreamWork(backbone,keep=new Set()){
+  const owner=backbone._residentWorkOwner;
+  if(!owner&&!backbone._failedUniforms?.size)return;
+  if(owner){
+    for(const allocation of owner.allocations)owner.buffers.add(allocation.buffer);
+    owner.allocations.length=0;
+  }
+  await backbone.device.queue.onSubmittedWorkDone();
+  const errors=[];
+  for(const buffer of backbone._failedUniforms??[]){
+    try{buffer.destroy();backbone._failedUniforms.delete(buffer);}
+    catch(error){errors.push(error);}
+  }
+  for(const buffer of owner?.buffers??[])if(!keep.has(buffer)){
+    try{
+      buffer.destroy();owner.buffers.delete(buffer);
+      if(backbone._zeroBias===buffer){backbone._zeroBias=null;backbone._zeroBiasSize=0;}
+      for(const [key,value] of Object.entries(backbone._diagnosticBuffers??{}))
+        if(value===buffer)delete backbone._diagnosticBuffers[key];
+    }catch(error){errors.push(error);}
+  }
+  if(errors.length)throw new AggregateError(errors,'two-stream work retirement failed');
+  if(!owner||owner.buffers.size===0)backbone._residentWorkOwner=null;
+}
+
+function liveWorkBuffers(state,backbone){
+  const keep=new Set(),seen=new Set(),owned=backbone._residentWorkOwner.buffers;
+  const visit=value=>{
+    if(!value||typeof value!=='object'||seen.has(value))return;
+    seen.add(value);if(owned.has(value)){keep.add(value);return;}
+    for(const [key,child] of Object.entries(value))if(key!=='weights'&&key!=='attnWeights')visit(child);
+  };
+  for(const value of [state.currentLatent,state.currentTriplane,state.activeOperation,state.result,backbone._zeroBias])visit(value);
+  return keep;
+}
+
+async function runCooperativeTwoStream(options) {
+  const {
+    device,
+    backbone,
+    imageTokensBuf,
+    N_img,
+    weights,
+    schedulingMode = 'cooperative',
+    dutyGranularity = 'stage',
+    linearRowsPerDuty = 128,
+    attentionRowsPerDuty = 128,
+    residentFFN = false,
+    retireIntermediateBuffers = false,
+    reuseDeadTriplaneStorage = false,
+    reuseAttentionResidualStorage = false,
+    reuseAttentionQueryStorage = false,
+    reuseAttentionProjectionStorage = false,
+    reuseTokenizerSetupStorage = false,
+    rematerializeTokenizerEmbedding = false,
+    withGroupWeights = null,
+    onProgress,
+    signal,
+    invocationId = `sf3d:two-stream:${schedulingMode}`,
+  } = options;
+  if (!['stage', 'attention-tile'].includes(dutyGranularity)) {
+    throw new RangeError(`unknown two-stream duty granularity ${dutyGranularity}`);
+  }
+  if((residentFFN||retireIntermediateBuffers||withGroupWeights)&&dutyGranularity!=='attention-tile')
+    throw TypeError('resident lifetimes require the exact attention-tile plan');
+  if(typeof reuseDeadTriplaneStorage!=='boolean'||(reuseDeadTriplaneStorage&&
+    (!residentFFN||!retireIntermediateBuffers||dutyGranularity!=='attention-tile')))
+    throw TypeError('dead-triplane reuse requires explicit resident FFN and owned work retirement');
+  if(typeof reuseAttentionResidualStorage!=='boolean'||(reuseAttentionResidualStorage&&!reuseDeadTriplaneStorage))
+    throw TypeError('attention residual reuse requires explicit owned dead-triplane reuse');
+  if(typeof reuseAttentionQueryStorage!=='boolean'||(reuseAttentionQueryStorage&&(!residentFFN||!retireIntermediateBuffers||dutyGranularity!=='attention-tile')))
+    throw TypeError('attention query storage reuse requires owned resident attention duties');
+  if(typeof reuseAttentionProjectionStorage!=='boolean'||(reuseAttentionProjectionStorage&&
+    (!reuseAttentionQueryStorage||!reuseAttentionResidualStorage)))
+    throw TypeError('attention projection row reuse requires owned query and residual reuse');
+  if(withGroupWeights!==null&&typeof withGroupWeights!=='function')throw TypeError('withGroupWeights must be a function');
+  if(typeof reuseTokenizerSetupStorage!=='boolean'||(reuseTokenizerSetupStorage&&
+    (!residentFFN||!retireIntermediateBuffers||!withGroupWeights||!rematerializeTokenizerEmbedding||
+      dutyGranularity!=='attention-tile')))
+    throw TypeError('tokenizer setup reuse requires owned resident work and canonical rematerialization');
+  if(backbone._residentWorkOwner||backbone._failedUniforms?.size)throw Error('two-stream work cleanup is quarantined');
+  const attentionPlan = dutyGranularity === 'attention-tile'
+    ? createTwoStreamAttentionDutyPlan(N_img, { linearRowsPerDuty, attentionRowsPerDuty, residentFFN })
+    : null;
+  const now = () => globalThis.performance?.now?.() ?? Date.now();
+  const queueFences = [];
+  const browserYields = [];
+  let activeStage = null;
+  const runtime = createSf3dCooperativeRuntime(device, {
+    foregroundOpportunities: options.foregroundOpportunities ?? null,
+    onQueueFenceResolved(event) {
+      queueFences.push(Object.freeze({ ...activeStage, ...event }));
+    },
+    onBrowserYield(event) {
+      browserYields.push(Object.freeze({ ...activeStage, ...event }));
+    },
+  });
+  const execution = createWebGpuCooperativeExecution({
+    runtime,
+    manifest: defineTwoStreamManifest({
+      dutyGranularity,
+      N_img,
+      linearRowsPerDuty,
+      attentionRowsPerDuty,
+      residentFFN,
+      reuseDeadTriplaneStorage,
+      reuseAttentionResidualStorage,
+      reuseAttentionQueryStorage,
+      reuseAttentionProjectionStorage,
+      reuseTokenizerSetupStorage,
+    }),
+    invocationId,
+    schedulingMode,
+    onProgress,
+    signal,
+  });
+  const state = attentionPlan
+    ? backbone.createAttentionForwardState(
+      imageTokensBuf,
+      N_img,
+      weights,
+      { linearRowsPerDuty, attentionRowsPerDuty, residentFFN, reuseDeadTriplaneStorage, reuseAttentionResidualStorage,reuseAttentionQueryStorage,reuseAttentionProjectionStorage,
+        reuseTokenizerSetupStorage,rematerializeTokenizerEmbedding },
+    )
+    : backbone.createForwardState(imageTokensBuf, N_img, weights);
+  let stageTelemetry = [];
+  if(attentionPlan&&JSON.stringify(state.finePlan)!==JSON.stringify(attentionPlan))
+    throw Error('backbone effective plan differs from declared cooperative plan');
+  if(attentionPlan&&(state.reuseAttentionQueryStorage??false)!==reuseAttentionQueryStorage)
+    throw Error('backbone effective attention query reuse differs from requested configuration');
+  if(attentionPlan&&(state.reuseAttentionProjectionStorage??false)!==reuseAttentionProjectionStorage)
+    throw Error('backbone effective attention projection row reuse differs from requested configuration');
+  const owner=retireIntermediateBuffers?{allocations:[],buffers:new Set()}:null;
+  if(owner)backbone._residentWorkOwner=owner;
+  let succeeded=false,failure,failed=false;
+  const storageReuse=[];
+  const attentionResidualReuse=[];
+  const attentionProjectionReuse=[];
+  let tokenizerSetupStorageReuse=null;
+  const record=fn=>owner?captureGpuBufferAllocations(fn,{ownedAllocations:owner.allocations}).value:fn();
+
+  try{
+  await execution.run(async cooperative => {
+    const driven = attentionPlan
+      ? await driveTwoStreamAttentionBoundary(cooperative, {
+        plan: attentionPlan,
+        now,
+        beforeDuty:options.onBeforeDuty?duty=>options.onBeforeDuty(duty,state):null,
+        withDutyGroup:withGroupWeights?async(group,work)=>withGroupWeights(group,async phaseWeights=>{
+          state.weights=phaseWeights;return work();
+        }):null,
+        async afterDuty(duty){
+          if(owner){
+            for(const allocation of owner.allocations)owner.buffers.add(allocation.buffer);
+            owner.allocations.length=0;
+            if(reuseTokenizerSetupStorage&&duty.kind==='setup')
+              tokenizerSetupStorageReuse={...state.tokenizerSetupStorageReuse,status:'completed-prefix',afterDutyIndex:duty.dutyIndex};
+            if(reuseAttentionProjectionStorage&&duty.kind==='fuse-attention-linear-range'&&duty.rangeIndex===duty.rangeCount-1)
+              attentionProjectionReuse.push(backbone._markFineAttentionProjectionReusable(state,duty));
+            if(reuseAttentionResidualStorage&&duty.kind==='fuse-attention-linear-range'&&duty.rangeIndex===duty.rangeCount-1)
+              attentionResidualReuse.push(backbone._markFineAttentionResidualReusable(state,duty));
+            if(reuseDeadTriplaneStorage&&duty.kind==='fuse-residual-norm')
+              storageReuse.push(backbone._markFineFuseStorageReusable(state,duty));
+            await retireTwoStreamWork(backbone,liveWorkBuffers(state,backbone));
+          }
+          await options.onAfterDuty?.(duty,state);
+        },
+        encodeDuty({ duty }) {
+          activeStage = {
+            dutyIndex: duty.dutyIndex,
+            dutyId: duty.dutyId,
+            kind: duty.kind,
+            ownerId: duty.ownerId ?? null,
+            tileIndex: duty.tileIndex ?? null,
+            tileCount: duty.tileCount ?? null,
+            rangeIndex: duty.rangeIndex ?? null,
+            rangeCount: duty.rangeCount ?? null,
+            rowStart: duty.rowStart ?? null,
+            rowCount: duty.rowCount ?? null,
+            rowEnd: duty.rowEnd ?? null,
+          };
+          const encoder = device.createCommandEncoder({
+            label: `two-stream-${duty.dutyIndex}-${duty.dutyId}`,
+          });
+          record(()=>backbone.dispatchAttentionForwardDuty(encoder, state, duty.dutyIndex));
+          return encoder.finish();
+        },
+      })
+      : await driveTwoStreamBoundary(cooperative, {
+        now,
+        encodeStage({ stageIndex, stageId }) {
+          activeStage = { stageIndex, stageId };
+          const encoder = device.createCommandEncoder({
+            label: `two-stream-${stageIndex}-${stageId}`,
+          });
+          backbone.dispatchForwardStage(encoder, state, stageIndex);
+          return encoder.finish();
+        },
+      });
+    stageTelemetry = driven.telemetry;
+  });
+
+  activeStage = null;
+  const result = backbone.getForwardResult(state);
+  succeeded=true;
+  return {
+    result,
+    report: Object.freeze({
+      ...execution.finish(),
+      adapterTelemetry: Object.freeze({
+        dutyGranularity,
+        residentFFN,
+        reuseDeadTriplaneStorage,
+        storageReuse:Object.freeze(storageReuse),
+        reuseAttentionResidualStorage,
+        reuseAttentionQueryStorage:state.reuseAttentionQueryStorage??false,
+        reuseAttentionProjectionStorage:state.reuseAttentionProjectionStorage??false,
+        attentionProjectionReuse:Object.freeze(attentionProjectionReuse),
+        attentionResidualReuse:Object.freeze(attentionResidualReuse),
+        reuseTokenizerSetupStorage,
+        tokenizerSetupStorageReuse,
+        linearRowsPerDuty:attentionPlan?linearRowsPerDuty:null,
+        attentionRowsPerDuty:attentionPlan?attentionRowsPerDuty:null,
+        declaredDutyCount: attentionPlan?.length ?? TWO_STREAM_DUTY_COUNT,
+        stageDuties: Object.freeze(stageTelemetry),
+        queueFences: Object.freeze(queueFences),
+        browserYields: Object.freeze(browserYields),
+      }),
+    }),
+  };
+  }catch(error){failed=true;failure=error;throw error;}
+  finally{
+    if(owner){
+      try{
+        await retireTwoStreamWork(backbone,succeeded?new Set([state.result?.buffer]):new Set());
+        // Ownership of the one complete returned output transfers only if
+        // cleanup succeeded. A rejected return leaves that output recoverable.
+        backbone._residentWorkOwner=null;
+      }catch(error){
+        throw failed?new AggregateError([failure,error],'two-stream failed and cleanup is unresolved',{cause:failure}):error;
+      }
+    }
+  }
+}
+
+// Shared unchanged inference kernel: [3,1024,96,96] -> [1024,27648].
+const code=`
+              struct P { Np: u32, C: u32, H: u32, W: u32, numWgX: u32 }
+              @group(0) @binding(0) var<uniform> p: P;
+              @group(0) @binding(1) var<storage, read> src: array<f32>;
+              @group(0) @binding(2) var<storage, read_write> dst: array<f32>;
+              @compute @workgroup_size(256)
+              fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+                let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+                let total = p.Np * p.C * p.H * p.W;
+                if (idx >= total) { return; }
+                // idx iterates over destination [C, Np*H*W]
+                let c = idx / (p.Np * p.H * p.W);
+                let s = idx % (p.Np * p.H * p.W);
+                let plane = s / (p.H * p.W);
+                let hw = s % (p.H * p.W);
+                // source layout: [Np, C, H, W]
+                let srcIdx = plane * p.C * p.H * p.W + c * p.H * p.W + hw;
+                dst[idx] = src[srcIdx];
+              }
+            `;
+function dispatchTokenizerEmbedding(encoder,device,pipelines,embedding){
+  const Np=3,C=1024,H=96,W=96,total=Np*C*H*W;
+  if(embedding?.size!==total*4)throw Error('complete tokenizer embedding dimensions required');
+  if(!pipelines._rearrangePipeline)pipelines._rearrangePipeline=device.createComputePipeline({
+    layout:'auto',compute:{module:device.createShaderModule({code}),entryPoint:'main'},
+  });
+  const totalWG=Math.ceil(total/256),wgX=Math.min(totalWG,65535),wgY=Math.ceil(totalWG/65535);
+  const params=createStorageBuffer(device,new Uint32Array([Np,C,H,W,wgX]),GPUBufferUsage.UNIFORM,'tokenizer-rearrange-uniform');
+  const output=createEmptyBuffer(device,total*4);
+  const bg=device.createBindGroup({layout:pipelines._rearrangePipeline.getBindGroupLayout(0),entries:[
+    {binding:0,resource:{buffer:params}},{binding:1,resource:{buffer:embedding}},{binding:2,resource:{buffer:output}},
+  ]});
+  const pass=encoder.beginComputePass();pass.setPipeline(pipelines._rearrangePipeline);pass.setBindGroup(0,bg);
+  pass.dispatchWorkgroups(wgX,wgY);pass.end();
+  // The command owner retains captured output/uniform through its queue fence.
+  return output;
+}
+
+const conv2dWGSL = "// conv2d.wgsl — 2D convolution compute shader\r\n//\r\n// Standard conv2d with:\r\n//   - Arbitrary kernel size (1x1, 3x3, etc.)\r\n//   - Input tiling with halo in workgroup shared memory for 3x3\r\n//   - Replicate padding (matching PyTorch padding_mode='replicate')\r\n//   - Optional bias\r\n//   - Supports batched execution (one dispatch per output channel group)\r\n//\r\n// Memory layout (all NCHW, row-major):\r\n//   input:   [C_in, H, W]       — f32\r\n//   weight:  [C_out, C_in, kH, kW] — f32\r\n//   bias:    [C_out]             — f32\r\n//   output:  [C_out, H_out, W_out] — f32\r\n//\r\n// Uniforms:\r\n//   inC, inH, inW: input dimensions\r\n//   outC, outH, outW: output dimensions\r\n//   kH, kW: kernel size\r\n//   padH, padW: padding\r\n//   strideH, strideW: stride\r\n//   hasBias: 0 or 1\r\n\r\nstruct ConvParams {\r\n  inC: u32,\r\n  inH: u32,\r\n  inW: u32,\r\n  outC: u32,\r\n  outH: u32,\r\n  outW: u32,\r\n  kH: u32,\r\n  kW: u32,\r\n  padH: u32,\r\n  padW: u32,\r\n  strideH: u32,\r\n  strideW: u32,\r\n  hasBias: u32,\r\n};\r\n\r\n@group(0) @binding(0) var<uniform> params: ConvParams;\r\n@group(0) @binding(1) var<storage, read> input: array<f32>;\r\n@group(0) @binding(2) var<storage, read> weight: array<f32>;\r\n@group(0) @binding(3) var<storage, read> bias: array<f32>;\r\n@group(0) @binding(4) var<storage, read_write> output: array<f32>;\r\n\r\n// Workgroup tile for output spatial positions\r\n// 16x16 output tile per workgroup\r\nconst TILE_W: u32 = 16;\r\nconst TILE_H: u32 = 16;\r\n\r\n@compute @workgroup_size(TILE_W, TILE_H, 1)\r\nfn conv2d_main(\r\n  @builtin(global_invocation_id) gid: vec3<u32>,\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n) {\r\n  let outX = gid.x;\r\n  let outY = gid.y;\r\n  let outCh = wgid.z; // one output channel per z-workgroup\r\n\r\n  if (outX >= params.outW || outY >= params.outH || outCh >= params.outC) {\r\n    return;\r\n  }\r\n\r\n  var sum: f32 = 0.0;\r\n\r\n  // Loop over input channels and kernel\r\n  for (var ic: u32 = 0; ic < params.inC; ic++) {\r\n    for (var ky: u32 = 0; ky < params.kH; ky++) {\r\n      for (var kx: u32 = 0; kx < params.kW; kx++) {\r\n        // Input coordinate with stride and padding\r\n        let inY_raw = i32(outY * params.strideH + ky) - i32(params.padH);\r\n        let inX_raw = i32(outX * params.strideW + kx) - i32(params.padW);\r\n\r\n        // Replicate padding: clamp to valid range\r\n        let inY = u32(clamp(inY_raw, 0, i32(params.inH) - 1));\r\n        let inX = u32(clamp(inX_raw, 0, i32(params.inW) - 1));\r\n\r\n        let inputIdx = ic * params.inH * params.inW + inY * params.inW + inX;\r\n        let weightIdx = outCh * params.inC * params.kH * params.kW\r\n                      + ic * params.kH * params.kW\r\n                      + ky * params.kW\r\n                      + kx;\r\n\r\n        sum += input[inputIdx] * weight[weightIdx];\r\n      }\r\n    }\r\n  }\r\n\r\n  // Add bias\r\n  if (params.hasBias != 0) {\r\n    sum += bias[outCh];\r\n  }\r\n\r\n  let outputIdx = outCh * params.outH * params.outW + outY * params.outW + outX;\r\n  output[outputIdx] = sum;\r\n}\r\n";
+
+const conv2dChannelRangeWGSL = "// conv2d_channel_range.wgsl - exact output-channel range convolution\r\n\r\nstruct ConvRangeParams {\r\n  inC: u32,\r\n  inH: u32,\r\n  inW: u32,\r\n  outC: u32,\r\n  outH: u32,\r\n  outW: u32,\r\n  kH: u32,\r\n  kW: u32,\r\n  padH: u32,\r\n  padW: u32,\r\n  strideH: u32,\r\n  strideW: u32,\r\n  hasBias: u32,\r\n  channelStart: u32,\r\n  channelCount: u32,\r\n  applyRelu: u32,\r\n};\r\n\r\n@group(0) @binding(0) var<uniform> params: ConvRangeParams;\r\n@group(0) @binding(1) var<storage, read> input: array<f32>;\r\n@group(0) @binding(2) var<storage, read> weight: array<f32>;\r\n@group(0) @binding(3) var<storage, read> bias: array<f32>;\r\n@group(0) @binding(4) var<storage, read_write> output: array<f32>;\r\n\r\nconst TILE_W: u32 = 16;\r\nconst TILE_H: u32 = 16;\r\n\r\n@compute @workgroup_size(TILE_W, TILE_H, 1)\r\nfn conv2d_channel_range_main(\r\n  @builtin(global_invocation_id) gid: vec3<u32>,\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n) {\r\n  let outX = gid.x;\r\n  let outY = gid.y;\r\n  let localOutCh = wgid.z;\r\n  let outCh = params.channelStart + localOutCh;\r\n\r\n  if (\r\n    outX >= params.outW\r\n    || outY >= params.outH\r\n    || localOutCh >= params.channelCount\r\n    || outCh >= params.outC\r\n  ) {\r\n    return;\r\n  }\r\n\r\n  var sum: f32 = 0.0;\r\n  for (var ic: u32 = 0; ic < params.inC; ic++) {\r\n    for (var ky: u32 = 0; ky < params.kH; ky++) {\r\n      for (var kx: u32 = 0; kx < params.kW; kx++) {\r\n        let inYRaw = i32(outY * params.strideH + ky) - i32(params.padH);\r\n        let inXRaw = i32(outX * params.strideW + kx) - i32(params.padW);\r\n        let inY = u32(clamp(inYRaw, 0, i32(params.inH) - 1));\r\n        let inX = u32(clamp(inXRaw, 0, i32(params.inW) - 1));\r\n        let inputIndex = ic * params.inH * params.inW + inY * params.inW + inX;\r\n        let weightIndex = outCh * params.inC * params.kH * params.kW\r\n          + ic * params.kH * params.kW\r\n          + ky * params.kW\r\n          + kx;\r\n        sum += input[inputIndex] * weight[weightIndex];\r\n      }\r\n    }\r\n  }\r\n\r\n  if (params.hasBias != 0) {\r\n    sum += bias[outCh];\r\n  }\r\n  if (params.applyRelu != 0) {\r\n    sum = max(sum, 0.0);\r\n  }\r\n\r\n  let outputIndex = outCh * params.outH * params.outW + outY * params.outW + outX;\r\n  output[outputIndex] = sum;\r\n}\r\n";
+
+const pixelshuffleWGSL = "// pixelshuffle.wgsl — PixelShuffle (sub-pixel convolution) compute shader\r\n//\r\n// Rearranges elements from [C*r*r, H, W] to [C, H*r, W*r]\r\n// where r is the upscale factor.\r\n//\r\n// This is the primary upsampling method in MoGe-2's ConvStack resamplers.\r\n// PyTorch: nn.PixelShuffle(scale_factor)\r\n//\r\n// Memory layout (CHW, row-major):\r\n//   input:   [C_in, H, W]          — where C_in = C_out * r * r\r\n//   output:  [C_out, H * r, W * r]\r\n\r\nstruct PixelShuffleParams {\r\n  inC: u32,      // C_in = C_out * r * r\r\n  inH: u32,\r\n  inW: u32,\r\n  outC: u32,     // C_out\r\n  scaleFactor: u32,  // r\r\n  numWorkgroupsX: u32,\r\n};\r\n\r\n@group(0) @binding(0) var<uniform> params: PixelShuffleParams;\r\n@group(0) @binding(1) var<storage, read> input: array<f32>;\r\n@group(0) @binding(2) var<storage, read_write> output: array<f32>;\r\n\r\nconst WG_SIZE: u32 = 256;\r\n\r\n@compute @workgroup_size(WG_SIZE)\r\nfn pixelshuffle_main(\r\n  @builtin(workgroup_id) wgid: vec3<u32>,\r\n  @builtin(local_invocation_id) lid: vec3<u32>,\r\n) {\r\n  let outH = params.inH * params.scaleFactor;\r\n  let outW = params.inW * params.scaleFactor;\r\n  let totalOut = params.outC * outH * outW;\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n\r\n  if (idx >= totalOut) {\r\n    return;\r\n  }\r\n\r\n  // Decompose output index\r\n  let outSpatial = outH * outW;\r\n  let oc = idx / outSpatial;\r\n  let rem = idx % outSpatial;\r\n  let oy = rem / outW;\r\n  let ox = rem % outW;\r\n\r\n  // Map to input coordinates\r\n  let r = params.scaleFactor;\r\n  let iy = oy / r;\r\n  let ix = ox / r;\r\n  let subY = oy % r;\r\n  let subX = ox % r;\r\n\r\n  // Input channel: oc * r * r + subY * r + subX\r\n  let ic = oc * r * r + subY * r + subX;\r\n  let inputIdx = ic * params.inH * params.inW + iy * params.inW + ix;\r\n\r\n  output[idx] = input[inputIdx];\r\n}\r\n";
+
+/**
+ * shader_ops.js — WebGPU compute dispatch wrappers for each shader.
+ *
+ * Each function creates a pipeline, binds buffers, and dispatches.
+ * Pipelines are cached by device for reuse.
+ */
+
+
+const pipelineCache = new Map();
+const uniformCache = new Map();
+const MAX_WG_DIM = 65535;
+
+function cachedUniform(device, data) {
+  const bytes = new Uint8Array(data.buffer || data);
+  let h = 0;
+  for (let i = 0; i < bytes.length; i++) h = (h * 31 + bytes[i]) | 0;
+  const key = `u_${bytes.length}_${h}`;
+  if (uniformCache.has(key)) return uniformCache.get(key);
+  const buf = device.createBuffer({
+    size: Math.max(bytes.byteLength, 16),
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    mappedAtCreation: true,
+  });
+  new Uint8Array(buf.getMappedRange()).set(bytes);
+  buf.unmap();
+  uniformCache.set(key, buf);
+  return buf;
+}
+
+// Cache for dummy bias buffers (one per device)
+let dummyBiasBuf = null;
+function getDummyBias(device) {
+  if (!dummyBiasBuf) {
+    dummyBiasBuf = createStorageBuffer(device, new Float32Array([0]));
+  }
+  return dummyBiasBuf;
+}
+
+/**
+ * Split a total workgroup count into 2D dispatch (x, y) to stay within limits.
+ * Returns [wgX, wgY] where wgX * wgY >= totalWG and wgX <= MAX_WG_DIM.
+ */
+function splitWorkgroups(totalWG) {
+  if (totalWG <= MAX_WG_DIM) return [totalWG, 1];
+  const wgX = MAX_WG_DIM;
+  const wgY = Math.ceil(totalWG / MAX_WG_DIM);
+  return [wgX, wgY];
+}
+
+function getOrCreatePipeline(device, key, code, entryPoint, resourceContext = null) {
+  if (resourceContext && (resourceContext.device !== device
+      || !(resourceContext.pipelines instanceof Map))) {
+    throw new Error('shader resource context belongs to another device');
+  }
+  const cache = resourceContext?.pipelines ?? pipelineCache;
+  if (cache.has(key)) return cache.get(key);
+  const module = device.createShaderModule({ code });
+  const pipeline = device.createComputePipeline({
+    layout: 'auto',
+    compute: { module, entryPoint },
+  });
+  cache.set(key, pipeline);
+  return pipeline;
+}
+
+function dutyUniform(device, data, resourceContext) {
+  return resourceContext
+    ? createUniformBuffer(device, data, 'post-processor-duty-uniform')
+    : cachedUniform(device, data);
+}
+
+function ceil(a, b) { return Math.ceil(a / b); }
+
+/**
+ * Dispatch conv2d (3x3 or arbitrary kernel).
+ * Returns output buffer [outC, outH, outW].
+ */
+function dispatchConv2d(device, encoder, inputBuf, weightBuf, biasBuf, params) {
+  const { inC, inH, inW, outC, kH, kW, padH, padW, strideH, strideW } = params;
+  const outH = Math.floor((inH + 2 * padH - kH) / strideH) + 1;
+  const outW = Math.floor((inW + 2 * padW - kW) / strideW) + 1;
+  const hasBias = biasBuf ? 1 : 0;
+
+  const pipeline = getOrCreatePipeline(device, 'conv2d', conv2dWGSL, 'conv2d_main');
+
+  const uniformData = new Uint32Array([inC, inH, inW, outC, outH, outW, kH, kW, padH, padW, strideH, strideW, hasBias]);
+  const uniformBuf = cachedUniform(device, uniformData);
+
+  const dummyBias = biasBuf || getDummyBias(device);
+  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: inputBuf } },
+      { binding: 2, resource: { buffer: weightBuf } },
+      { binding: 3, resource: { buffer: dummyBias } },
+      { binding: 4, resource: { buffer: outputBuf } },
+    ],
+  });
+
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(ceil(outW, 16), ceil(outH, 16), outC);
+  pass.end();
+
+  return { buffer: outputBuf, outC, outH, outW };
+}
+
+/**
+ * Dispatch an exact output-channel range into a caller-owned Conv2d output.
+ */
+function dispatchConv2dChannelRange(
+  device,
+  encoder,
+  inputBuf,
+  weightBuf,
+  biasBuf,
+  outputBuf,
+  params,
+  range,
+) {
+  const {
+    inC,
+    inH,
+    inW,
+    outC,
+    kH,
+    kW,
+    padH,
+    padW,
+    strideH,
+    strideW,
+  } = params;
+  const { channelStart, channelCount } = range;
+  if (!Number.isSafeInteger(channelStart) || channelStart < 0
+      || !Number.isSafeInteger(channelCount) || channelCount <= 0
+      || channelStart + channelCount > outC) {
+    throw new RangeError(
+      `invalid Conv2d output-channel range ${channelStart}+${channelCount}/${outC}`,
+    );
+  }
+  const outH = Math.floor((inH + 2 * padH - kH) / strideH) + 1;
+  const outW = Math.floor((inW + 2 * padW - kW) / strideW) + 1;
+  const hasBias = biasBuf ? 1 : 0;
+  const pipeline = getOrCreatePipeline(
+    device,
+    'conv2d-channel-range',
+    conv2dChannelRangeWGSL,
+    'conv2d_channel_range_main',
+    params.resourceContext,
+  );
+  const uniformData = new Uint32Array([
+    inC,
+    inH,
+    inW,
+    outC,
+    outH,
+    outW,
+    kH,
+    kW,
+    padH,
+    padW,
+    strideH,
+    strideW,
+    hasBias,
+    channelStart,
+    channelCount,
+    params.applyRelu === true ? 1 : 0,
+  ]);
+  const uniformBuf = dutyUniform(device, uniformData, params.resourceContext);
+  const dummyBias = biasBuf || (params.resourceContext
+    ? createStorageBuffer(device, new Float32Array([0])) : getDummyBias(device));
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: inputBuf } },
+      { binding: 2, resource: { buffer: weightBuf } },
+      { binding: 3, resource: { buffer: dummyBias } },
+      { binding: 4, resource: { buffer: outputBuf } },
+    ],
+  });
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(ceil(outW, 16), ceil(outH, 16), channelCount);
+  pass.end();
+  return { buffer: outputBuf, outC, outH, outW };
+}
+
+/**
+ * Dispatch element-wise activation.
+ * op: 0=relu, 1=silu, 2=add, 3=add_relu, 4=sigmoid
+ */
+function dispatchActivation(device, encoder, inputA, inputB, count, op) {
+  const pipeline = getOrCreatePipeline(device, 'activation', activationsWGSL, 'activation_main');
+
+  const totalWG = ceil(count, 256);
+  const [wgX, wgY] = splitWorkgroups(totalWG);
+  const uniformData = new Uint32Array([count, op, wgX]);
+  const uniformBuf = cachedUniform(device, uniformData);
+
+  const dummyB = getDummyBias(device);
+  const outputBuf = createEmptyBuffer(device, count * 4);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: inputA } },
+      { binding: 2, resource: { buffer: dummyB } },
+      { binding: 3, resource: { buffer: outputBuf } },
+    ],
+  });
+
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
+
+  return outputBuf;
+}
+
+/**
+ * Dispatch PixelShuffle.
+ */
+function dispatchPixelShuffle(device, encoder, inputBuf, params) {
+  const { inC, inH, inW, scaleFactor } = params;
+  const outC = inC / (scaleFactor * scaleFactor);
+  const outH = inH * scaleFactor;
+  const outW = inW * scaleFactor;
+
+  const pipeline = getOrCreatePipeline(device, 'pixelshuffle', pixelshuffleWGSL, 'pixelshuffle_main', params.resourceContext);
+
+  const totalWG = ceil(outC * outH * outW, 256);
+  const [wgX, wgY] = splitWorkgroups(totalWG);
+  const uniformData = new Uint32Array([inC, inH, inW, outC, scaleFactor, wgX]);
+  const uniformBuf = dutyUniform(device, uniformData, params.resourceContext);
+
+  const outputBuf = createEmptyBuffer(device, outC * outH * outW * 4);
+
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: inputBuf } },
+      { binding: 2, resource: { buffer: outputBuf } },
+    ],
+  });
+
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
+
+  return { buffer: outputBuf, C: outC, H: outH, W: outW };
+}
+
+/**
+ * post_processor.js — PixelShuffle upsampling network for SF3D triplane features.
+ *
+ * Architecture (from network.py PixelShuffleUpsampleNetwork):
+ *   Input: [1024, 27648] channel-first triplane features from backbone
+ *   Reshape to 3 planes: [3, 1024, 96, 96]
+ *   Per-plane processing (shared weights):
+ *     Conv2d(1024→1024, 3×3, pad=1) + ReLU  ×3
+ *     Conv2d(1024→640, 3×3, pad=1)           (640 = 40 * 4²)
+ *     PixelShuffle(4)                         → [40, 384, 384]
+ *   Output: [3, 40, 384, 384] triplane feature planes
+ */
+
+
+const POST_CONFIG = {
+  inChannels: 1024,
+  outChannels: 40,
+  scaleFactor: 4,
+  convLayers: 4,
+  planeSize: 96,
+  // output_channels = out_channels * scale_factor² = 40 * 16 = 640
+  lastConvOut: 640,
+};
+
+const POST_PROCESSOR_PLANE_STAGE_IDS = Object.freeze([
+  'gather',
+  'conv-0-relu',
+  'conv-1-relu',
+  'conv-2-relu',
+  'conv-3',
+  'pixel-shuffle-copy',
+]);
+
+const POST_PROCESSOR_CONV_OUTPUT_CHANNELS = Object.freeze([
+  POST_CONFIG.inChannels,
+  POST_CONFIG.inChannels,
+  POST_CONFIG.inChannels,
+  POST_CONFIG.lastConvOut,
+]);
+
+/**
+ * Dispatch the post-processor for all 3 triplane planes.
+ *
+ * @param {GPUDevice} device
+ * @param {GPUCommandEncoder} encoder
+ * @param {GPUBuffer} triplanesBuf - [1024, 27648] channel-first backbone output
+ * @param {Object} weights - post_processor weights from loadWeights
+ * @returns {{ buffer: GPUBuffer, C: number, H: number, W: number }} - [3, 40, 384, 384]
+ */
+function createPostProcessorOutput(device) {
+  const { outChannels, scaleFactor, planeSize } = POST_CONFIG;
+  const outH = planeSize * scaleFactor; // 384
+  const outW = planeSize * scaleFactor; // 384
+  const outPlaneElements = outChannels * outH * outW;
+
+  // Output buffer for all 3 planes: [3, 40, 384, 384]
+  const outputBuf = createEmptyBuffer(device, 3 * outPlaneElements * 4);
+  return {
+    buffer: outputBuf,
+    C: outChannels,
+    H: outH,
+    W: outW,
+    numPlanes: 3,
+  };
+}
+
+/**
+ * Encode one dependency-independent triplane plane into a caller-owned output.
+ *
+ * The four convolutions inside a plane remain sequential and therefore stay in
+ * one command buffer for this first cooperative cut. Different planes share
+ * weights but no intermediate buffers, so command boundaries between planes do
+ * not change numerical ordering or output layout.
+ */
+function dispatchPostProcessorPlane(
+  device,
+  encoder,
+  triplanesBuf,
+  weights,
+  output,
+  plane,
+) {
+  const state = createPostProcessorPlaneState(
+    device,
+    triplanesBuf,
+    weights,
+    output,
+    plane,
+  );
+  for (let stageIndex = 0; stageIndex < POST_PROCESSOR_PLANE_STAGE_IDS.length; stageIndex++) {
+    dispatchPostProcessorPlaneStage(device, encoder, state, stageIndex);
+  }
+}
+
+/**
+ * Create the persistent state that crosses command boundaries for one plane.
+ *
+ * Buffer allocation remains inside the stage that first produces each value,
+ * so constructing state does not silently perform GPU work or front-load memory.
+ */
+function createPostProcessorPlaneState(
+  device,
+  triplanesBuf,
+  weights,
+  output,
+  plane,
+) {
+  if (!Number.isSafeInteger(plane) || plane < 0 || plane >= 3) {
+    throw new RangeError('postprocessor plane must be an integer in [0, 3)');
+  }
+  if (!device || !triplanesBuf || !weights || !output?.buffer) {
+    throw new TypeError('postprocessor plane state requires device, input, weights, and output');
+  }
+  if (!Array.isArray(weights.convLayers) || weights.convLayers.length !== POST_CONFIG.convLayers) {
+    throw new RangeError(`postprocessor requires exactly ${POST_CONFIG.convLayers} convolution layers`);
+  }
+  return {
+    device,
+    triplanesBuf,
+    weights,
+    output,
+    plane,
+    nextStageIndex: 0,
+    channelStage: null,
+    current: null,
+    complete: false,
+  };
+}
+
+/**
+ * Encode one exact channel-plan duty for one plane.
+ */
+function dispatchPostProcessorChannelDuty(device, encoder, state, duty) {
+  if (device !== state?.device) {
+    throw new Error('postprocessor plane state belongs to a different GPUDevice');
+  }
+  if (!duty || duty.plane !== state.plane) {
+    throw new Error(`postprocessor channel duty belongs to plane ${duty?.plane}`);
+  }
+  if (duty.kind === 'gather') {
+    if (duty.stageIndex !== 0 || state.nextStageIndex !== 0 || state.channelStage) {
+      throw new Error(`postprocessor plane ${state.plane} expected gather stage 0`);
+    }
+    return dispatchPostProcessorPlaneStage(device, encoder, state, 0);
+  }
+  if (duty.kind === 'pixel-shuffle-copy') {
+    if (duty.stageIndex !== 5 || state.nextStageIndex !== 5 || state.channelStage) {
+      throw new Error(`postprocessor plane ${state.plane} expected PixelShuffle stage 5`);
+    }
+    return dispatchPostProcessorPlaneStage(device, encoder, state, 5);
+  }
+  if (duty.kind !== 'conv-range') {
+    throw new Error(`unsupported postprocessor channel duty kind ${duty.kind}`);
+  }
+  if (!Number.isSafeInteger(duty.stageIndex)
+      || duty.stageIndex < 1
+      || duty.stageIndex > 4
+      || duty.stageIndex !== state.nextStageIndex) {
+    throw new Error(
+      `postprocessor plane ${state.plane} expected stage ${state.nextStageIndex}, `
+      + `got ${duty.stageIndex}`,
+    );
+  }
+
+  const layerIndex = duty.stageIndex - 1;
+  const totalChannels = POST_PROCESSOR_CONV_OUTPUT_CHANNELS[layerIndex];
+  const isLast = layerIndex === POST_CONFIG.convLayers - 1;
+  if (duty.layerIndex !== layerIndex
+      || duty.totalChannels !== totalChannels
+      || !Number.isSafeInteger(duty.rangeIndex)
+      || !Number.isSafeInteger(duty.rangeCount)
+      || duty.rangeCount <= 0
+      || !Number.isSafeInteger(duty.channelStart)
+      || !Number.isSafeInteger(duty.channelCount)
+      || duty.channelCount <= 0
+      || duty.channelEnd !== duty.channelStart + duty.channelCount
+      || duty.channelEnd > totalChannels) {
+    throw new Error(`invalid postprocessor channel duty for ${duty.stageId}`);
+  }
+
+  if (!state.channelStage) {
+    if (duty.rangeIndex !== 0 || duty.channelStart !== 0) {
+      throw new Error(`postprocessor ${duty.stageId} must begin at output channel 0`);
+    }
+    const input = state.current;
+    if (!input?.buffer) {
+      throw new Error(`postprocessor ${duty.stageId} has no input buffer`);
+    }
+    const outH = Math.floor((input.outH + 2 - 3) / 1) + 1;
+    const outW = Math.floor((input.outW + 2 - 3) / 1) + 1;
+    const outputBuffer = createEmptyBuffer(device, totalChannels * outH * outW * 4);
+    state.channelStage = {
+      layerIndex,
+      stageIndex: duty.stageIndex,
+      stageId: duty.stageId,
+      rangeCount: duty.rangeCount,
+      nextRangeIndex: 0,
+      nextChannelStart: 0,
+      input,
+      outputBuffer,
+      outC: totalChannels,
+      outH,
+      outW,
+    };
+  }
+
+  const active = state.channelStage;
+  if (active.layerIndex !== layerIndex
+      || active.stageIndex !== duty.stageIndex
+      || active.stageId !== duty.stageId
+      || active.rangeCount !== duty.rangeCount
+      || duty.rangeIndex !== active.nextRangeIndex
+      || duty.channelStart !== active.nextChannelStart) {
+    throw new Error(
+      `postprocessor ${duty.stageId} expected range ${active.nextRangeIndex} `
+      + `at channel ${active.nextChannelStart}`,
+    );
+  }
+
+  dispatchConv2dChannelRange(
+    device,
+    encoder,
+    active.input.buffer,
+    state.weights.convLayers[layerIndex].weight,
+    state.weights.convLayers[layerIndex].bias,
+    active.outputBuffer,
+    {
+      inC: active.input.outC,
+      inH: active.input.outH,
+      inW: active.input.outW,
+      outC: totalChannels,
+      kH: 3,
+      kW: 3,
+      padH: 1,
+      padW: 1,
+      strideH: 1,
+      strideW: 1,
+      applyRelu: !isLast,
+      resourceContext: state.resourceContext,
+    },
+    {
+      channelStart: duty.channelStart,
+      channelCount: duty.channelCount,
+    },
+  );
+  active.nextRangeIndex++;
+  active.nextChannelStart = duty.channelEnd;
+  const rangeComplete = active.nextRangeIndex === active.rangeCount;
+  const channelsComplete = active.nextChannelStart === totalChannels;
+  if (rangeComplete !== channelsComplete) {
+    throw new Error(`postprocessor ${duty.stageId} range count disagrees with channel coverage`);
+  }
+  if (rangeComplete) {
+    state.current = {
+      buffer: active.outputBuffer,
+      outC: totalChannels,
+      outH: active.outH,
+      outW: active.outW,
+    };
+    state.channelStage = null;
+    state.nextStageIndex++;
+  }
+  return {
+    plane: state.plane,
+    stageIndex: duty.stageIndex,
+    stageId: duty.stageId,
+    rangeIndex: duty.rangeIndex,
+    rangeCount: duty.rangeCount,
+    channelStart: duty.channelStart,
+    channelEnd: duty.channelEnd,
+    complete: state.complete,
+  };
+}
+
+/**
+ * Encode one exact stage for one plane.
+ *
+ * The caller may invoke all stages into one encoder (legacy route) or finish
+ * and submit after each stage (cooperative route). State enforces the dependency
+ * order so skipped, repeated, or out-of-order command duties fail loud.
+ */
+function dispatchPostProcessorPlaneStage(device, encoder, state, stageIndex) {
+  if (device !== state?.device) {
+    throw new Error('postprocessor plane state belongs to a different GPUDevice');
+  }
+  if (!Number.isSafeInteger(stageIndex)
+      || stageIndex < 0
+      || stageIndex >= POST_PROCESSOR_PLANE_STAGE_IDS.length) {
+    throw new RangeError(
+      `postprocessor stage must be an integer in [0, ${POST_PROCESSOR_PLANE_STAGE_IDS.length})`,
+    );
+  }
+  if (stageIndex !== state.nextStageIndex) {
+    throw new Error(
+      `postprocessor plane ${state.plane} expected stage ${state.nextStageIndex}, got ${stageIndex}`,
+    );
+  }
+
+  const {
+    inChannels,
+    scaleFactor,
+    planeSize,
+    lastConvOut,
+  } = POST_CONFIG;
+  const planePixels = planeSize * planeSize;
+  const planeElements = inChannels * planePixels;
+
+  if (stageIndex === 0) {
+    const planeBuf = createEmptyBuffer(device, planeElements * 4);
+    _dispatchGatherPlane(
+      device,
+      encoder,
+      state.triplanesBuf,
+      planeBuf,
+      inChannels,
+      planeSize * planeSize * 3,
+      state.plane * planePixels,
+      planePixels,
+      state.resourceContext,
+    );
+    state.current = {
+      buffer: planeBuf,
+      outC: inChannels,
+      outH: planeSize,
+      outW: planeSize,
+    };
+  } else if (stageIndex <= 4) {
+    const layerIndex = stageIndex - 1;
+    const isLast = layerIndex === POST_CONFIG.convLayers - 1;
+    const curOutC = isLast ? lastConvOut : inChannels;
+    const convResult = dispatchConv2d(
+      device,
+      encoder,
+      state.current.buffer,
+      state.weights.convLayers[layerIndex].weight,
+      state.weights.convLayers[layerIndex].bias,
+      {
+        inC: state.current.outC,
+        inH: state.current.outH,
+        inW: state.current.outW,
+        outC: curOutC,
+        kH: 3,
+        kW: 3,
+        padH: 1,
+        padW: 1,
+        strideH: 1,
+        strideW: 1,
+      },
+    );
+    if (isLast) {
+      state.current = {
+        buffer: convResult.buffer,
+        outC: curOutC,
+        outH: convResult.outH,
+        outW: convResult.outW,
+      };
+    } else {
+      const reluBuf = dispatchActivation(
+        device,
+        encoder,
+        convResult.buffer,
+        null,
+        curOutC * convResult.outH * convResult.outW,
+        0,
+      );
+      state.current = {
+        buffer: reluBuf,
+        outC: curOutC,
+        outH: convResult.outH,
+        outW: convResult.outW,
+      };
+    }
+  } else {
+    const psResult = dispatchPixelShuffle(device, encoder, state.current.buffer, {
+      inC: lastConvOut,
+      inH: planeSize,
+      inW: planeSize,
+      scaleFactor,
+      resourceContext: state.resourceContext,
+    });
+    const outPlaneElements = state.output.C * state.output.H * state.output.W;
+    const outOffset = state.plane * outPlaneElements * 4;
+    encoder.copyBufferToBuffer(
+      psResult.buffer,
+      0,
+      state.output.buffer,
+      outOffset,
+      outPlaneElements * 4,
+    );
+    state.complete = true;
+  }
+
+  state.nextStageIndex++;
+  return {
+    plane: state.plane,
+    stageIndex,
+    stageId: POST_PROCESSOR_PLANE_STAGE_IDS[stageIndex],
+    complete: state.complete,
+  };
+}
+
+function dispatchPostProcessor(device, encoder, triplanesBuf, weights) {
+  const output = createPostProcessorOutput(device);
+
+  // Preserve the legacy route exactly: all three planes are still encoded into
+  // the caller's one command encoder and submitted by the caller as one buffer.
+  for (let plane = 0; plane < output.numPlanes; plane++) {
+    dispatchPostProcessorPlane(device, encoder, triplanesBuf, weights, output, plane);
+  }
+
+  return output;
+}
+
+// --- Internal: gather one triplane plane from strided layout ---
+
+let _gatherPipeline = null;
+
+function _dispatchGatherPlane(device, encoder, srcBuf, dstBuf, numChannels, totalSpatial, spatialOffset, spatialSize, resourceContext = null) {
+  if (resourceContext && (resourceContext.device !== device
+      || !(resourceContext.pipelines instanceof Map))) throw new Error('gather resource context belongs to another device');
+  let pipeline = resourceContext ? resourceContext.pipelines.get('gather') : _gatherPipeline;
+  // Gather: for each channel c and spatial index s in [0, spatialSize):
+  //   dst[c * spatialSize + s] = src[c * totalSpatial + spatialOffset + s]
+  if (!pipeline) {
+    pipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: {
+        module: device.createShaderModule({
+          code: `
+            struct P { numChannels: u32, totalSpatial: u32, spatialOffset: u32, spatialSize: u32, numWgX: u32 }
+            @group(0) @binding(0) var<uniform> p: P;
+            @group(0) @binding(1) var<storage, read> src: array<f32>;
+            @group(0) @binding(2) var<storage, read_write> dst: array<f32>;
+            @compute @workgroup_size(256)
+            fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+              let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+              let total = p.numChannels * p.spatialSize;
+              if (idx >= total) { return; }
+              let c = idx / p.spatialSize;
+              let s = idx % p.spatialSize;
+              dst[c * p.spatialSize + s] = src[c * p.totalSpatial + p.spatialOffset + s];
+            }
+          `,
+        }),
+        entryPoint: 'main',
+      },
+    });
+    if (resourceContext) resourceContext.pipelines.set('gather', pipeline);
+    else _gatherPipeline = pipeline;
+  }
+
+  const total = numChannels * spatialSize;
+  const totalWG = Math.ceil(total / 256);
+  const wgX = Math.min(totalWG, 65535);
+  const wgY = Math.ceil(totalWG / 65535);
+
+  const params = createUniformBuffer(device,
+    new Uint32Array([numChannels, totalSpatial, spatialOffset, spatialSize, wgX]),
+    'post-processor-gather-uniform');
+
+  const bg = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: params } },
+      { binding: 1, resource: { buffer: srcBuf } },
+      { binding: 2, resource: { buffer: dstBuf } },
+    ],
+  });
+
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
+}
+
+/**
+ * Cooperative SF3D PixelShuffle postprocessor.
+ *
+ * Each of the three triplane planes is independent. This module cuts the legacy
+ * one-command-buffer postprocessor at those dependency-safe boundaries and
+ * drives the resulting duties through the Kaminos cooperative execution facade.
+ * The convolutions within each plane stay ordered inside one command buffer.
+ */
+
+
+const POST_PROCESSOR_MANIFEST_ID = 'sf3d.post-processor-cooperative-boundaries.v0';
+const POST_PROCESSOR_BOUNDARY_ID = 'post-processor-triplane-planes';
+const POST_PROCESSOR_PLANE_COUNT = 3;
+const POST_PROCESSOR_LAYER_MANIFEST_ID =
+  'sf3d.post-processor-layer-cooperative-boundaries.v0';
+const POST_PROCESSOR_LAYER_BOUNDARY_ID = 'post-processor-triplane-stages';
+const POST_PROCESSOR_CHANNEL_MANIFEST_ID =
+  'sf3d.post-processor-channel-cooperative-boundaries.v0';
+const POST_PROCESSOR_CHANNEL_BOUNDARY_ID =
+  'post-processor-triplane-channel-ranges';
+const POST_PROCESSOR_LAYER_DUTY_COUNT =
+  POST_PROCESSOR_PLANE_COUNT * POST_PROCESSOR_PLANE_STAGE_IDS.length;
+
+function buildPostProcessorChannelDutyPlan(channelsPerDuty) {
+  const duties = [];
+  for (let plane = 0; plane < POST_PROCESSOR_PLANE_COUNT; plane++) {
+    duties.push({
+      plane,
+      kind: 'gather',
+      stageIndex: 0,
+      stageId: POST_PROCESSOR_PLANE_STAGE_IDS[0],
+    });
+    for (let layerIndex = 0; layerIndex < POST_PROCESSOR_CONV_OUTPUT_CHANNELS.length; layerIndex++) {
+      const totalChannels = POST_PROCESSOR_CONV_OUTPUT_CHANNELS[layerIndex];
+      const rangeCount = Math.ceil(totalChannels / channelsPerDuty);
+      for (let rangeIndex = 0; rangeIndex < rangeCount; rangeIndex++) {
+        const channelStart = rangeIndex * channelsPerDuty;
+        const channelEnd = Math.min(totalChannels, channelStart + channelsPerDuty);
+        duties.push({
+          plane,
+          kind: 'conv-range',
+          stageIndex: layerIndex + 1,
+          stageId: POST_PROCESSOR_PLANE_STAGE_IDS[layerIndex + 1],
+          layerIndex,
+          rangeIndex,
+          rangeCount,
+          channelStart,
+          channelCount: channelEnd - channelStart,
+          channelEnd,
+          totalChannels,
+        });
+      }
+    }
+    duties.push({
+      plane,
+      kind: 'pixel-shuffle-copy',
+      stageIndex: POST_PROCESSOR_PLANE_STAGE_IDS.length - 1,
+      stageId: POST_PROCESSOR_PLANE_STAGE_IDS.at(-1),
+    });
+  }
+  const totalDuties = duties.length;
+  return Object.freeze({
+    channelsPerDuty,
+    duties: Object.freeze(duties.map((duty, dutyIndex) => Object.freeze({
+      ...duty,
+      dutyIndex,
+      totalDuties,
+      channelsPerDuty,
+    }))),
+  });
+}
+
+function createPostProcessorChannelDutyPlan(channelsPerDuty) {
+  if (!Number.isSafeInteger(channelsPerDuty) || channelsPerDuty <= 0) {
+    throw new TypeError('channelsPerDuty must be a positive safe integer');
+  }
+  return buildPostProcessorChannelDutyPlan(channelsPerDuty);
+}
+
+function requireExactPostProcessorChannelDutyPlan(plan) {
+  if (!plan || !Number.isSafeInteger(plan.channelsPerDuty) || plan.channelsPerDuty <= 0
+      || !Array.isArray(plan.duties)) {
+    throw new TypeError('invalid postprocessor channel duty plan');
+  }
+  const expected = buildPostProcessorChannelDutyPlan(plan.channelsPerDuty);
+  if (plan.duties.length !== expected.duties.length) {
+    throw new Error('postprocessor channel duty plan has the wrong duty count');
+  }
+  for (let index = 0; index < expected.duties.length; index++) {
+    const actualDuty = plan.duties[index];
+    const expectedDuty = expected.duties[index];
+    for (const key of Object.keys(expectedDuty)) {
+      if (actualDuty?.[key] !== expectedDuty[key]) {
+        throw new Error(
+          `postprocessor channel duty plan mismatch at duty ${index} field ${key}`,
+        );
+      }
+    }
+  }
+  return expected;
+}
+
+function definePostProcessorManifest(numPlanes = POST_PROCESSOR_PLANE_COUNT) {
+  if (!Number.isSafeInteger(numPlanes) || numPlanes <= 0) {
+    throw new TypeError('numPlanes must be a positive safe integer');
+  }
+  if (numPlanes !== POST_PROCESSOR_PLANE_COUNT) {
+    throw new RangeError(`SF3D postprocessor must declare exactly ${POST_PROCESSOR_PLANE_COUNT} planes`);
+  }
+  return defineWebGpuCooperativeBoundaryManifest({
+    manifestId: POST_PROCESSOR_MANIFEST_ID,
+    routeId: SF3D_ROUTE_ID,
+    phases: [
+      {
+        phaseId: 'triplane-post-processor',
+        boundaries: [
+          {
+            boundaryId: POST_PROCESSOR_BOUNDARY_ID,
+            kind: 'gpu-command',
+            unit: 'triplane-plane',
+            totalItems: numPlanes,
+            progressWeight: numPlanes,
+            commandDutyKind: 'compute',
+            chunking: { mode: 'fixed', chunkItems: 1 },
+            yieldPolicy: 'after-duty',
+            resources: {
+              retain: ['triplane.low-resolution', 'post-processor.weights'],
+              produce: ['triplane.high-resolution'],
+              release: [],
+            },
+          },
+        ],
+      },
+    ],
+    metadata: { source: 'sf3d-webgpu-cooperative-post-processor' },
+  });
+}
+
+function definePostProcessorLayerManifest() {
+  return defineWebGpuCooperativeBoundaryManifest({
+    manifestId: POST_PROCESSOR_LAYER_MANIFEST_ID,
+    routeId: SF3D_ROUTE_ID,
+    phases: [
+      {
+        phaseId: 'triplane-post-processor',
+        boundaries: [
+          {
+            boundaryId: POST_PROCESSOR_LAYER_BOUNDARY_ID,
+            kind: 'gpu-command',
+            unit: 'post-processor-stage',
+            totalItems: POST_PROCESSOR_LAYER_DUTY_COUNT,
+            progressWeight: POST_PROCESSOR_LAYER_DUTY_COUNT,
+            commandDutyKind: 'compute',
+            chunking: { mode: 'fixed', chunkItems: 1 },
+            yieldPolicy: 'after-duty',
+            resources: {
+              retain: [
+                'triplane.low-resolution',
+                'post-processor.weights',
+                'post-processor.intermediates',
+              ],
+              produce: ['triplane.high-resolution'],
+              release: [],
+            },
+          },
+        ],
+      },
+    ],
+    metadata: { source: 'sf3d-webgpu-cooperative-post-processor-layers' },
+  });
+}
+
+function definePostProcessorChannelManifest(channelsPerDuty) {
+  const plan = createPostProcessorChannelDutyPlan(channelsPerDuty);
+  return defineWebGpuCooperativeBoundaryManifest({
+    manifestId: POST_PROCESSOR_CHANNEL_MANIFEST_ID,
+    routeId: SF3D_ROUTE_ID,
+    phases: [
+      {
+        phaseId: 'triplane-post-processor',
+        boundaries: [
+          {
+            boundaryId: POST_PROCESSOR_CHANNEL_BOUNDARY_ID,
+            kind: 'gpu-command',
+            unit: 'post-processor-channel-duty',
+            totalItems: plan.duties.length,
+            progressWeight: plan.duties.length,
+            commandDutyKind: 'compute',
+            chunking: { mode: 'fixed', chunkItems: 1 },
+            yieldPolicy: 'after-duty',
+            resources: {
+              retain: [
+                'triplane.low-resolution',
+                'post-processor.weights',
+                'post-processor.intermediates',
+              ],
+              produce: ['triplane.high-resolution'],
+              release: [],
+            },
+            metadata: { channelsPerDuty },
+          },
+        ],
+      },
+    ],
+    metadata: {
+      source: 'sf3d-webgpu-cooperative-post-processor-channels',
+      channelsPerDuty,
+    },
+  });
+}
+
+/**
+ * Shared boundary driver used by production and deterministic tests.
+ */
+async function drivePostProcessorCooperativeBoundary(cooperative, options) {
+  const {
+    numPlanes = POST_PROCESSOR_PLANE_COUNT,
+    encodePlane,
+  } = options;
+  const gpu = cooperative.startBoundary(POST_PROCESSOR_BOUNDARY_ID);
+  let completedPlanes = 0;
+
+  for (let plane = 0; plane < numPlanes; plane++) {
+    const range = gpu.nextRange();
+    if (!range) {
+      throw new Error(`cooperative postprocessor exhausted ranges before plane ${plane}`);
+    }
+    if (range.itemStart !== plane || range.itemEnd !== plane + 1) {
+      throw new Error(
+        `cooperative postprocessor range ${range.itemStart}-${range.itemEnd} does not match plane ${plane}`,
+      );
+    }
+    // kit >=0.1.41: encode returns the command buffer(s); the kit owns queue
+    // submission (submit callbacks are unsupported so bounded-prefix can track
+    // in-flight duties). Byte-identical: same command buffer, same queue order.
+    await gpu.runGpuDuty(range, {
+      encode: () => encodePlane({ plane, range }),
+    });
+    completedPlanes++;
+  }
+
+  if (gpu.nextRange() != null) {
+    throw new Error('cooperative postprocessor left ranges unconsumed');
+  }
+  return { completedPlanes, totalPlanes: numPlanes };
+}
+
+async function drivePostProcessorLayerBoundary(cooperative, options) {
+  const {
+    encodeStage,
+    now = () => globalThis.performance?.now?.() ?? Date.now(),
+  } = options;
+  const gpu = cooperative.startBoundary(POST_PROCESSOR_LAYER_BOUNDARY_ID);
+  const telemetry = [];
+
+  for (let dutyIndex = 0; dutyIndex < POST_PROCESSOR_LAYER_DUTY_COUNT; dutyIndex++) {
+    const range = gpu.nextRange();
+    if (!range) {
+      throw new Error(`cooperative postprocessor exhausted ranges before duty ${dutyIndex}`);
+    }
+    if (range.itemStart !== dutyIndex || range.itemEnd !== dutyIndex + 1) {
+      throw new Error(
+        `cooperative postprocessor range ${range.itemStart}-${range.itemEnd} `
+        + `does not match duty ${dutyIndex}`,
+      );
+    }
+    const plane = Math.floor(dutyIndex / POST_PROCESSOR_PLANE_STAGE_IDS.length);
+    const stageIndex = dutyIndex % POST_PROCESSOR_PLANE_STAGE_IDS.length;
+    const stageId = POST_PROCESSOR_PLANE_STAGE_IDS[stageIndex];
+    const timing = {
+      dutyIndex,
+      plane,
+      stageIndex,
+      stageId,
+      dutyStartedAtMs: now(),
+      encodeStartedAtMs: null,
+      encodeCompletedAtMs: null,
+      submitStartedAtMs: null,
+      submitCompletedAtMs: null,
+      dutyCompletedAtMs: null,
+      encodeMs: null,
+      submitMs: null,
+      dutyMs: null,
+    };
+
+    // kit >=0.1.41: encode returns the command buffer; the kit submits it. The
+    // per-duty submit interval is now kit-owned (submit* timing stays null); the
+    // trivial queue.submit call it previously measured is captured by the kit's
+    // own settlement telemetry. encode + duty timing are preserved.
+    await gpu.runGpuDuty(range, {
+      encode: () => {
+        timing.encodeStartedAtMs = now();
+        const commandBuffer = encodeStage({
+          dutyIndex,
+          plane,
+          stageIndex,
+          stageId,
+          range,
+        });
+        timing.encodeCompletedAtMs = now();
+        timing.encodeMs = timing.encodeCompletedAtMs - timing.encodeStartedAtMs;
+        return commandBuffer;
+      },
+    });
+    timing.dutyCompletedAtMs = now();
+    timing.dutyMs = timing.dutyCompletedAtMs - timing.dutyStartedAtMs;
+    telemetry.push(Object.freeze(timing));
+  }
+
+  if (gpu.nextRange() != null) {
+    throw new Error('cooperative postprocessor left ranges unconsumed');
+  }
+  return {
+    completedDuties: telemetry.length,
+    totalDuties: POST_PROCESSOR_LAYER_DUTY_COUNT,
+    telemetry: Object.freeze(telemetry),
+  };
+}
+
+async function drivePostProcessorChannelBoundary(cooperative, options) {
+  const {
+    plan: suppliedPlan,
+    encodeDuty,
+    now = () => globalThis.performance?.now?.() ?? Date.now(),
+  } = options;
+  const plan = requireExactPostProcessorChannelDutyPlan(suppliedPlan);
+  for (const name of ['beforeDuty', 'afterDuty', 'withDutyGroup']) {
+    if (options[name] != null && typeof options[name] !== 'function') {
+      throw new TypeError(name + ' must be a function');
+    }
+  }
+  const gpu = cooperative.startBoundary(POST_PROCESSOR_CHANNEL_BOUNDARY_ID);
+  const telemetry = [];
+
+  const runDuty = async duty => {
+    await options.beforeDuty?.(duty);
+    const range = gpu.nextRange();
+    if (!range) {
+      throw new Error(
+        `cooperative postprocessor exhausted ranges before channel duty ${duty.dutyIndex}`,
+      );
+    }
+    if (range.itemStart !== duty.dutyIndex || range.itemEnd !== duty.dutyIndex + 1) {
+      throw new Error(
+        `cooperative postprocessor range ${range.itemStart}-${range.itemEnd} `
+        + `does not match channel duty ${duty.dutyIndex}`,
+      );
+    }
+    const timing = {
+      ...duty,
+      dutyStartedAtMs: now(),
+      encodeStartedAtMs: null,
+      encodeCompletedAtMs: null,
+      submitStartedAtMs: null,
+      submitCompletedAtMs: null,
+      dutyCompletedAtMs: null,
+      encodeMs: null,
+      submitMs: null,
+      dutyMs: null,
+    };
+    // kit >=0.1.41: encode returns the command buffer; the kit submits it (submit
+    // callbacks unsupported so bounded-prefix can own in-flight tracking). This
+    // is the boundary bounded-prefix actually applies to. Byte-identical output.
+    await gpu.runGpuDuty(range, {
+      encode: () => {
+        timing.encodeStartedAtMs = now();
+        const commandBuffer = encodeDuty(duty, range);
+        timing.encodeCompletedAtMs = now();
+        timing.encodeMs = timing.encodeCompletedAtMs - timing.encodeStartedAtMs;
+        return commandBuffer;
+      },
+    });
+    timing.dutyCompletedAtMs = now();
+    timing.dutyMs = timing.dutyCompletedAtMs - timing.dutyStartedAtMs;
+    telemetry.push(Object.freeze(timing));
+    await options.afterDuty?.(duty);
+  };
+  for (let first = 0; first < plan.duties.length;) {
+    const head = plan.duties[first];
+    let end = first + 1;
+    while (end < plan.duties.length
+        && plan.duties[end].plane === head.plane
+        && plan.duties[end].stageIndex === head.stageIndex) end++;
+    const group = Object.freeze({
+      plane: head.plane, stageIndex: head.stageIndex, stageId: head.stageId,
+      kind: head.kind, layerIndex: head.layerIndex ?? null,
+      duties: Object.freeze(plan.duties.slice(first, end)),
+    });
+    let entered = false, completed = false;
+    const work = async () => {
+      if (entered) throw new Error('postprocessor duty group may execute exactly once');
+      entered = true;
+      for (const duty of group.duties) await runDuty(duty);
+      completed = true;
+    };
+    if (options.withDutyGroup) await options.withDutyGroup(group, work);
+    else await work();
+    if (!completed) throw new Error('postprocessor duty group did not execute completely');
+    first = end;
+  }
+  if (gpu.nextRange() != null) {
+    throw new Error('cooperative postprocessor left channel ranges unconsumed');
+  }
+  return {
+    completedDuties: telemetry.length,
+    totalDuties: plan.duties.length,
+    telemetry: Object.freeze(telemetry),
+  };
+}
+
+async function runCooperativePostProcessor(options) {
+  const {
+    device,
+    triplanesBuf,
+    weights,
+    schedulingMode = 'cooperative',
+    dutyGranularity = 'plane',
+    channelsPerDuty = 16,
+    onProgress,
+    signal,
+    invocationId = `sf3d:post-processor:${schedulingMode}`,
+    // Bounded-prefix completion (kit >=0.1.41): allow up to maxInFlightGpuDuties
+    // GPU duties to be in flight before the facade fences a prefix, instead of
+    // strict per-duty prefix fencing. Default null → strict-prefix (unchanged).
+    // Per Cranial's composition contract, bounded-prefix is opt-in ONLY on the
+    // fixed postprocessor channel-range boundary; plane/layer/adaptive stay
+    // strict. The kit itself also rejects bounded-prefix on adaptive boundaries
+    // and outside cooperative scheduling.
+    completionPolicy = 'strict-prefix',
+    maxInFlightGpuDuties = null,
+  } = options;
+  const residentWork = options.residentWork ?? null;
+  const withGroupWeights = options.withGroupWeights ?? null;
+  if (residentWork || withGroupWeights || options.onBeforeDuty || options.onAfterDuty) {
+    if (dutyGranularity !== 'channel-range' || schedulingMode !== 'cooperative'
+        || completionPolicy !== 'strict-prefix') {
+      throw new Error('resident postprocessor hooks require cooperative strict-prefix channel-range execution');
+    }
+    for (const name of ['onBeforeDuty', 'onAfterDuty', 'withGroupWeights']) {
+      if (options[name] != null && typeof options[name] !== 'function') throw new TypeError(name + ' must be a function');
+    }
+  }
+  if (residentWork && (residentWork.device !== device || residentWork._postProcessorWorkOwner)) {
+    throw new Error('postprocessor work device mismatch or cleanup is quarantined');
+  }
+  if (residentWork && typeof options.onBeforeDuty !== 'function') {
+    throw new TypeError('resident postprocessor requires a fresh pre-allocation observer');
+  }
+  if (!['plane', 'layer', 'channel-range'].includes(dutyGranularity)) {
+    throw new RangeError(`unsupported postprocessor duty granularity: ${dutyGranularity}`);
+  }
+  if (!Number.isSafeInteger(channelsPerDuty) || channelsPerDuty <= 0) {
+    throw new TypeError('channelsPerDuty must be a positive safe integer');
+  }
+  if (!['strict-prefix', 'bounded-prefix'].includes(completionPolicy)) {
+    throw new RangeError(`completionPolicy must be strict-prefix or bounded-prefix; got ${completionPolicy}`);
+  }
+  if (completionPolicy === 'bounded-prefix') {
+    // Bounded-prefix is only lawful on the fixed channel-range boundary under
+    // cooperative scheduling (Cranial contract + kit constraint). Fail loud
+    // rather than silently downgrade.
+    if (dutyGranularity !== 'channel-range') {
+      throw new RangeError(`bounded-prefix completion is only supported for channel-range duties; got ${dutyGranularity}`);
+    }
+    if (schedulingMode !== 'cooperative') {
+      throw new RangeError('bounded-prefix completion requires cooperative scheduling');
+    }
+    if (!Number.isSafeInteger(maxInFlightGpuDuties) || maxInFlightGpuDuties <= 0) {
+      throw new TypeError('bounded-prefix completion requires a positive maxInFlightGpuDuties');
+    }
+  } else if (maxInFlightGpuDuties != null) {
+    throw new TypeError('maxInFlightGpuDuties is available only with bounded-prefix completion');
+  }
+  const channelPlan = dutyGranularity === 'channel-range'
+    ? createPostProcessorChannelDutyPlan(channelsPerDuty)
+    : null;
+  const manifest = dutyGranularity === 'channel-range'
+    ? definePostProcessorChannelManifest(channelsPerDuty)
+    : dutyGranularity === 'layer'
+      ? definePostProcessorLayerManifest()
+      : definePostProcessorManifest();
+  const queueFences = [];
+  const browserYields = [];
+  const runtime = createSf3dCooperativeRuntime(device, {
+    foregroundOpportunities: options.foregroundOpportunities ?? null,
+    onQueueFenceResolved: event => queueFences.push(Object.freeze({ ...event })),
+    onBrowserYield: event => browserYields.push(Object.freeze({ ...event })),
+  });
+  const execution = createWebGpuCooperativeExecution({
+    runtime,
+    manifest,
+    invocationId,
+    schedulingMode,
+    onProgress,
+    signal,
+    // Only the fixed channel-range boundary carries bounded-prefix; all other
+    // granularities and the default keep strict-prefix (the kit rejects
+    // bounded-prefix on adaptive boundaries regardless).
+    completionPolicy,
+    ...(completionPolicy === 'bounded-prefix' ? { maxInFlightGpuDuties } : {}),
+  });
+  const owner = residentWork ? {
+    allocations: [], buffers: new Set(), resourceContext: {device, pipelines: new Map()},
+  } : null;
+  if (owner) residentWork._postProcessorWorkOwner = owner;
+  const record = fn => owner
+    ? captureGpuBufferAllocations(fn, {ownedAllocations:owner.allocations}).value : fn();
+  let output, succeeded = false, failed = false, failure;
+  let dutyTelemetry = [];
+  try {
+  if (options.onBeforeDuty) await options.onBeforeDuty({
+    kind:'output-allocation', workGpuBytes:70778880, plane:null, dutyIndex:null,
+  }, null);
+  output = record(() => createPostProcessorOutput(device));
+  await execution.run(async (cooperative) => {
+    if (dutyGranularity === 'channel-range') {
+      const planeStates = Array(output.numPlanes).fill(null);
+      const stateFor = plane => {
+        if (!planeStates[plane]) {
+          planeStates[plane] = createPostProcessorPlaneState(
+            device, triplanesBuf, weights, output, plane);
+          if (owner) planeStates[plane].resourceContext = owner.resourceContext;
+        }
+        return planeStates[plane];
+      };
+      const driven = await drivePostProcessorChannelBoundary(cooperative, {
+        plan: channelPlan,
+        beforeDuty: options.onBeforeDuty
+          ? duty => options.onBeforeDuty({...duty,
+            ...describePostProcessorDutyDemand(duty)}, stateFor(duty.plane)) : null,
+        withDutyGroup: withGroupWeights ? async (group, work) => withGroupWeights(group, async selected => {
+          const state = stateFor(group.plane);
+          state.weights = selected;
+          try { return await work(); }
+          finally { state.weights = {convLayers:[null,null,null,null]}; }
+        }) : null,
+        async afterDuty(duty) {
+          const state = stateFor(duty.plane);
+          if (owner) {
+            const keep = new Set([output.buffer]);
+            if (!state.complete) {
+              if (state.current?.buffer) keep.add(state.current.buffer);
+              if (state.channelStage) {
+                keep.add(state.channelStage.input.buffer);
+                keep.add(state.channelStage.outputBuffer);
+              }
+            }
+            await retirePostProcessorWork(residentWork, keep);
+          }
+          await options.onAfterDuty?.(duty, state);
+        },
+        encodeDuty(duty) {
+          const state = stateFor(duty.plane);
+          const encoder = device.createCommandEncoder({
+            label: `post-processor-plane-${duty.plane}-${duty.stageId}`
+              + (duty.kind === 'conv-range' ? `-${duty.rangeIndex}` : ''),
+          });
+          record(() => dispatchPostProcessorChannelDuty(
+            device,
+            encoder,
+            state,
+            duty,
+          ));
+          return encoder.finish();
+        },
+      });
+      dutyTelemetry = driven.telemetry;
+      return;
+    }
+    if (dutyGranularity === 'layer') {
+      const planeStates = Array(output.numPlanes).fill(null);
+      const driven = await drivePostProcessorLayerBoundary(cooperative, {
+        encodeStage({ plane, stageIndex, stageId }) {
+          if (!planeStates[plane]) {
+            planeStates[plane] = createPostProcessorPlaneState(
+              device,
+              triplanesBuf,
+              weights,
+              output,
+              plane,
+            );
+          }
+          const encoder = device.createCommandEncoder({
+            label: `post-processor-plane-${plane}-${stageId}`,
+          });
+          dispatchPostProcessorPlaneStage(
+            device,
+            encoder,
+            planeStates[plane],
+            stageIndex,
+          );
+          return encoder.finish();
+        },
+      });
+      dutyTelemetry = driven.telemetry;
+      return;
+    }
+
+    await drivePostProcessorCooperativeBoundary(cooperative, {
+      numPlanes: output.numPlanes,
+      encodePlane({ plane }) {
+        const encoder = device.createCommandEncoder({
+          label: `post-processor-plane-${plane}`,
+        });
+        dispatchPostProcessorPlane(
+          device,
+          encoder,
+          triplanesBuf,
+          weights,
+          output,
+          plane,
+        );
+        return encoder.finish();
+      },
+    });
+  });
+
+  const report = execution.finish();
+  succeeded = true;
+  return {
+    result: output,
+    report: Object.freeze({
+      ...report,
+      adapterTelemetry: Object.freeze({
+        dutyGranularity,
+        residentWork: Boolean(owner),
+        channelsPerDuty: dutyGranularity === 'channel-range' ? channelsPerDuty : null,
+        stageDuties: Object.freeze(dutyTelemetry),
+        queueFences: Object.freeze(queueFences),
+        browserYields: Object.freeze(browserYields),
+      }),
+    }),
+  };
+  } catch (error) { failed = true; failure = error; throw error; }
+  finally {
+    if (owner) {
+      try {
+        await retirePostProcessorWork(residentWork, succeeded ? new Set([output.buffer]) : new Set());
+        // Transfer only the complete output after every other owned store retired.
+        if (succeeded) owner.buffers.delete(output.buffer);
+        residentWork._postProcessorWorkOwner = null;
+      } catch (error) {
+        throw failed ? new AggregateError([failure,error], 'postprocessor failed and cleanup is unresolved', {cause:failure}) : error;
+      }
+    }
+  }
+}
+
+/** Fresh new-allocation demand, never destruction credit or physical fit. */
+function describePostProcessorDutyDemand(duty) {
+  if (duty.kind === 'gather') return {workGpuBytes:1024*96*96*4+20};
+  if (duty.kind === 'pixel-shuffle-copy') return {workGpuBytes:40*384*384*4+24};
+  if (duty.kind === 'conv-range') return {
+    workGpuBytes:(duty.rangeIndex === 0 ? duty.totalChannels*96*96*4 : 0)+64,
+  };
+  throw new Error('exact postprocessor duty required');
+}
+
+/** Preserve unresolved inventories on the caller's stage handle for recovery. */
+async function retirePostProcessorWork(handle, keep = new Set()) {
+  const owner = handle._postProcessorWorkOwner;
+  if (!owner) return;
+  for (const allocation of owner.allocations) owner.buffers.add(allocation.buffer);
+  owner.allocations.length = 0;
+  await handle.device.queue.onSubmittedWorkDone();
+  const errors = [];
+  for (const buffer of owner.buffers) if (!keep.has(buffer)) {
+    try { buffer.destroy(); owner.buffers.delete(buffer); }
+    catch (error) { errors.push(error); }
+  }
+  if (errors.length) throw new AggregateError(errors, 'postprocessor work retirement failed');
+}
+
+const gridSampleWGSL = "/**\r\n * Grid sample (bilinear) compute shader.\r\n *\r\n * Implements torch.nn.functional.grid_sample with:\r\n *   - mode='bilinear'\r\n *   - align_corners=True\r\n *   - padding_mode='zeros' (out-of-bound → 0)\r\n *\r\n * Used for SF3D's triplane query: sample features from 3 planes at\r\n * arbitrary 2D coordinates derived from 3D positions.\r\n *\r\n * Input feature map: [C, H, W]\r\n * Grid coordinates: [N, 2] (normalized [-1, 1])\r\n * Output: [N, C]\r\n */\r\n\r\nstruct Params {\r\n  C: u32,    // channels\r\n  H: u32,    // input height\r\n  W: u32,    // input width\r\n  N: u32,    // number of sample points\r\n  numWorkgroupsX: u32,\r\n}\r\n\r\n@group(0) @binding(0) var<uniform> params: Params;\r\n@group(0) @binding(1) var<storage, read> input: array<f32>;   // [C, H, W]\r\n@group(0) @binding(2) var<storage, read> grid: array<f32>;    // [N, 2] (x, y in [-1, 1])\r\n@group(0) @binding(3) var<storage, read_write> output: array<f32>; // [N, C]\r\n\r\nconst WG_SIZE: u32 = 256;\r\n\r\n@compute @workgroup_size(WG_SIZE)\r\nfn grid_sample_main(@builtin(global_invocation_id) gid: vec3<u32>,\r\n                    @builtin(workgroup_id) wgid: vec3<u32>,\r\n                    @builtin(local_invocation_id) lid: vec3<u32>) {\r\n  let linearWG = wgid.x + wgid.y * params.numWorkgroupsX;\r\n  let idx = linearWG * WG_SIZE + lid.x;\r\n\r\n  let total = params.N * params.C;\r\n  if (idx >= total) { return; }\r\n\r\n  let n = idx / params.C;\r\n  let c = idx % params.C;\r\n\r\n  // Grid coordinates in [-1, 1], align_corners=True:\r\n  // pixel = (grid + 1) / 2 * (size - 1)\r\n  let gx = grid[n * 2];\r\n  let gy = grid[n * 2 + 1];\r\n\r\n  let px = (gx + 1.0) * 0.5 * f32(params.W - 1);\r\n  let py = (gy + 1.0) * 0.5 * f32(params.H - 1);\r\n\r\n  let x0 = i32(floor(px));\r\n  let y0 = i32(floor(py));\r\n  let x1 = x0 + 1;\r\n  let y1 = y0 + 1;\r\n\r\n  let fx = px - f32(x0);\r\n  let fy = py - f32(y0);\r\n\r\n  let H = i32(params.H);\r\n  let W = i32(params.W);\r\n\r\n  // Sample 4 corners with bounds checking (zeros padding)\r\n  var v00: f32 = 0.0;\r\n  var v01: f32 = 0.0;\r\n  var v10: f32 = 0.0;\r\n  var v11: f32 = 0.0;\r\n\r\n  if (x0 >= 0 && x0 < W && y0 >= 0 && y0 < H) {\r\n    v00 = input[c * params.H * params.W + u32(y0) * params.W + u32(x0)];\r\n  }\r\n  if (x1 >= 0 && x1 < W && y0 >= 0 && y0 < H) {\r\n    v01 = input[c * params.H * params.W + u32(y0) * params.W + u32(x1)];\r\n  }\r\n  if (x0 >= 0 && x0 < W && y1 >= 0 && y1 < H) {\r\n    v10 = input[c * params.H * params.W + u32(y1) * params.W + u32(x0)];\r\n  }\r\n  if (x1 >= 0 && x1 < W && y1 >= 0 && y1 < H) {\r\n    v11 = input[c * params.H * params.W + u32(y1) * params.W + u32(x1)];\r\n  }\r\n\r\n  // Bilinear interpolation\r\n  let top = v00 * (1.0 - fx) + v01 * fx;\r\n  let bot = v10 * (1.0 - fx) + v11 * fx;\r\n  let result = top * (1.0 - fy) + bot * fy;\r\n\r\n  // Output layout: [N, C]\r\n  output[n * params.C + c] = result;\r\n}\r\n";
+
+/**
+ * triplane_decoder.js — Triplane query and MaterialMLP decoder for SF3D.
+ *
+ * Triplane query (from system.py query_triplane):
+ *   For each 3D point [x, y, z]:
+ *     - Project onto XY plane → sample features[0] at (x, y) → [40]
+ *     - Project onto XZ plane → sample features[1] at (x, z) → [40]
+ *     - Project onto YZ plane → sample features[2] at (y, z) → [40]
+ *     - Concatenate → [120]
+ *
+ * MaterialMLP decoder (from network.py MaterialMLP):
+ *   in_channels: 120, n_neurons: 64, activation: silu
+ *   Heads:
+ *     density:        Linear(120→64)+SiLU, Linear(64→64)+SiLU, Linear(64→1)  + bias(-1) + trunc_exp
+ *     features:       Linear(120→64)+SiLU, Linear(64→64)+SiLU, Linear(64→64)+SiLU, Linear(64→3) + sigmoid
+ *     perturb_normal: Linear(120→64)+SiLU, Linear(64→64)+SiLU, Linear(64→64)+SiLU, Linear(64→3) + normalize
+ *     vertex_offset:  Linear(120→64)+SiLU, Linear(64→64)+SiLU, Linear(64→3)
+ */
+
+
+const WG_SIZE$1 = 256;
+const MAX_WG = 65535;
+function splitWG$1(total) {
+  if (total <= MAX_WG) return [total, 1];
+  return [MAX_WG, Math.ceil(total / MAX_WG)];
+}
+function ceilDiv$1(a, b) { return Math.ceil(a / b); }
+
+const DECODER_CONFIG = {
+  inChannels: 120,   // 3 planes × 40 features
+  nNeurons: 64,
+  planeChannels: 40,
+  radius: 0.87};
+
+class TriplaneDecoder {
+  constructor(device) {
+    this.device = device;
+    this.pipelines = {};
+    this._uniformCache = new Map();
+    // Optional scratch-slot provider. When set (during an arena-backed decode),
+    // _alloc(slotKey, size) returns a reusable pre-allocated buffer bound to that
+    // stable slot key instead of allocating a fresh transient buffer. Default
+    // null → createEmptyBuffer (unchanged behavior). Slot keys are deterministic
+    // per decode call site (+ plane/head/layer index), which is exactly the
+    // reusable slot graph the arena is proven against.
+    this._slotProvider = null;
+  }
+
+  /**
+   * Allocate (or reuse) a scratch buffer for a decode dispatch.
+   * @param {string} slotKey  stable slot identity (arena binding key)
+   * @param {number} size     byte size needed for this range's N
+   */
+  _alloc(slotKey, size) {
+    if (this._slotProvider) return this._slotProvider.acquire(slotKey, size);
+    // Pass the slot key as the buffer label so allocation capture records slot
+    // identity (the arena binding key), not just the byte size.
+    return createEmptyBuffer(this.device, size, 0, slotKey);
+  }
+
+  init() {
+    const device = this.device;
+    const make = (code, entry) => device.createComputePipeline({
+      layout: 'auto',
+      compute: { module: device.createShaderModule({ code }), entryPoint: entry },
+    });
+
+    this.pipelines.gridSample = make(gridSampleWGSL, 'grid_sample_main');
+    this.pipelines.linear = make(linearWGSL, 'main');
+    this.pipelines.activation = make(activationsWGSL, 'activation_main');
+
+    // Concat 3 sampled planes: [N, 40] × 3 → [N, 120]
+    this.pipelines.concatPlanes = make(`
+      struct P { N: u32, C: u32, numWgX: u32 }
+      @group(0) @binding(0) var<uniform> p: P;
+      @group(0) @binding(1) var<storage, read> plane0: array<f32>;
+      @group(0) @binding(2) var<storage, read> plane1: array<f32>;
+      @group(0) @binding(3) var<storage, read> plane2: array<f32>;
+      @group(0) @binding(4) var<storage, read_write> output: array<f32>;
+      @compute @workgroup_size(256)
+      fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+        let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+        let total = p.N * p.C * 3u;
+        if (idx >= total) { return; }
+        let n = idx / (p.C * 3u);
+        let rem = idx % (p.C * 3u);
+        let planeIdx = rem / p.C;
+        let c = rem % p.C;
+        let srcIdx = n * p.C + c;
+        switch planeIdx {
+          case 0u: { output[idx] = plane0[srcIdx]; }
+          case 1u: { output[idx] = plane1[srcIdx]; }
+          case 2u: { output[idx] = plane2[srcIdx]; }
+          default: {}
+        }
+      }
+    `, 'main');
+
+    // trunc_exp: output = exp(input)
+    // normalize_channel_last: output[n, :] = input[n, :] / ||input[n, :]||
+    // These are small enough to use inline shaders
+    this.pipelines.truncExp = make(`
+      struct P { count: u32, numWgX: u32 }
+      @group(0) @binding(0) var<uniform> p: P;
+      @group(0) @binding(1) var<storage, read> input: array<f32>;
+      @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+      @compute @workgroup_size(256)
+      fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+        let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+        if (idx >= p.count) { return; }
+        output[idx] = exp(input[idx]);
+      }
+    `, 'main');
+
+    this.pipelines.sigmoid = make(`
+      struct P { count: u32, numWgX: u32 }
+      @group(0) @binding(0) var<uniform> p: P;
+      @group(0) @binding(1) var<storage, read> input: array<f32>;
+      @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+      @compute @workgroup_size(256)
+      fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+        let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+        if (idx >= p.count) { return; }
+        output[idx] = 1.0 / (1.0 + exp(-input[idx]));
+      }
+    `, 'main');
+
+    this.pipelines.normalize3 = make(`
+      struct P { N: u32, numWgX: u32 }
+      @group(0) @binding(0) var<uniform> p: P;
+      @group(0) @binding(1) var<storage, read> input: array<f32>;
+      @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+      @compute @workgroup_size(256)
+      fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+        let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+        if (idx >= p.N) { return; }
+        let base = idx * 3u;
+        let x = input[base]; let y = input[base + 1]; let z = input[base + 2];
+        let len = sqrt(x*x + y*y + z*z) + 1e-8;
+        output[base] = x / len;
+        output[base + 1] = y / len;
+        output[base + 2] = z / len;
+      }
+    `, 'main');
+
+    // Add bias (scalar broadcast to all elements)
+    this.pipelines.addBias = make(`
+      struct P { count: u32, bias: f32, numWgX: u32 }
+      @group(0) @binding(0) var<uniform> p: P;
+      @group(0) @binding(1) var<storage, read_write> data: array<f32>;
+      @compute @workgroup_size(256)
+      fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+        let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+        if (idx >= p.count) { return; }
+        data[idx] = data[idx] + p.bias;
+      }
+    `, 'main');
+  }
+
+  _cachedUniform(data) {
+    const bytes = new Uint8Array(data.buffer || data);
+    let h = 0;
+    for (let i = 0; i < bytes.length; i++) h = (h * 31 + bytes[i]) | 0;
+    const key = `td_${bytes.length}_${h}`;
+    if (this._uniformCache.has(key)) return this._uniformCache.get(key);
+    // Resident queries own the entire cache until the awaited consumer ends.
+    // Default cooperative bake captures and retires range scratch, not its
+    // persistent cached uniforms; preserve that lifetime contract.
+    let buf;
+    if (this._residentQueryWorkOwner) {
+      buf = createUniformBuffer(this.device, bytes, key);
+    } else {
+      buf = this.device.createBuffer({
+        size: Math.max(bytes.byteLength, 16),
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true,
+      });
+      new Uint8Array(buf.getMappedRange()).set(bytes);
+      buf.unmap();
+    }
+    this._uniformCache.set(key, buf);
+    return buf;
+  }
+
+  /**
+   * Query triplane features at 3D positions and decode with MaterialMLP.
+   *
+   * @param {GPUCommandEncoder} encoder
+   * @param {GPUBuffer} positionsBuf - [N, 3] query positions in model space
+   * @param {GPUBuffer} triplanesBuf - [3, 40, 384, 384] from post-processor
+   * @param {number} N - number of query points
+   * @param {Object} weights - decoder weights
+   * @param {string[]} heads - which heads to run (default: all)
+   * @returns {Object} - { density, features, perturb_normal, vertex_offset } buffers
+   */
+  decode(encoder, positionsBuf, triplanesBuf, N, weights, heads) {
+    this.device;
+    const C = DECODER_CONFIG.planeChannels; // 40
+    const H = 384, W = 384;
+    const radius = DECODER_CONFIG.radius;
+
+    // 1. Scale positions from model space to [-1, 1] for grid_sample
+    //    PyTorch: scale_tensor(positions, (-radius, radius), (-1, 1))
+    //    → pos_norm = pos / radius
+    const scaledPosBuf = this._dispatchScalePositions(encoder, positionsBuf, N, radius, 'scaledPos');
+
+    // 2. Create grid coordinates for each plane
+    //    XY plane: (x, y), XZ plane: (x, z), YZ plane: (y, z)
+    const gridXY = this._dispatchExtractGrid(encoder, scaledPosBuf, N, 0, 1, 'grid:XY'); // x, y
+    const gridXZ = this._dispatchExtractGrid(encoder, scaledPosBuf, N, 0, 2, 'grid:XZ'); // x, z
+    const gridYZ = this._dispatchExtractGrid(encoder, scaledPosBuf, N, 1, 2, 'grid:YZ'); // y, z
+
+    // 3. Grid sample each plane
+    const planeSize = C * H * W * 4; // bytes per plane
+    const sampledXY = this._dispatchGridSample(encoder, triplanesBuf, 0, gridXY, C, H, W, N, 'sampled:XY');
+    const sampledXZ = this._dispatchGridSample(encoder, triplanesBuf, planeSize, gridXZ, C, H, W, N, 'sampled:XZ');
+    const sampledYZ = this._dispatchGridSample(encoder, triplanesBuf, planeSize * 2, gridYZ, C, H, W, N, 'sampled:YZ');
+
+    // 4. Concatenate: [N, 40] × 3 → [N, 120]
+    const featuresBuf = this._dispatchConcatPlanes(encoder, sampledXY, sampledXZ, sampledYZ, N, C, 'concatFeatures');
+
+    // 5. Run MLP heads
+    const results = {};
+    const headsToRun = heads || ['density', 'features', 'perturb_normal', 'vertex_offset'];
+
+    for (const headName of headsToRun) {
+      const headLayers = weights.heads[headName];
+      results[headName] = this._dispatchMLPHead(encoder, featuresBuf, headLayers, N, headName);
+    }
+
+    return results;
+  }
+
+  // --- Scale positions: pos / radius ---
+  _dispatchScalePositions(encoder, posBuf, N, radius, slotKey = 'scaledPos') {
+    if (!this.pipelines.scalePos) {
+      this.pipelines.scalePos = this.device.createComputePipeline({
+        layout: 'auto',
+        compute: {
+          module: this.device.createShaderModule({
+            code: `
+              struct P { count: u32, invRadius: f32, numWgX: u32 }
+              @group(0) @binding(0) var<uniform> p: P;
+              @group(0) @binding(1) var<storage, read> input: array<f32>;
+              @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+              @compute @workgroup_size(256)
+              fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+                let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+                if (idx >= p.count) { return; }
+                output[idx] = input[idx] * p.invRadius;
+              }
+            `,
+          }),
+          entryPoint: 'main',
+        },
+      });
+    }
+
+    const count = N * 3;
+    const totalWG = ceilDiv$1(count, WG_SIZE$1);
+    const [wgX, wgY] = splitWG$1(totalWG);
+    const paramsData = new ArrayBuffer(12);
+    const u32 = new Uint32Array(paramsData);
+    const f32 = new Float32Array(paramsData);
+    u32[0] = count; f32[1] = 1.0 / radius; u32[2] = wgX;
+    const params = this._cachedUniform(new Uint8Array(paramsData));
+
+    const outBuf = this._alloc(slotKey, count * 4);
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.scalePos.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: posBuf } },
+        { binding: 2, resource: { buffer: outBuf } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.scalePos);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+    return outBuf;
+  }
+
+  // --- Extract 2D grid from 3D positions ---
+  _dispatchExtractGrid(encoder, posBuf, N, dim0, dim1, slotKey = 'grid') {
+    if (!this.pipelines.extractGrid) {
+      this.pipelines.extractGrid = this.device.createComputePipeline({
+        layout: 'auto',
+        compute: {
+          module: this.device.createShaderModule({
+            code: `
+              struct P { N: u32, dim0: u32, dim1: u32, numWgX: u32 }
+              @group(0) @binding(0) var<uniform> p: P;
+              @group(0) @binding(1) var<storage, read> positions: array<f32>;
+              @group(0) @binding(2) var<storage, read_write> grid: array<f32>;
+              @compute @workgroup_size(256)
+              fn main(@builtin(workgroup_id) wgid: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+                let idx = (wgid.x + wgid.y * p.numWgX) * 256u + lid.x;
+                if (idx >= p.N) { return; }
+                grid[idx * 2] = positions[idx * 3 + p.dim0];
+                grid[idx * 2 + 1] = positions[idx * 3 + p.dim1];
+              }
+            `,
+          }),
+          entryPoint: 'main',
+        },
+      });
+    }
+
+    const totalWG = ceilDiv$1(N, WG_SIZE$1);
+    const [wgX, wgY] = splitWG$1(totalWG);
+    const params = this._cachedUniform(new Uint32Array([N, dim0, dim1, wgX]));
+    const gridBuf = this._alloc(slotKey, N * 2 * 4);
+
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.extractGrid.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: posBuf } },
+        { binding: 2, resource: { buffer: gridBuf } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.extractGrid);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+    return gridBuf;
+  }
+
+  // --- Grid sample from one triplane plane ---
+  _dispatchGridSample(encoder, triplanesBuf, planeOffsetBytes, gridBuf, C, H, W, N, slotKey = 'sampled') {
+    const totalWG = ceilDiv$1(N * C, WG_SIZE$1);
+    const [wgX, wgY] = splitWG$1(totalWG);
+    const params = this._cachedUniform(new Uint32Array([C, H, W, N, wgX]));
+
+    const outBuf = this._alloc(slotKey, N * C * 4);
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.gridSample.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: triplanesBuf, offset: planeOffsetBytes, size: C * H * W * 4 } },
+        { binding: 2, resource: { buffer: gridBuf } },
+        { binding: 3, resource: { buffer: outBuf } },
+      ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.gridSample);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+    return outBuf;
+  }
+
+  // --- Concat 3 planes → [N, 120] ---
+  _dispatchConcatPlanes(encoder, plane0, plane1, plane2, N, C, slotKey = 'concatFeatures') {
+    const total = N * C * 3;
+    const totalWG = ceilDiv$1(total, WG_SIZE$1);
+    const [wgX, wgY] = splitWG$1(totalWG);
+    const params = this._cachedUniform(new Uint32Array([N, C, wgX]));
+
+    const outBuf = this._alloc(slotKey, total * 4);
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.concatPlanes.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: plane0 } },
+        { binding: 2, resource: { buffer: plane1 } },
+        { binding: 3, resource: { buffer: plane2 } },
+        { binding: 4, resource: { buffer: outBuf } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.concatPlanes);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+    return outBuf;
+  }
+
+  // --- Run one MLP head ---
+  _dispatchMLPHead(encoder, inputBuf, headLayers, N, headName) {
+    const { inChannels, nNeurons } = DECODER_CONFIG;
+
+    // Head architecture: headLayers is an array of { weight, bias } from the weight loader.
+    // All hidden layers output nNeurons (64), final layer outputs head-specific channels.
+    const HEAD_OUT_CHANNELS = { density: 1, features: 3, perturb_normal: 3, vertex_offset: 3 };
+    const outChannels = HEAD_OUT_CHANNELS[headName];
+
+    let current = inputBuf;
+    let currentDim = inChannels;
+
+    // Hidden layers: Linear + SiLU (all but the last layer). Slot keys are
+    // stable per head+layer so the arena reuses the same physical buffer for the
+    // same layer across ranges.
+    const hk = `head:${headName}`;
+    for (let i = 0; i < headLayers.length - 1; i++) {
+      const layer = headLayers[i];
+      const outBuf = this._alloc(`${hk}:lin:${i}`, N * nNeurons * 4);
+      this._dispatchLinear(encoder, current, outBuf, layer.weight, layer.bias, N, currentDim, nNeurons);
+
+      // SiLU activation
+      const siluBuf = this._dispatchSiLU(encoder, outBuf, N * nNeurons, `${hk}:silu:${i}`);
+      current = siluBuf;
+      currentDim = nNeurons;
+    }
+
+    // Final layer: Linear (no activation yet)
+    const lastLayer = headLayers[headLayers.length - 1];
+    const rawOutBuf = this._alloc(`${hk}:rawOut`, N * outChannels * 4);
+    this._dispatchLinear(encoder, current, rawOutBuf, lastLayer.weight, lastLayer.bias, N, currentDim, outChannels);
+
+    // Apply output bias and activation
+    let resultBuf = rawOutBuf;
+
+    if (headName === 'density') {
+      // bias(-1.0) then trunc_exp
+      this._dispatchAddBias(encoder, resultBuf, N * outChannels, -1);
+      const expBuf = this._dispatchTruncExp(encoder, resultBuf, N * outChannels, `${hk}:truncExp`);
+      resultBuf = expBuf;
+    } else if (headName === 'features') {
+      // sigmoid
+      resultBuf = this._dispatchSigmoid(encoder, resultBuf, N * outChannels, `${hk}:sigmoid`);
+    } else if (headName === 'perturb_normal') {
+      // normalize per-vector (3 components)
+      resultBuf = this._dispatchNormalize3(encoder, resultBuf, N, `${hk}:normalize3`);
+    }
+    // vertex_offset: no output activation
+
+    return resultBuf;
+  }
+
+  // --- Low-level dispatchers ---
+
+  _dispatchLinear(encoder, input, output, weight, bias, rows, inDim, outDim) {
+    const totalWG = ceilDiv$1(rows * outDim, WG_SIZE$1);
+    const [wgX, wgY] = splitWG$1(totalWG);
+    const params = this._cachedUniform(new Uint32Array([rows, inDim, outDim, wgX, 1]));
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.linear.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: input } },
+        { binding: 2, resource: { buffer: weight } },
+        { binding: 3, resource: { buffer: bias } },
+        { binding: 4, resource: { buffer: output } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.linear);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+
+  _dispatchSiLU(encoder, inputBuf, count, slotKey = 'silu') {
+    const totalWG = ceilDiv$1(count, WG_SIZE$1);
+    const [wgX, wgY] = splitWG$1(totalWG);
+    const params = this._cachedUniform(new Uint32Array([count, 1, wgX])); // op=1 = SiLU
+    const dummyBuf = this._alloc(slotKey + ':dummy', 4);
+    const outBuf = this._alloc(slotKey, count * 4);
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.activation.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: inputBuf } },
+        { binding: 2, resource: { buffer: dummyBuf } },
+        { binding: 3, resource: { buffer: outBuf } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.activation);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+    return outBuf;
+  }
+
+  _dispatchTruncExp(encoder, inputBuf, count, slotKey = 'truncExp') {
+    const totalWG = ceilDiv$1(count, WG_SIZE$1);
+    const [wgX, wgY] = splitWG$1(totalWG);
+    const params = this._cachedUniform(new Uint32Array([count, wgX]));
+    const outBuf = this._alloc(slotKey, count * 4);
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.truncExp.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: inputBuf } },
+        { binding: 2, resource: { buffer: outBuf } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.truncExp);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+    return outBuf;
+  }
+
+  _dispatchSigmoid(encoder, inputBuf, count, slotKey = 'sigmoid') {
+    const totalWG = ceilDiv$1(count, WG_SIZE$1);
+    const [wgX, wgY] = splitWG$1(totalWG);
+    const params = this._cachedUniform(new Uint32Array([count, wgX]));
+    const outBuf = this._alloc(slotKey, count * 4);
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.sigmoid.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: inputBuf } },
+        { binding: 2, resource: { buffer: outBuf } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.sigmoid);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+    return outBuf;
+  }
+
+  _dispatchNormalize3(encoder, inputBuf, N, slotKey = 'normalize3') {
+    const totalWG = ceilDiv$1(N, WG_SIZE$1);
+    const [wgX, wgY] = splitWG$1(totalWG);
+    const params = this._cachedUniform(new Uint32Array([N, wgX]));
+    const outBuf = this._alloc(slotKey, N * 3 * 4);
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.normalize3.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: inputBuf } },
+        { binding: 2, resource: { buffer: outBuf } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.normalize3);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+    return outBuf;
+  }
+
+  _dispatchAddBias(encoder, buf, count, bias) {
+    const totalWG = ceilDiv$1(count, WG_SIZE$1);
+    const [wgX, wgY] = splitWG$1(totalWG);
+    const paramsData = new ArrayBuffer(12);
+    const u32 = new Uint32Array(paramsData);
+    const f32 = new Float32Array(paramsData);
+    u32[0] = count; f32[1] = bias; u32[2] = wgX;
+    const params = this._cachedUniform(new Uint8Array(paramsData));
+    const bg = this.device.createBindGroup({
+      layout: this.pipelines.addBias.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: buf } },
+      ],
+    });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.pipelines.addBias);
+    pass.setBindGroup(0, bg);
+    pass.dispatchWorkgroups(wgX, wgY);
+    pass.end();
+  }
+}
+
+const TRIANGLE_TABLE = [
+  [-1, -1, -1, -1, -1, -1],
+  [1, 0, 2, -1, -1, -1],
+  [4, 0, 3, -1, -1, -1],
+  [1, 4, 2, 1, 3, 4],
+  [3, 1, 5, -1, -1, -1],
+  [2, 3, 0, 2, 5, 3],
+  [1, 4, 0, 1, 5, 4],
+  [4, 2, 5, -1, -1, -1],
+  [4, 5, 2, -1, -1, -1],
+  [4, 1, 0, 4, 5, 1],
+  [3, 2, 0, 3, 5, 2],
+  [1, 3, 5, -1, -1, -1],
+  [4, 1, 2, 4, 3, 1],
+  [3, 0, 4, -1, -1, -1],
+  [2, 0, 1, -1, -1, -1],
+  [-1, -1, -1, -1, -1, -1]
+];
+const NUM_TRIANGLES_TABLE = [0, 1, 1, 2, 1, 2, 2, 1, 1, 2, 2, 1, 2, 1, 1, 0];
+const BASE_TET_EDGES = [0, 1, 0, 2, 0, 3, 1, 2, 1, 3, 2, 3];
+const SOURCE_PUBLIC_BASE_PATH = "./";
+const SOURCE_PUBLIC_BASE_URL = resolveSourcePublicBaseUrl(
+  SOURCE_PUBLIC_BASE_PATH,
+  import.meta.url,
+  false
+);
+const DEFAULT_TET_BASE_PATH = new URL("tets/", SOURCE_PUBLIC_BASE_URL).href;
+function resolveSourcePublicBaseUrl(basePath, moduleUrl, development = false) {
+  const value = String(basePath);
+  if (!value || value.startsWith(".")) {
+    if (development) return new URL("/", moduleUrl);
+    const dir = new URL("./", moduleUrl);
+    return dir.pathname.endsWith("/assets/") ? new URL("../", dir) : dir;
+  }
+  return new URL(value, moduleUrl);
+}
+async function fetchTetArrayBuffer(url, bytesPerElement) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Tet asset fetch failed for ${url}: HTTP ${response.status} ${response.statusText}`.trim());
+  }
+  const contentType = response.headers.get("content-type")?.toLowerCase() || "";
+  if (contentType.includes("text/html") || contentType.includes("application/xhtml+xml")) {
+    throw new Error(`Tet asset ${url} returned non-binary content type ${contentType}`);
+  }
+  const buffer = await response.arrayBuffer();
+  if (buffer.byteLength === 0 || buffer.byteLength % bytesPerElement !== 0) {
+    throw new Error(
+      `Tet asset ${url} byte length ${buffer.byteLength} must be a non-zero multiple of ${bytesPerElement}`
+    );
+  }
+  return buffer;
+}
+async function loadTetGridVertices(basePath = DEFAULT_TET_BASE_PATH) {
+  const normalizedBase = String(basePath).endsWith("/") ? String(basePath) : `${basePath}/`;
+  const resolvedBase = new URL(normalizedBase, SOURCE_PUBLIC_BASE_URL);
+  const gridUrl = new URL("_grid_vertices.bin", resolvedBase).href;
+  const gridVertices = new Float32Array(await fetchTetArrayBuffer(gridUrl, Float32Array.BYTES_PER_ELEMENT));
+  if (gridVertices.length % 3 !== 0) {
+    throw new Error(`Tet vertex asset ${gridUrl} has ${gridVertices.length} values; expected xyz triples`);
+  }
+  return { gridVertices, indices: null, numVertices: gridVertices.length / 3, numTets: null };
+}
+async function loadTetData(basePath = DEFAULT_TET_BASE_PATH) {
+  const normalizedBase = String(basePath).endsWith("/") ? String(basePath) : `${basePath}/`;
+  const resolvedBase = new URL(normalizedBase, SOURCE_PUBLIC_BASE_URL);
+  const gridUrl = new URL("_grid_vertices.bin", resolvedBase).href;
+  const indicesUrl = new URL("indices.bin", resolvedBase).href;
+  const [vertsBuf, indicesBuf] = await Promise.all([
+    fetchTetArrayBuffer(gridUrl, Float32Array.BYTES_PER_ELEMENT),
+    fetchTetArrayBuffer(indicesUrl, Int32Array.BYTES_PER_ELEMENT)
+  ]);
+  const gridVertices = new Float32Array(vertsBuf);
+  const indices = new Int32Array(indicesBuf);
+  if (gridVertices.length % 3 !== 0) {
+    throw new Error(`Tet vertex asset ${gridUrl} has ${gridVertices.length} values; expected xyz triples`);
+  }
+  if (indices.length % 4 !== 0) {
+    throw new Error(`Tet index asset ${indicesUrl} has ${indices.length} values; expected tetrahedra quads`);
+  }
+  return {
+    gridVertices,
+    numVertices: gridVertices.length / 3,
+    indices,
+    numTets: indices.length / 4
+  };
+}
+function marchingTetrahedra(gridVertices, sdf, tetIndices, vertexOffsets = null, resolution = 160) {
+  const N_v = gridVertices.length / 3;
+  const N_t = tetIndices.length / 4;
+  let positions;
+  if (vertexOffsets) {
+    const scale = 1.74 / resolution;
+    positions = new Float32Array(N_v * 3);
+    for (let i = 0; i < N_v * 3; i++) {
+      positions[i] = gridVertices[i] + scale * Math.tanh(vertexOffsets[i]);
+    }
+  } else {
+    positions = gridVertices;
+  }
+  const occ = new Uint8Array(N_v);
+  for (let i = 0; i < N_v; i++) {
+    occ[i] = sdf[i] > 0 ? 1 : 0;
+  }
+  const validTets = [];
+  for (let t = 0; t < N_t; t++) {
+    const base = t * 4;
+    const sum = occ[tetIndices[base]] + occ[tetIndices[base + 1]] + occ[tetIndices[base + 2]] + occ[tetIndices[base + 3]];
+    if (sum > 0 && sum < 4) {
+      validTets.push(t);
+    }
+  }
+  const edgeMap = /* @__PURE__ */ new Map();
+  const edgeList = [];
+  const tetEdgeIndices = new Int32Array(validTets.length * 6);
+  for (let vi = 0; vi < validTets.length; vi++) {
+    const t = validTets[vi];
+    const tetBase = t * 4;
+    for (let e = 0; e < 6; e++) {
+      let v0 = tetIndices[tetBase + BASE_TET_EDGES[e * 2]];
+      let v1 = tetIndices[tetBase + BASE_TET_EDGES[e * 2 + 1]];
+      if (v0 > v1) {
+        const tmp = v0;
+        v0 = v1;
+        v1 = tmp;
+      }
+      const key = `${v0},${v1}`;
+      let edgeIdx;
+      if (edgeMap.has(key)) {
+        edgeIdx = edgeMap.get(key);
+      } else {
+        edgeIdx = edgeList.length;
+        edgeMap.set(key, edgeIdx);
+        edgeList.push([v0, v1]);
+      }
+      tetEdgeIndices[vi * 6 + e] = edgeIdx;
+    }
+  }
+  const crossingEdges = [];
+  const edgeToVertex = new Int32Array(edgeList.length).fill(-1);
+  let vertexCount = 0;
+  for (let i = 0; i < edgeList.length; i++) {
+    const [v0, v1] = edgeList[i];
+    if (occ[v0] !== occ[v1]) {
+      edgeToVertex[i] = vertexCount++;
+      crossingEdges.push(i);
+    }
+  }
+  const vertices = new Float32Array(vertexCount * 3);
+  for (const edgeIdx of crossingEdges) {
+    const [v0, v1] = edgeList[edgeIdx];
+    const s0 = sdf[v0];
+    const s1 = sdf[v1];
+    const denom = s0 - s1;
+    const t = denom !== 0 ? s0 / denom : 0.5;
+    const outIdx = edgeToVertex[edgeIdx] * 3;
+    for (let d = 0; d < 3; d++) {
+      vertices[outIdx + d] = positions[v0 * 3 + d] * (1 - t) + positions[v1 * 3 + d] * t;
+    }
+  }
+  const faceList = [];
+  for (let vi = 0; vi < validTets.length; vi++) {
+    const t = validTets[vi];
+    const tetBase = t * 4;
+    let tetindex = 0;
+    for (let j = 0; j < 4; j++) {
+      if (occ[tetIndices[tetBase + j]]) {
+        tetindex |= 1 << j;
+      }
+    }
+    const numTri = NUM_TRIANGLES_TABLE[tetindex];
+    const triRow = TRIANGLE_TABLE[tetindex];
+    for (let tri = 0; tri < numTri; tri++) {
+      const i0 = edgeToVertex[tetEdgeIndices[vi * 6 + triRow[tri * 3]]];
+      const i1 = edgeToVertex[tetEdgeIndices[vi * 6 + triRow[tri * 3 + 1]]];
+      const i2 = edgeToVertex[tetEdgeIndices[vi * 6 + triRow[tri * 3 + 2]]];
+      if (i0 >= 0 && i1 >= 0 && i2 >= 0) {
+        faceList.push(i0, i1, i2);
+      }
+    }
+  }
+  const faces = new Uint32Array(faceList);
+  return {
+    vertices,
+    faces,
+    numVertices: vertexCount,
+    numFaces: faces.length / 3
+  };
+}
+async function runResidentMarchingTetrahedra({
+  handle,
+  memoryBudget,
+  gridVertices,
+  sdf,
+  tetIndices,
+  vertexOffsets = null,
+  resolution = 160,
+  onBeforePhase
+}) {
+  if (!isLoaderMemoryBudget(memoryBudget)) throw TypeError("authenticated marching budget required");
+  if (!handle || handle._residentMarchingOwner) throw Error("unoccupied owned marching handle required");
+  if (typeof onBeforePhase !== "function") throw TypeError("fresh before-allocation marching guard required");
+  if (!(gridVertices instanceof Float32Array) || gridVertices.length % 3 || !(sdf instanceof Float32Array) || sdf.length !== gridVertices.length / 3 || !(tetIndices instanceof Int32Array) || tetIndices.length % 4 || vertexOffsets !== null && (!(vertexOffsets instanceof Float32Array) || vertexOffsets.length !== gridVertices.length) || !Number.isFinite(resolution) || resolution <= 0) throw TypeError("complete finite marching shape required");
+  const nv = sdf.length, nt = tetIndices.length / 4;
+  for (const array of [gridVertices, sdf, vertexOffsets]) if (array) {
+    for (const value of array) if (!Number.isFinite(value)) throw Error("nonfinite marching input");
+  }
+  const caseAt = (t) => {
+    let bits = 0;
+    for (let j = 0; j < 4; j++) {
+      const v = tetIndices[t * 4 + j];
+      if (v < 0 || v >= nv) throw Error("marching tet index outside complete grid");
+      if (sdf[v] > 0) bits |= 1 << j;
+    }
+    return bits;
+  };
+  let validCount = 0, numTriangles = 0, edgeCapacity = 0;
+  for (let t = 0; t < nt; t++) {
+    const bits = caseAt(t), triangles = NUM_TRIANGLES_TABLE[bits];
+    if (triangles) {
+      validCount++;
+      numTriangles += triangles;
+      for (let e = 0; e < 6; e++) if ((bits >> BASE_TET_EDGES[e * 2] & 1) !== (bits >> BASE_TET_EDGES[e * 2 + 1] & 1)) edgeCapacity++;
+    }
+  }
+  let hashSlots = 1;
+  while (hashSlots < 2 * edgeCapacity) hashSlots *= 2;
+  const scratchBytes = (vertexOffsets ? gridVertices.byteLength : 0) + nv + validCount * 28 + edgeCapacity * 8 + hashSlots * 4;
+  if (!Number.isSafeInteger(scratchBytes)) throw Error("marching backing demand exceeds exact integer capacity");
+  const owner = { scratch: null, scratchLease: null, outputLease: null, value: null };
+  handle._residentMarchingOwner = owner;
+  try {
+    await onBeforePhase({
+      name: "marching-counted-scratch",
+      rangeCpuBytes: scratchBytes,
+      workGpuBytes: 0,
+      requiredBytes: scratchBytes,
+      validTets: validCount,
+      edgeCapacity,
+      hashSlots,
+      numTriangles,
+      gridPoints: nv
+    });
+    if (handle._residentMarchingOwner !== owner) throw Error("marching owner disposed during guard");
+    owner.scratchLease = memoryBudget.reserveCpu(scratchBytes, "marching-counted-scratch");
+    const s = owner.scratch = {};
+    s.positions = vertexOffsets ? new Float32Array(gridVertices.length) : gridVertices;
+    s.occ = new Uint8Array(nv);
+    s.valid = new Uint32Array(validCount);
+    s.tetEdges = new Int32Array(validCount * 6).fill(-1);
+    s.edge0 = new Uint32Array(edgeCapacity);
+    s.edge1 = new Uint32Array(edgeCapacity);
+    s.hash = new Uint32Array(hashSlots);
+    if (vertexOffsets) {
+      const scale = 1.74 / resolution;
+      for (let i = 0; i < gridVertices.length; i++) s.positions[i] = gridVertices[i] + scale * Math.tanh(vertexOffsets[i]);
+    }
+    for (let i = 0; i < nv; i++) s.occ[i] = sdf[i] > 0 ? 1 : 0;
+    let vi = 0, vertexCount = 0, faceCount = 0;
+    for (let t = 0; t < nt; t++) {
+      const bits = caseAt(t);
+      if (!NUM_TRIANGLES_TABLE[bits]) continue;
+      if (vi >= validCount) throw Error("marching input changed during guarded allocation");
+      s.valid[vi] = t;
+      faceCount += NUM_TRIANGLES_TABLE[bits];
+      for (let e = 0; e < 6; e++) {
+        let v0 = tetIndices[t * 4 + BASE_TET_EDGES[e * 2]], v1 = tetIndices[t * 4 + BASE_TET_EDGES[e * 2 + 1]];
+        if (s.occ[v0] === s.occ[v1]) continue;
+        if (v0 > v1) {
+          const v = v0;
+          v0 = v1;
+          v1 = v;
+        }
+        let slot = ((Math.imul(v0, 2654435761) ^ Math.imul(v1, 2246822507)) >>> 0) % hashSlots;
+        let id;
+        for (; ; ) {
+          const entry = s.hash[slot];
+          if (!entry) {
+            if (vertexCount >= edgeCapacity) throw Error("marching crossing demand changed");
+            id = vertexCount++;
+            s.edge0[id] = v0;
+            s.edge1[id] = v1;
+            s.hash[slot] = id + 1;
+            break;
+          }
+          id = entry - 1;
+          if (s.edge0[id] === v0 && s.edge1[id] === v1) break;
+          slot = (slot + 1) % hashSlots;
+        }
+        s.tetEdges[vi * 6 + e] = id;
+      }
+      vi++;
+    }
+    if (vi !== validCount || faceCount !== numTriangles) throw Error("marching counted topology changed");
+    const outputBytes = vertexCount * 12 + numTriangles * 12;
+    await onBeforePhase({
+      name: "marching-complete-mesh",
+      rangeCpuBytes: outputBytes,
+      workGpuBytes: 0,
+      requiredBytes: outputBytes,
+      numVertices: vertexCount,
+      numFaces: numTriangles,
+      gridPoints: nv
+    });
+    if (handle._residentMarchingOwner !== owner) throw Error("marching owner disposed during guard");
+    owner.outputLease = memoryBudget.reserveCpu(outputBytes, "marching-complete-mesh");
+    const output = owner.value = {
+      vertices: new Float32Array(vertexCount * 3),
+      faces: new Uint32Array(numTriangles * 3),
+      numVertices: vertexCount,
+      numFaces: numTriangles
+    };
+    for (let id = 0; id < vertexCount; id++) {
+      const v0 = s.edge0[id], v1 = s.edge1[id], s0 = sdf[v0], s1 = sdf[v1], denom = s0 - s1;
+      const t = denom !== 0 ? s0 / denom : 0.5;
+      for (let d = 0; d < 3; d++) output.vertices[id * 3 + d] = s.positions[v0 * 3 + d] * (1 - t) + s.positions[v1 * 3 + d] * t;
+    }
+    let f = 0;
+    for (let v = 0; v < validCount; v++) {
+      const bits = caseAt(s.valid[v]), row = TRIANGLE_TABLE[bits];
+      for (let j = 0; j < NUM_TRIANGLES_TABLE[bits] * 3; j++) {
+        const id = s.tetEdges[v * 6 + row[j]];
+        if (id < 0 || id >= vertexCount) throw Error("marching lookup has no crossing vertex");
+        output.faces[f++] = id;
+      }
+    }
+    if (f !== output.faces.length) throw Error("marching complete face count drift");
+    owner.scratch = null;
+    owner.scratchLease.release();
+    owner.scratchLease = null;
+    return output;
+  } catch (error) {
+    if (handle._residentMarchingOwner === owner) disposeResidentMarchingTetrahedra(handle);
+    throw error;
+  }
+}
+function disposeResidentMarchingTetrahedra(handle) {
+  const owner = handle?._residentMarchingOwner;
+  if (!owner) return;
+  owner.scratch = null;
+  owner.scratchLease?.release();
+  owner.scratchLease = null;
+  if (owner.value) {
+    owner.value.vertices = new Float32Array(0);
+    owner.value.faces = new Uint32Array(0);
+    owner.value = null;
+  }
+  owner.outputLease?.release();
+  owner.outputLease = null;
+  handle._residentMarchingOwner = null;
+}
+function scaleTensor(data, fromRange, toRange) {
+  const [fromMin, fromMax] = fromRange;
+  const [toMin, toMax] = toRange;
+  const scale = (toRange[1] - toRange[0]) / (fromMax - fromMin);
+  const offset = toRange[0] - fromMin * scale;
+  const result = new Float32Array(data.length);
+  for (let i = 0; i < data.length; i++) {
+    result[i] = data[i] * scale + offset;
+  }
+  return result;
+}
+function validateMarchingTetReply(d) {
+  const numVertices = d?.numVertices;
+  const numFaces = d?.numFaces;
+  if (!Number.isSafeInteger(numVertices) || numVertices <= 0) throw new Error(`marching-tet reply numVertices invalid: ${numVertices}`);
+  if (!Number.isSafeInteger(numFaces) || numFaces <= 0) throw new Error(`marching-tet reply numFaces invalid: ${numFaces}`);
+  if (!(d.vertices instanceof ArrayBuffer) || !(d.faces instanceof ArrayBuffer)) {
+    throw new Error("marching-tet reply must carry vertices and faces ArrayBuffers");
+  }
+  const vertices = new Float32Array(d.vertices);
+  const faces = new Uint32Array(d.faces);
+  if (vertices.length !== numVertices * 3) throw new Error(`marching-tet vertices length ${vertices.length} != ${numVertices * 3}`);
+  if (faces.length !== numFaces * 3) throw new Error(`marching-tet faces length ${faces.length} != ${numFaces * 3}`);
+  for (let i = 0; i < vertices.length; i++) {
+    if (!Number.isFinite(vertices[i])) throw new Error(`marching-tet vertex value non-finite at ${i}`);
+  }
+  for (let i = 0; i < faces.length; i++) {
+    if (faces[i] >= numVertices) throw new Error(`marching-tet face index ${faces[i]} out of range at ${i}`);
+  }
+  return { vertices, faces, numVertices, numFaces };
+}
+async function runMarchingTetOnWorker(worker, { sdf, vertexOffsets, bbox, resolution }, { timeoutMs = 3e4 } = {}) {
+  if (!(sdf instanceof Float32Array)) throw new TypeError("sdf must be a Float32Array");
+  if (vertexOffsets != null && !(vertexOffsets instanceof Float32Array)) throw new TypeError("vertexOffsets must be a Float32Array or null");
+  const sdfBuf = sdf.slice().buffer;
+  const offBuf = vertexOffsets ? vertexOffsets.slice().buffer : null;
+  const transfer = offBuf ? [sdfBuf, offBuf] : [sdfBuf];
+  return await callWorker(
+    worker,
+    { id: `marching-tet-${Math.random().toString(36).slice(2)}`, sdf: sdfBuf, vertexOffsets: offBuf, bbox, resolution },
+    transfer,
+    { timeoutMs, onResult: validateMarchingTetReply }
+  );
+}
+
+/**
+ * inference.js — SF3D WebGPU inference pipeline.
+ *
+ * Full forward pass:
+ *   1. Image preprocessing (normalize, resize to 512×512)
+ *   2. Camera embedding (linear projection)
+ *   3. DINOv2 image tokenization (with AdaNorm modulation)
+ *   4. Two-stream backbone (interleave transformer)
+ *   5. PixelShuffle post-processing
+ *   6. Triplane query + decoder MLP
+ *   7. Marching tetrahedra mesh extraction (CPU)
+ *
+ * Steps 1 run on CPU. Steps 2-6 run on GPU. Step 7 runs on CPU.
+ */
+
+
+// SF3D model configuration
+const CONFIG = {
+  ...SF3D_IMAGE_PREPROCESS,
+  numEncoderLayers: 24,
+  isosurfaceResolution: 160,
+  isosurfaceThreshold: 10.0,
+  radius: 0.87,
+  defaultFovDeg: 40.0,
+  defaultDistance: 1.6,
+};
+
+/**
+ * Preprocess an image for SF3D input.
+ * Returns Float32Array in CHW format, normalized with ImageNet stats.
+ */
+
+/**
+ * Extract raw float32 RGBA source pixels from an image element via canvas.
+ * Cheap (a getImageData copy); the expensive resize/blend/normalize is separate
+ * so it can run on either the main thread or a worker.
+ */
+function extractSourcePixels(imageData) {
+  const canvas = document.createElement('canvas');
+  const srcW = imageData.naturalWidth || imageData.width;
+  const srcH = imageData.naturalHeight || imageData.height;
+  canvas.width = srcW;
+  canvas.height = srcH;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(imageData, 0, 0);
+  const srcPixels = ctx.getImageData(0, 0, srcW, srcH).data;
+  const srcFloat = new Float32Array(srcW * srcH * 4);
+  for (let i = 0; i < srcPixels.length; i++) srcFloat[i] = srcPixels[i] / 255.0;
+  return { srcFloat, srcW, srcH };
+}
+
+/**
+ * Preprocess an image for SF3D input → CHW float32 tensor.
+ *
+ * @param {object} [options.preprocessWorker]  a live Worker running
+ *   preprocess_worker.js; when supplied, foreground framing, bicubic resizing,
+ *   blending and normalization run off the main thread. Both paths use the
+ *   same condition_image implementation.
+ */
+async function preprocessImage(imageData, width, height, options = {}) {
+  return (await preprocessConditionImage(imageData, options)).chw;
+}
+
+async function preprocessConditionImage(imageData, options = {}) {
+  const size = CONFIG.condImageSize;
+  const { srcFloat, srcW, srcH } = extractSourcePixels(imageData);
+  const bg = CONFIG.bgColor, imageMean = CONFIG.imageMean, imageStd = CONFIG.imageStd;
+
+  const worker = options.preprocessWorker;
+  if (worker) {
+    const id = `pp-${Math.random().toString(36).slice(2)}`;
+    // Fail-loud: a worker crash / malformed reply / wedge rejects (never hangs,
+    // never silently falls back). The caller owns any main-thread retry policy.
+    return await callWorker(
+      worker,
+      { srcBuffer: srcFloat.buffer, srcW, srcH, size, bg, imageMean, imageStd, id },
+      [srcFloat.buffer],
+      {
+        timeoutMs: options.workerTimeoutMs || 30000,
+        // Shape + finiteness (worker_reply_validation.js): a length-correct
+        // reply carrying NaN/Inf must not reach the GPU as a successful offload.
+        onResult: (data) => validateConditionReply(data, size),
+      },
+    );
+  }
+
+  return prepareConditionImage(srcFloat, srcW, srcH, size, bg, imageMean, imageStd);
+}
+
+/**
+ * Compute default camera embeddings input.
+ * SF3D uses a fixed camera: c2w at distance 1.6, fov 40°.
+ * Returns [25] float array: concat(c2w_4x4, intrinsic_normed_3x3).
+ */
+function computeCameraInput() {
+  const c2w = new Float32Array([
+    0, 0, 1, CONFIG.defaultDistance,
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 0, 1,
+  ]);
+
+  const fov = CONFIG.defaultFovDeg * Math.PI / 180;
+  const focal = 0.5 / Math.tan(fov / 2);
+  const intrinsicNormed = new Float32Array([
+    focal, 0, 0.5,
+    0, focal, 0.5,
+    0, 0, 1,
+  ]);
+
+  const embedInput = new Float32Array(25);
+  embedInput.set(c2w, 0);
+  embedInput.set(intrinsicNormed, 16);
+  return embedInput;
+}
+
+/**
+ * Initialize all GPU pipeline modules.
+ */
+function initPipelines(device) {
+  const imageTokenizer = new SF3DImageTokenizer(device);
+  imageTokenizer.init();
+
+  const twoStream = new TwoStreamBackbone(device);
+  twoStream.init();
+
+  const triplaneDecoder = new TriplaneDecoder(device);
+  triplaneDecoder.init();
+
+  return { imageTokenizer, twoStream, triplaneDecoder };
+}
+
+/**
+ * Run the full SF3D inference pipeline.
+ *
+ * @param {GPUDevice} device
+ * @param {Object} pipelines - from initPipelines()
+ * @param {Object} weights - from loadWeights()
+ * @param {HTMLImageElement|HTMLCanvasElement} imageElement
+ * @param {Function} onProgress - progress callback
+ * @returns {{ vertices: Float32Array, faces: Uint32Array, numVertices: number, numFaces: number }}
+ */
+async function runInference(device, pipelines, weights, imageElement, onProgress, options = {}) {
+  const report = (msg) => { if (onProgress) onProgress(msg); console.log(msg); };
+  const _stageTimings = {};
+  let _stageStart;
+
+  // Cooperative DINO options (first uptake of @kaminos/webgpu-inference-kit
+  // cooperative porting spine; see cooperative_dino.js). Defaults preserve the
+  // legacy single-submit path exactly.
+  const cooperativeDino = options.cooperativeDino === true;
+  const dinoSchedulingMode = options.dinoSchedulingMode === 'disabled' ? 'disabled' : 'cooperative';
+  const dinoChunkBlocks = Number.isSafeInteger(options.dinoChunkBlocks) && options.dinoChunkBlocks > 0
+    ? options.dinoChunkBlocks
+    : 1;
+  const cooperativePostProcessor = options.cooperativePostProcessor === true;
+  const cooperativeTwoStream = options.cooperativeTwoStream === true;
+  const twoStreamSchedulingMode = options.twoStreamSchedulingMode === 'disabled'
+    ? 'disabled'
+    : 'cooperative';
+  const twoStreamDutyGranularity = options.twoStreamDutyGranularity ?? 'stage';
+  if (!['stage', 'attention-tile'].includes(twoStreamDutyGranularity)) {
+    throw new RangeError(
+      `twoStreamDutyGranularity must be stage or attention-tile, `
+      + `got ${twoStreamDutyGranularity}`,
+    );
+  }
+  const twoStreamLinearRowsPerDuty = options.twoStreamLinearRowsPerDuty ?? 128;
+  if (!Number.isSafeInteger(twoStreamLinearRowsPerDuty)
+    || twoStreamLinearRowsPerDuty <= 0) {
+    throw new TypeError(
+      `twoStreamLinearRowsPerDuty must be a positive safe integer, `
+      + `got ${twoStreamLinearRowsPerDuty}`,
+    );
+  }
+  const postProcessorSchedulingMode = options.postProcessorSchedulingMode === 'disabled'
+    ? 'disabled'
+    : 'cooperative';
+  const postProcessorDutyGranularity = options.postProcessorDutyGranularity ?? 'plane';
+  if (!['plane', 'layer', 'channel-range'].includes(postProcessorDutyGranularity)) {
+    throw new RangeError(
+      `postProcessorDutyGranularity must be plane, layer, or channel-range, `
+      + `got ${postProcessorDutyGranularity}`,
+    );
+  }
+  // Bounded-prefix completion for the fixed channel-range postprocessor boundary
+  // (kit >=0.1.41). Default strict-prefix preserves prior behavior; validation
+  // lives in runCooperativePostProcessor (channel-range + cooperative only).
+  const postProcessorCompletionPolicy = options.postProcessorCompletionPolicy ?? 'strict-prefix';
+  const postProcessorMaxInFlightGpuDuties = options.postProcessorMaxInFlightGpuDuties ?? null;
+  const postProcessorChannelsPerDuty = options.postProcessorChannelsPerDuty ?? 16;
+  if (!Number.isSafeInteger(postProcessorChannelsPerDuty)
+      || postProcessorChannelsPerDuty <= 0) {
+    throw new TypeError(
+      `postProcessorChannelsPerDuty must be a positive safe integer, `
+      + `got ${postProcessorChannelsPerDuty}`,
+    );
+  }
+  // Surfaced back to the caller/smoke via the returned _cooperativeReports.
+  const _cooperativeReports = {};
+  // Exact DINO numerical payload (only when options.captureDinoPayload).
+  let _dinoPayload = null;
+  // Absolute-timestamp stage spans for foreground-tail attribution (opt-in).
+  const _spans = Array.isArray(options.recordStageSpans) ? options.recordStageSpans : null;
+  const _markSpan = (name, start) => { if (_spans) _spans.push({ name, start, end: performance.now() }); };
+
+  // 1. Preprocess image (CPU)
+  _stageStart = performance.now();
+  report('Preprocessing image...');
+  const conditionImage = await withForegroundScope(options,
+    options.preprocessWorker ? 'image-preprocess-worker' : 'image-preprocess',
+    () => preprocessConditionImage(imageElement,
+      { preprocessWorker: options.preprocessWorker, workerTimeoutMs: options.workerTimeoutMs }));
+  const imageBuf = createStorageBuffer(device, conditionImage.chw);
+
+  // 2. Camera embedding (GPU) — counted as part of image-preprocess
+  report('Computing camera embedding...');
+  const cameraInput = computeCameraInput();
+  const cameraInputBuf = createStorageBuffer(device, cameraInput);
+
+  // Dispatch camera embedding: Linear(25 → 768)
+  const encoder1 = device.createCommandEncoder();
+  const cameraEmbedBuf = createEmptyBuffer(device, 768 * 4);
+  _dispatchLinear$1(device, encoder1, pipelines, cameraInputBuf, cameraEmbedBuf,
+    weights.cameraEmbedder.weight, weights.cameraEmbedder.bias, 1, 25, 768);
+  device.queue.submit([encoder1.finish()]);
+
+  _stageTimings['image-preprocess'] = performance.now() - _stageStart;
+  _markSpan('image-preprocess', _stageStart);
+
+  // 3. DINOv2 image tokenization (GPU)
+  _stageStart = performance.now();
+  let dinov2Result;
+  if (cooperativeDino) {
+    report(`Running DINOv2 backbone (cooperative, ${dinoSchedulingMode}, chunk=${dinoChunkBlocks})...`);
+    const { result, report: coopReport } = await runCooperativeDino({
+      device,
+      foregroundOpportunities: options.foregroundOpportunities ?? null,
+      tokenizer: pipelines.imageTokenizer,
+      imageBuf,
+      cameraEmbedBuf,
+      weights: weights.imageTokenizer,
+      numBlocks: CONFIG.numEncoderLayers,
+      chunkBlocks: dinoChunkBlocks,
+      schedulingMode: dinoSchedulingMode,
+      onProgress: (p) => {
+        if (p.percent != null) report(`DINOv2 blocks ${p.completedItems}/${p.totalItems} (${p.percent.toFixed(0)}%)`);
+      },
+    });
+    dinov2Result = result;
+    _cooperativeReports['dinov2-tokenizer'] = coopReport;
+  } else {
+    report('Running DINOv2 backbone...');
+    const encoder2 = device.createCommandEncoder();
+    dinov2Result = pipelines.imageTokenizer.encode(
+      encoder2, imageBuf, cameraEmbedBuf, weights.imageTokenizer);
+    device.queue.submit([encoder2.finish()]);
+  }
+
+  // Exact numerical payload capture (acceptance-capsule gate 5). Reads back the
+  // complete DINOv2 token buffer — the canonical numerical output of the DINO
+  // boundary being A/B'd — so control and candidate can be hashed and compared
+  // field-by-field. Gated by option: normal runs pay no extra readback.
+  if (options.captureDinoPayload) {
+    const tokens = await readBuffer(device, dinov2Result.tokensBuf, dinov2Result.N * 1024 * 4);
+    _dinoPayload = {
+      shape: { N: dinov2Result.N, dim: 1024 },
+      length: tokens.length,
+      // Float32Array — the capsule hashes bytes and finds first differing index.
+      tokens: Float32Array.from(tokens),
+    };
+  }
+
+  _stageTimings['dinov2-tokenizer'] = performance.now() - _stageStart;
+  _markSpan('dinov2-tokenizer', _stageStart);
+
+  // 4. Two-stream backbone (GPU)
+  _stageStart = performance.now();
+  report('Running two-stream backbone...');
+
+  // Rearrange tokenizer embeddings from [3, 1024, 96, 96] to [1024, 27648]
+  // PyTorch does: rearrange("Np Ct Hp Wp -> Ct (Np Hp Wp)")
+  // Source [p,c,h,w] at p*C*H*W + c*H*W + h*W + w
+  // Dest [c, p*H*W + h*W + w] at c*3*H*W + p*H*W + h*W + w
+  if (!weights.backbone._rearrangedEmbeddings) {
+    const encoder=device.createCommandEncoder();
+    weights.backbone._rearrangedEmbeddings=dispatchTokenizerEmbedding(
+      encoder,device,pipelines,weights.tokenizer.embeddings);
+    device.queue.submit([encoder.finish()]);
+  }
+  weights.backbone.tokenizer_embeddings_buf = weights.backbone._rearrangedEmbeddings;
+
+  let backboneResult;
+  if (cooperativeTwoStream) {
+    report(
+      `Running two-stream backbone (cooperative, ${twoStreamSchedulingMode}, `
+      + `${twoStreamDutyGranularity})...`,
+    );
+    const { result, report: twoStreamReport } = await runCooperativeTwoStream({
+      device,
+      foregroundOpportunities: options.foregroundOpportunities ?? null,
+      backbone: pipelines.twoStream,
+      imageTokensBuf: dinov2Result.tokensBuf,
+      N_img: dinov2Result.N,
+      weights: weights.backbone,
+      schedulingMode: twoStreamSchedulingMode,
+      dutyGranularity: twoStreamDutyGranularity,
+      linearRowsPerDuty: twoStreamLinearRowsPerDuty,
+      signal: options.signal,
+      onProgress: (p) => {
+        if (p.percent != null) {
+          report(
+            `Two-stream duties ${p.completedItems}/${p.totalItems} `
+            + `(${p.percent.toFixed(0)}%)`,
+          );
+        }
+      },
+    });
+    backboneResult = result;
+    _cooperativeReports['two-stream-backbone'] = twoStreamReport;
+  } else {
+    const encoder3 = device.createCommandEncoder();
+    backboneResult = pipelines.twoStream.forward(
+      encoder3, dinov2Result.tokensBuf, dinov2Result.N, weights.backbone);
+    device.queue.submit([encoder3.finish()]);
+  }
+
+  // Stage-by-stage backbone diagnostics (compare with PyTorch reference)
+  // PyTorch reference (chair image):
+  //   after GroupNorm:      min=-2.50, max=2.51, std=0.45
+  //   after proj_triplane:  min=-6.64, max=6.94, std=0.43
+  //   block 0 triplane:     min=-7.64, max=9.77, std=0.59
+  //   block 3 triplane:     min=-10.09, max=16.46, std=0.85
+  //   proj_out (permuted):  min=-5.68, max=5.44, std=0.36
+  //   final (with residual): min=-5.67, max=5.45, std=0.36
+
+  _stageTimings['two-stream-backbone'] = performance.now() - _stageStart;
+  _markSpan('two-stream-backbone', _stageStart);
+
+  // 5. PixelShuffle post-processing (counted as part of triplane-decode)
+  _stageStart = performance.now();
+  let triplaneResult;
+  if (cooperativePostProcessor) {
+    const progressUnit = postProcessorDutyGranularity === 'plane' ? 'planes' : 'duties';
+    report(
+      `Running post-processor (cooperative, ${postProcessorSchedulingMode}, `
+      + `${postProcessorDutyGranularity})...`,
+    );
+    const { result, report: postProcessorReport } = await runCooperativePostProcessor({
+      device,
+      foregroundOpportunities: options.foregroundOpportunities ?? null,
+      triplanesBuf: backboneResult.buffer,
+      weights: weights.postProcessor,
+      schedulingMode: postProcessorSchedulingMode,
+      dutyGranularity: postProcessorDutyGranularity,
+      channelsPerDuty: postProcessorChannelsPerDuty,
+      completionPolicy: postProcessorCompletionPolicy,
+      maxInFlightGpuDuties: postProcessorMaxInFlightGpuDuties,
+      signal: options.signal,
+      onProgress: (p) => {
+        if (p.percent != null) {
+          report(
+            `Post-processor ${progressUnit} ${p.completedItems}/${p.totalItems} `
+            + `(${p.percent.toFixed(0)}%)`,
+          );
+        }
+      },
+    });
+    triplaneResult = result;
+    _cooperativeReports['post-processor'] = postProcessorReport;
+  } else {
+    report('Running post-processor...');
+    const encoder4 = device.createCommandEncoder();
+    triplaneResult = dispatchPostProcessor(
+      device, encoder4, backboneResult.buffer, weights.postProcessor);
+    device.queue.submit([encoder4.finish()]);
+
+    // Ensure GPU work is done before reading
+    await device.queue.onSubmittedWorkDone();
+  }
+  _markSpan('post-processor', _stageStart);
+
+  // 6. Triplane query + decoder (GPU) — still part of triplane-decode timing
+  report('Querying triplane and decoding...');
+
+  // Load tet grid data: the whole grid for the inline marching tet, or only
+  // the query positions when a Worker owns the tet table.
+  const tetData = options.marchingTetWorker ? await loadTetGridVertices() : await loadTetData();
+  report(`Loaded tet grid: ${tetData.numVertices} vertices, ${tetData.numTets ?? 'worker-owned'} tets`);
+
+  // Scale grid vertices from [0, 1] to bbox
+  const bbox = [-0.87, CONFIG.radius];
+  const gridPositions = scaleTensor(tetData.gridVertices, [0, 1], bbox);
+  const gridPosBuf = createStorageBuffer(device, gridPositions);
+
+  // First pass: density + vertex_offset for mesh extraction
+  const encoder5 = device.createCommandEncoder();
+  const decoded = pipelines.triplaneDecoder.decode(
+    encoder5, gridPosBuf, triplaneResult.buffer, tetData.numVertices,
+    weights.decoder, ['density', 'vertex_offset']);
+  device.queue.submit([encoder5.finish()]);
+
+  // Read back density and vertex_offset to CPU
+  report('Reading back SDF values...');
+  const densityCPU = await readBuffer(device, decoded.density, tetData.numVertices * 4);
+  const sdf = new Float32Array(densityCPU);
+
+  // Subtract threshold: sdf = density - threshold
+  for (let i = 0; i < sdf.length; i++) {
+    sdf[i] -= CONFIG.isosurfaceThreshold;
+  }
+
+  const vertexOffsetCPU = await readBuffer(device, decoded.vertex_offset, tetData.numVertices * 3 * 4);
+  const vertexOffsets = new Float32Array(vertexOffsetCPU);
+
+  _stageTimings['triplane-decode'] = performance.now() - _stageStart;
+  _markSpan('triplane-decode', _stageStart);
+
+  // 7. Marching tetrahedra (CPU)
+  _stageStart = performance.now();
+  report('Extracting mesh...');
+  // Grid vertices need to be in model space with deformation applied
+  // The grid is in [0, 1], scale to bbox for the marching tet
+  // Optionally offloaded to a Web Worker that owns the resident tet grid
+  // (options.marchingTetWorker) — byte-identical output (same marchingTetrahedra
+  // code); removes the ~30-40ms contiguous CPU stall from the main thread.
+  const mesh = await withForegroundScope(options,
+    options.marchingTetWorker ? 'marching-tet-worker' : 'marching-tet',
+    () => options.marchingTetWorker
+      ? runMarchingTetOnWorker(options.marchingTetWorker,
+          { sdf, vertexOffsets, bbox, resolution: CONFIG.isosurfaceResolution },
+          { timeoutMs: options.workerTimeoutMs })
+      : marchingTetrahedra(
+          gridPositions, sdf, tetData.indices, vertexOffsets, CONFIG.isosurfaceResolution));
+
+  report(`Mesh extracted: ${mesh.numVertices} vertices, ${mesh.numFaces} faces`);
+
+  _stageTimings['marching-tet'] = performance.now() - _stageStart;
+  _markSpan('marching-tet', _stageStart);
+
+  // Mesh vertices are already in bbox space (from gridPositions which was pre-scaled)
+  return {
+    vertices: mesh.vertices,
+    faces: mesh.faces,
+    numVertices: mesh.numVertices,
+    numFaces: mesh.numFaces,
+    _conditionRgba: conditionImage.rgba,
+    // Expose for texture baking
+    _triplanesBuf: triplaneResult.buffer,
+    _triplaneDecoder: pipelines.triplaneDecoder,
+    _decoderWeights: weights.decoder,
+    _stageTimings,
+    // Cooperative execution reports per phase (empty unless an opt-in boundary runs)
+    _cooperativeReports,
+    // Exact DINO numerical payload for A/B comparison (null unless captured).
+    _dinoPayload,
+    // Expose for parity verification (sdf = density - threshold; add threshold back for raw)
+    _sdf: sdf,
+    _isosurfaceThreshold: CONFIG.isosurfaceThreshold,
+    // Raw decoder vertex offsets (pre tanh/scale, [N*3]), scaled grid positions
+    // ([N*3]), and the camera-embedding GPU buffer ([768] f32) for element-wise
+    // comparison against tools/dump_parity_reference.py (tools/smoke_parity.mjs).
+    _vertexOffsets: vertexOffsets,
+    _gridPositions: gridPositions,
+    _cameraEmbedBuf: cameraEmbedBuf,
+  };
+}
+
+// --- Helper: dispatch a single linear layer (for camera embedding) ---
+function _dispatchLinear$1(device, encoder, pipelines, input, output, weight, bias, rows, inDim, outDim) {
+  // Reuse the imageTokenizer's linear pipeline
+  pipelines.imageTokenizer._dispatchLinear(encoder, input, output, weight, bias, rows, inDim, outDim);
+}
+
+/** Select real schema leaves; keep block indices rather than renumbering work. */
+function selectDinoPhase(template,{blockStart,blockEnd,isFirst,isLast}){
+  if(template?.blocks?.length!==24||!Number.isSafeInteger(blockStart)||!Number.isSafeInteger(blockEnd)||
+    blockStart<0||blockEnd<=blockStart||blockEnd>24||isFirst!==(blockStart===0)||isLast!==(blockEnd===24))
+    throw TypeError('exact DINO phase indices and setup/final boundaries required');
+  return {blocks:template.blocks.map((block,i)=>i>=blockStart&&i<blockEnd?block:null),
+    ...(isFirst?{patchEmbed:template.patchEmbed,clsToken:template.clsToken,posEmbed:template.posEmbed}:{}),
+    ...(isLast?{layernorm:template.layernorm}:{}),};
+}
+
+/**
+ * Complete DINO encoder with immutable range weights and one real block/duty.
+ * The invoker supplies fresh phase observation and owns physical admission;
+ * this adapter's budget/destruction is only explicit resource accounting.
+ * withResult consumes the complete GPU output before this adapter retires it.
+ */
+async function runResidentDino({device,memoryBudget,weightsUrl,expectedWeightBytes,expectedSourceETag,
+  imageChw,onBeforePhase,onProgress,withResult,foregroundOpportunities=null,onBeforeSourceIntake,
+  streamFp16Uploads=true,onAfterWeightsLoaded,onDiagnosticCheckpoint}){
+  if(typeof streamFp16Uploads!=='boolean')throw TypeError('exact boolean DINO FP16 upload mode required');
+  if(onAfterWeightsLoaded!==undefined&&typeof onAfterWeightsLoaded!=='function')
+    throw TypeError('weight observation callback must be a function');
+  if(onDiagnosticCheckpoint!==undefined&&typeof onDiagnosticCheckpoint!=='function')
+    throw TypeError('diagnostic checkpoint callback must be a function');
+  if(!isLoaderMemoryBudget(memoryBudget))throw TypeError('authenticated loader budget required');
+  memoryBudget.assertDeviceAcquiredHere(device);
+  if(!(imageChw instanceof Float32Array)||imageChw.length!==3*512*512||imageChw.some(v=>!Number.isFinite(v)))
+    throw TypeError('complete finite SF3D CHW input required');
+  if(typeof onBeforePhase!=='function'||typeof withResult!=='function')throw TypeError('fresh phase observer and complete result consumer required');
+  let source,tokenizer,imageBuf,cameraInputBuf,cameraEmbedBuf,result,cameraLease,failure,failed=false;
+  const phaseDescriptions=[];
+  const observedCheckpoints=new Set();
+  const observe=async(tensors)=>{
+    if(onDiagnosticCheckpoint&&tensors.length)await onDiagnosticCheckpoint(Object.freeze({
+      tensors:Object.freeze(tensors.map(tensor=>Object.freeze(tensor)))}));
+  };
+  try{
+    source=await createWeightPhaseSource(device,weightsUrl,{memoryBudget,expectedWeightBytes,expectedSourceETag,onBeforeSourceIntake,
+      streamFp16Uploads,onAfterWeightsLoaded});
+    const before=async(name,selection,details={})=>{
+      const descriptor={name,tensors:source.describe(selection),...details};
+      phaseDescriptions.push(descriptor);await onBeforePhase(descriptor);
+    };
+    await before('camera',source.template.cameraEmbedder);
+    tokenizer=new SF3DImageTokenizer(device);tokenizer.init();
+    const camera=computeCameraInput();cameraLease=memoryBudget.reserveCpu(camera.byteLength,'resident-camera-input');
+    imageBuf=createStorageBuffer(device,imageChw,0,'resident-image');
+    cameraInputBuf=createStorageBuffer(device,camera,0,'resident-camera-input');
+    cameraEmbedBuf=createEmptyBuffer(device,768*4,0,'resident-camera-embedding');
+    await source.withWeights(source.template.cameraEmbedder,async weights=>{
+      const encoder=device.createCommandEncoder();
+      tokenizer._dispatchLinear(encoder,cameraInputBuf,cameraEmbedBuf,weights.weight,weights.bias,1,25,768);
+      device.queue.submit([encoder.finish()]);await device.queue.onSubmittedWorkDone();
+    });
+    if(onDiagnosticCheckpoint)await observe([{name:'cameraEmbed',buffer:cameraEmbedBuf,shape:Object.freeze([768])}]);
+    const encoded=await runCooperativeDino({device,tokenizer,imageBuf,cameraEmbedBuf,weights:source.template.imageTokenizer,
+      numBlocks:24,chunkBlocks:1,schedulingMode:'cooperative',foregroundOpportunities,onProgress,retireIntermediateBuffers:true,
+      async withChunkWeights(boundary,work){
+        const selection=selectDinoPhase(source.template.imageTokenizer,boundary);
+        await before('dino-block-'+boundary.blockStart,selection,boundary);
+        return source.withWeights(selection,async weights=>{
+          const value=await work(weights);
+          // The actual cooperative driver has drained this chunk. Existing
+          // diagnostic copies retire in encodeCooperative's finally, so consume
+          // them here without allocating duplicates or transferring ownership.
+          if(onDiagnosticCheckpoint){
+            const tensors=[];
+            for(const [name,buffer]of Object.entries(tokenizer._dinov2Diag??{})){
+              if(observedCheckpoints.has(name))continue;
+              tensors.push({name,buffer,shape:Object.freeze([1297,1024])});
+              observedCheckpoints.add(name);
+            }
+            await observe(tensors);
+          }
+          return value;
+        });
+      },
+    });
+    result=encoded.result;
+    if(result.N!==1297||result.tokensBuf?.size!==1297*1024*4)throw Error('complete DINO output shape changed');
+    await onBeforePhase({name:'dino-output',tensors:[],outputBytes:result.tokensBuf.size});
+    const value=await withResult(result);
+    return {value,cooperative:encoded.report,loadingReport:source.loadingReport,weightPhases:source.phases,
+      phaseDescriptions,shape:[1297,1024],blocks:24};
+  }catch(error){failed=true;failure=error;throw error;}
+  finally{
+    // A failed prefix fence cannot authorize retirement of live backing.
+    try{await device.queue.onSubmittedWorkDone();}
+    catch(error){throw failed?new AggregateError([failure,error],'resident DINO failed and queue drain is unresolved',{cause:failure}):error;}
+    const errors=[],attempt=fn=>{try{fn();}catch(error){errors.push(error);}};
+    if(tokenizer)try{await tokenizer.retireCapturedWorkBuffers();}catch(error){errors.push(error);}
+    for(const buffer of [result?.tokensBuf,imageBuf,cameraInputBuf,cameraEmbedBuf,...(tokenizer?tokenizer._uniformCache.values():[])])
+      if(buffer)attempt(()=>buffer.destroy());
+    if(cameraLease)attempt(()=>cameraLease.release());
+    if(source)try{await source.dispose();}catch(error){errors.push(error);}
+    if(errors.length)throw new AggregateError(failed?[failure,...errors]:errors,'resident DINO retirement failed',{cause:failure});
+  }
+}
+
+async function retireConsumedTokenizerEmbedding(device,owner,afterGroup){
+  // Only a completed consumer may authorize retirement. Rematerialization
+  // supplies a new canonical operand before the later final consumer.
+  await device.queue.onSubmittedWorkDone();
+  const errors=[];let logicalBytes=0,bufferCount=0;
+  for(const allocation of [...owner.allocations]){
+    try{
+      allocation.buffer.destroy();
+      owner.allocations.splice(owner.allocations.indexOf(allocation),1);
+      logicalBytes+=allocation.size;bufferCount++;
+    }catch(error){errors.push(error);}
+  }
+  if(errors.length)throw new AggregateError(errors,'consumed tokenizer embedding retirement failed');
+  return {status:'retired',afterGroup,logicalBytes,bufferCount,
+    authority:'logical owned retirement after completed prefix; not physical reclamation credit'};
+}
+
+function selectTwoStreamPhase(template,stageId){
+  const t=template.backbone;
+  if(stageId==='setup')return Object.fromEntries(['latentInit','normTriplane','projTriplane','normImage',
+    'projImage','normLatent','projLatent'].map(key=>[key,t[key]]));
+  if(stageId==='final')return {projOut:t.projOut};
+  const match=/^block-([0-3])-(?:fuse-(in|out)|basic-([0-2]))$/.exec(stageId);
+  if(!match)throw Error('exact two-stream stage selection required');
+  const block=Number(match[1]),basic=match[3]===undefined?null:Number(match[3]);
+  const selected=basic===null?{[match[2]==='in'?'fuseBlockIn':'fuseBlockOut']:
+    t.mainBlocks[block][match[2]==='in'?'fuseBlockIn':'fuseBlockOut']}:
+    {transformerBlocks:t.mainBlocks[block].transformerBlocks.map((value,i)=>i===basic?value:null)};
+  return {mainBlocks:t.mainBlocks.map((value,i)=>i===block?selected:null)};
+}
+
+/** Complete same-backbone consumer; diagnostic admission remains caller-owned. */
+async function runResidentTwoStream({device,backbone,memoryBudget,weightsUrl,expectedWeightBytes,
+  expectedSourceETag,imageTokensBuf,N_img,onBeforePhase,onBeforeDuty,onAfterDuty,onProgress,withResult,
+  foregroundOpportunities=null,linearRowsPerDuty=128,attentionRowsPerDuty=128,reuseDeadTriplaneStorage=false,
+  reuseAttentionResidualStorage=false,reuseAttentionProjectionStorage=false,rematerializeTokenizerEmbedding=false,reuseTokenizerSetupStorage=false,onBeforeSourceIntake}){
+  if(typeof reuseTokenizerSetupStorage!=='boolean'||(reuseTokenizerSetupStorage&&!rematerializeTokenizerEmbedding))
+    throw TypeError('tokenizer setup reuse requires explicit canonical rematerialization');
+  if(typeof rematerializeTokenizerEmbedding!=='boolean')throw TypeError('explicit boolean tokenizer rematerialization required');
+  if(typeof reuseDeadTriplaneStorage!=='boolean')throw TypeError('explicit boolean dead-triplane reuse required');
+  if(typeof reuseAttentionResidualStorage!=='boolean'||(reuseAttentionResidualStorage&&!reuseDeadTriplaneStorage))
+    throw TypeError('attention residual reuse requires explicit owned dead-triplane reuse');
+  if(typeof reuseAttentionProjectionStorage!=='boolean'||(reuseAttentionProjectionStorage&&!reuseAttentionResidualStorage))
+    throw TypeError('attention projection row reuse requires owned residual reuse');
+  if(!isLoaderMemoryBudget(memoryBudget))throw TypeError('authenticated loader budget required');
+  memoryBudget.assertDeviceAcquiredHere(device);
+  if(backbone?.device!==device||backbone._residentAdapterOwner)throw Error('owned nonquarantined backbone required');
+  if(N_img!==1297||imageTokensBuf?.size!==1297*1024*4)throw Error('complete SF3D DINO tokens required');
+  if(typeof onBeforePhase!=='function'||typeof onBeforeDuty!=='function'||typeof withResult!=='function')
+    throw TypeError('fresh weight/duty observers and complete result consumer required');
+  const owner={buffers:new Set(),allocations:[],source:null};
+  backbone._residentAdapterOwner=owner;
+  let failure,failed=false;
+  try{
+    owner.source=await createWeightPhaseSource(device,weightsUrl,{memoryBudget,expectedWeightBytes,expectedSourceETag,onBeforeSourceIntake,streamFp16Uploads:true});
+    const source=owner.source,template=source.template;
+    let embedding,tokenizerEmbeddingRetirement,setupTokenizerEmbeddingRetirement;
+    const materializeEmbedding=async(prefix='')=>{
+      await onBeforePhase({name:'two-stream-embedding-'+prefix+'weights',tensors:source.describe(template.tokenizer),workGpuBytes:0});
+      await source.withWeights(template.tokenizer,async selected=>{
+        // Conversion custody has ended, not necessarily physical backing.
+        // A fresh post-upload observation includes anything still resident.
+        await onBeforePhase({name:'two-stream-embedding-'+prefix+'rearrange',tensors:[],workGpuBytes:3*1024*96*96*4+20});
+        const encoder=device.createCommandEncoder();
+        captureGpuBufferAllocations(()=>{
+          embedding=dispatchTokenizerEmbedding(encoder,device,backbone.pipelines,selected.embeddings);
+        },{ownedAllocations:owner.allocations});
+        device.queue.submit([encoder.finish()]);await device.queue.onSubmittedWorkDone();
+      });
+    };
+    await materializeEmbedding();
+    const executed=await runCooperativeTwoStream({device,backbone,imageTokensBuf,N_img,weights:{},
+      dutyGranularity:'attention-tile',linearRowsPerDuty,attentionRowsPerDuty,residentFFN:true,retireIntermediateBuffers:true,
+      reuseDeadTriplaneStorage,
+      reuseAttentionResidualStorage,
+      reuseAttentionQueryStorage:true,
+      reuseAttentionProjectionStorage,
+      reuseTokenizerSetupStorage,rematerializeTokenizerEmbedding,
+      foregroundOpportunities,onProgress,onBeforeDuty,onAfterDuty,
+      async withGroupWeights(group,work){
+        if(group.stageId==='final'&&rematerializeTokenizerEmbedding)
+          await materializeEmbedding('rematerialize-');
+        const selection=selectTwoStreamPhase(template,group.stageId);
+        await onBeforePhase({name:'two-stream-'+group.stageId,tensors:source.describe(selection)});
+        const value=await source.withWeights(selection,weights=>work(group.stageId==='setup'||group.stageId==='final'
+          ?{...weights,tokenizer_embeddings_buf:embedding}:weights));
+        if(group.stageId==='setup'&&rematerializeTokenizerEmbedding){
+          setupTokenizerEmbeddingRetirement=await retireConsumedTokenizerEmbedding(device,owner,'setup');
+          embedding=null;
+        }
+        if(group.stageId==='final'){
+          tokenizerEmbeddingRetirement=await retireConsumedTokenizerEmbedding(device,owner,'final');
+          if(backbone._diagnosticBuffers?.rearrangedEmb===embedding)delete backbone._diagnosticBuffers.rearrangedEmb;
+          embedding=null;
+        }
+        return value;
+      },
+    });
+    owner.buffers.add(executed.result.buffer);
+    if(executed.report?.adapterTelemetry?.reuseAttentionQueryStorage!==true||
+      (executed.report.adapterTelemetry.reuseAttentionProjectionStorage??false)!==reuseAttentionProjectionStorage)
+      throw Error('resident effective attention query reuse mismatch');
+    if(executed.result.C!==1024||executed.result.N!==27648||executed.result.planeSize!==96||
+      executed.result.buffer.size!==3*1024*96*96*4)throw Error('complete triplane feature shape changed');
+    await onBeforeDuty({kind:'output',dutyId:'two-stream-output'},null);
+    const value=await withResult(executed.result);
+    return {value,cooperative:executed.report,loadingReport:source.loadingReport,weightPhases:source.phases,
+      shape:[3,1024,96,96],blocks:4,basicBlocks:12,residentFFN:true,linearRowsPerDuty,attentionRowsPerDuty,reuseDeadTriplaneStorage,
+      reuseAttentionQueryStorage:executed.report.adapterTelemetry.reuseAttentionQueryStorage,
+      reuseAttentionResidualStorage,reuseAttentionProjectionStorage,rematerializeTokenizerEmbedding,reuseTokenizerSetupStorage,
+      tokenizerEmbeddingRetirement,setupTokenizerEmbeddingRetirement};
+  }catch(error){failed=true;failure=error;throw error;}
+  finally{
+    try{await disposeResidentTwoStream(backbone);}
+    catch(error){throw failed?new AggregateError([failure,error],'resident two-stream failed and cleanup is unresolved',{cause:failure}):error;}
+  }
+}
+
+/** Recovery retains exact source/work inventories on the caller's backbone. */
+async function disposeResidentTwoStream(backbone){
+  const owner=backbone._residentAdapterOwner;if(!owner)return;
+  for(const allocation of owner.allocations)owner.buffers.add(allocation.buffer);
+  owner.allocations.length=0;
+  await backbone.device.queue.onSubmittedWorkDone();
+  const errors=[];
+  try{await retireTwoStreamWork(backbone);}catch(error){errors.push(error);}
+  for(const buffer of [...owner.buffers,...backbone._uniformCache.values()]){
+    try{buffer.destroy();owner.buffers.delete(buffer);
+      for(const [key,value] of backbone._uniformCache)if(value===buffer)backbone._uniformCache.delete(key);
+    }catch(error){errors.push(error);}
+  }
+  if(owner.source)try{await owner.source.dispose();owner.source=null;}catch(error){errors.push(error);}
+  if(errors.length)throw new AggregateError(errors,'resident two-stream retirement failed');
+  backbone._residentAdapterOwner=null;
+}
+
+function selectPostProcessorPhase(template, layerIndex) {
+  const layers=template?.postProcessor?.convLayers;
+  if(!Array.isArray(layers)||layers.length!==4||!Number.isSafeInteger(layerIndex)
+      ||layerIndex<0||layerIndex>=4)throw TypeError('exact four-layer postprocessor selection required');
+  return {convLayers:layers.map((layer,index)=>index===layerIndex?layer:null)};
+}
+
+/** The complete existing upsampler consumes borrowed backbone output; no eager weights. */
+async function runResidentPostProcessor({device,postProcessor,memoryBudget,weightsUrl,
+  expectedWeightBytes,expectedSourceETag,triplanesBuf,onBeforePhase,onBeforeDuty,onAfterDuty,
+  onProgress,withResult,foregroundOpportunities=null,channelsPerDuty=16,onBeforeSourceIntake}) {
+  if(!isLoaderMemoryBudget(memoryBudget))throw TypeError('authenticated loader budget required');
+  memoryBudget.assertDeviceAcquiredHere(device);
+  if(postProcessor?.device!==device||postProcessor._residentAdapterOwner||postProcessor._postProcessorWorkOwner)
+    throw Error('owned nonquarantined postprocessor handle required');
+  if(triplanesBuf?.size!==113246208)throw Error('complete [3,1024,96,96] borrowed backbone input required');
+  if(typeof onBeforePhase!=='function'||typeof onBeforeDuty!=='function'||typeof withResult!=='function')
+    throw TypeError('fresh phase/duty observers and complete result consumer required');
+  const owner={source:null,buffers:new Set()};
+  postProcessor._residentAdapterOwner=owner;
+  let failed=false,failure;
+  try {
+    owner.source=await createWeightPhaseSource(device,weightsUrl,
+      {memoryBudget,expectedWeightBytes,expectedSourceETag,onBeforeSourceIntake});
+    const source=owner.source;
+    const executed=await runCooperativePostProcessor({
+      device,triplanesBuf,weights:{convLayers:[null,null,null,null]},
+      dutyGranularity:'channel-range',channelsPerDuty,schedulingMode:'cooperative',
+      completionPolicy:'strict-prefix',residentWork:postProcessor,
+      onBeforeDuty,onAfterDuty,onProgress,foregroundOpportunities,
+      async withGroupWeights(group,work) {
+        if(group.kind!=='conv-range')return work({convLayers:[null,null,null,null]});
+        const selection=selectPostProcessorPhase(source.template,group.layerIndex);
+        await onBeforePhase({name:'post-processor-plane-'+group.plane+'-'+group.stageId,
+          tensors:source.describe(selection),workGpuBytes:0});
+        return source.withWeights(selection,work);
+      },
+    });
+    owner.buffers.add(executed.result.buffer);
+    const result=executed.result;
+    if(result.C!==40||result.H!==384||result.W!==384||result.numPlanes!==3
+        ||result.buffer.size!==70778880)throw Error('complete postprocessor output shape changed');
+    const value=await withResult(result);
+    return {value,shape:[3,40,384,384],planes:3,convolutionsPerPlane:4,
+      channelsPerDuty,cooperative:executed.report,loadingReport:source.loadingReport,
+      weightPhases:source.phases};
+  } catch(error) {failed=true;failure=error;throw error;}
+  finally {
+    try {await disposeResidentPostProcessor(postProcessor);}
+    catch(error) {throw failed?new AggregateError([failure,error],
+      'resident postprocessor failed and cleanup is unresolved',{cause:failure}):error;}
+  }
+}
+
+/** Exact queue/destruction recovery remains reachable on the caller's handle. */
+async function disposeResidentPostProcessor(postProcessor) {
+  const owner=postProcessor._residentAdapterOwner;
+  if(!owner&&!postProcessor._postProcessorWorkOwner)return;
+  await postProcessor.device.queue.onSubmittedWorkDone();
+  const errors=[];
+  try {
+    await retirePostProcessorWork(postProcessor);
+    postProcessor._postProcessorWorkOwner=null;
+  } catch(error) {errors.push(error);}
+  for(const buffer of owner?.buffers??[]) {
+    try {buffer.destroy();owner.buffers.delete(buffer);}
+    catch(error) {errors.push(error);}
+  }
+  if(owner?.source)try {await owner.source.dispose();owner.source=null;}
+  catch(error) {errors.push(error);}
+  if(errors.length)throw new AggregateError(errors,'resident postprocessor retirement failed');
+  postProcessor._residentAdapterOwner=null;
+}
+
+const channels={density:1,vertex_offset:3,features:3,perturb_normal:3};
+
+function selectDecoderHeads(template,heads){
+  if(!Array.isArray(heads)||!heads.length||new Set(heads).size!==heads.length||
+    heads.some(h=>!channels[h]||!Array.isArray(template?.decoder?.heads?.[h])||
+      template.decoder.heads[h].length!==(h==='density'||h==='vertex_offset'?3:4)))
+    throw TypeError('complete canonical selected decoder heads required');
+  return {heads:Object.fromEntries(heads.map(h=>[h,template.decoder.heads[h]]))};
+}
+
+/** Canonical range source/selected full heads; no eager complete weight set. */
+async function runResidentDecoder({device,decoder,memoryBudget,weightsUrl,
+  expectedWeightBytes,expectedSourceETag,positions,triplanesBuf,heads,batchPoints,
+  onBeforePhase,onBeforeDuty,withResult,onBeforeSourceIntake,onAfterDuty}){
+  if(!isLoaderMemoryBudget(memoryBudget))throw TypeError('authenticated loader budget required');
+  memoryBudget.assertDeviceAcquiredHere(device);
+  if(decoder?.device!==device||decoder._residentDecoderAdapterOwner||decoder._residentQueryWorkOwner)
+    throw Error('owned nonquarantined decoder handle required');
+  if(typeof onBeforePhase!=='function'||typeof onBeforeDuty!=='function'||typeof withResult!=='function')
+    throw TypeError('fresh phase/range guards and complete consumer required');
+  const owner={source:null};decoder._residentDecoderAdapterOwner=owner;
+  let failed=false,failure;
+  try{
+    owner.source=await createWeightPhaseSource(device,weightsUrl,
+      {memoryBudget,expectedWeightBytes,expectedSourceETag,onBeforeSourceIntake});
+    const source=owner.source,selection=selectDecoderHeads(source.template,heads);
+    await onBeforePhase({name:'decoder-selected-complete-heads',tensors:source.describe(selection),workGpuBytes:0});
+    const result=await source.withWeights(selection,weights=>runResidentDecoderQueries({device,decoder,
+      memoryBudget,positions,triplanesBuf,weights,heads,batchPoints,onBeforePhase,onBeforeDuty,withResult,onAfterDuty}));
+    return {...result,loadingReport:source.loadingReport,weightPhases:source.phases};
+  }catch(error){failed=true;failure=error;throw error;}
+  finally{try{await disposeResidentDecoder(decoder);}
+    catch(error){throw failed?new AggregateError([failure,error],
+      'resident decoder failed and owned cleanup unresolved',{cause:failure}):error;}}
+}
+
+async function disposeResidentDecoder(decoder){
+  await disposeResidentDecoderQueries(decoder);
+  const owner=decoder._residentDecoderAdapterOwner;if(!owner)return;
+  if(owner.source){await owner.source.dispose();owner.source=null;}
+  decoder._residentDecoderAdapterOwner=null;
+}
+
+/** Identified existing decoder allocation graph, not opaque driver memory.
+ * Every point is processed; batchPoints bounds reusable scratch, never output. */
+function describeResidentDecoderDemand({numPoints,batchPoints,heads,weights}){
+  if(!Number.isSafeInteger(numPoints)||numPoints<1||!Number.isSafeInteger(batchPoints)||batchPoints<1)
+    throw TypeError('positive complete point count and explicit batch size required');
+  if(!Array.isArray(heads)||!heads.length||new Set(heads).size!==heads.length||
+    heads.some(h=>!channels[h]||!Array.isArray(weights?.heads?.[h])||weights.heads[h].length!==(h==='density'||h==='vertex_offset'?3:4)))
+    throw TypeError('exact selected canonical decoder heads required');
+  const capacity=Math.min(numPoints,batchPoints);
+  // scaled xyz, 3xy grids, 3 sampled40 channels, concatenated120 channels.
+  let perPoint=12+3*8+3*160+480,base=0;
+  // Sum every actual uniform call without relying on cache deduplication:
+  // scale16 + extract3*16 + sample3*20 + concat16; head linear20,
+  // hidden SiLU16, density bias/exp16+16 or other final activation16.
+  let uniformPerShape=16+3*16+3*20+16;
+  for(const h of heads){const hidden=weights.heads[h].length-1;
+    perPoint+=hidden*2*64*4+channels[h]*4;
+    base+=hidden*4; // actual SiLU dummy buffers
+    if(h!=='vertex_offset')perPoint+=channels[h]*4;
+    uniformPerShape+=weights.heads[h].length*20+hidden*16+
+      (h==='density'?32:h==='vertex_offset'?0:16);
+  }
+  const resultChannels=heads.reduce((n,h)=>n+channels[h],0);
+  const outputCpuBytes=numPoints*resultChannels*4;
+  const readbackBytes=capacity*Math.max(...heads.map(h=>channels[h]))*4;
+  // Only full range and optional tail have distinct N. This is a source-derived
+  // allocation bound, not an arbitrary device cap or a physical-memory claim.
+  const uniformBytes=uniformPerShape*(numPoints%capacity?2:1);
+  const workGpuBytes=(perPoint+12)*capacity+base+uniformBytes+readbackBytes;
+  const rangeCpuBytes=2*readbackBytes;
+  return {capacity,outputCpuBytes,workGpuBytes,rangeCpuBytes,
+    requiredBytes:workGpuBytes+rangeCpuBytes,
+    components:{decoderPerPointBytes:perPoint,decoderBaseBytes:base,
+      inputGpuBytes:12*capacity,readbackBytes,uniformBytes},
+    authority:'identified explicit complete-query backing; no physical reclaim or driver-capacity guarantee'};
+}
+
+/** Borrowed weights/triplanes/device remain owned by the awaited parent. */
+async function runResidentDecoderQueries({device,decoder,memoryBudget,positions,triplanesBuf,
+  weights,heads,batchPoints,onBeforePhase,onBeforeDuty,withResult,onAfterDuty}){
+  if(!isLoaderMemoryBudget(memoryBudget))throw TypeError('authenticated loader budget required');
+  memoryBudget.assertDeviceAcquiredHere(device);
+  if(decoder?.device!==device||decoder._residentQueryWorkOwner||decoder._slotProvider||decoder._uniformCache.size)
+    throw Error('owned empty nonquarantined decoder required');
+  if(!(positions instanceof Float32Array)||!positions.length||positions.length%3||
+    triplanesBuf?.size!==70778880)throw TypeError('complete xyz positions and borrowed postprocessor shape required');
+  if(typeof onBeforePhase!=='function'||typeof onBeforeDuty!=='function'||typeof withResult!=='function')
+    throw TypeError('fresh output/range guards and awaited complete consumer required');
+  const numPoints=positions.length/3,demand=describeResidentDecoderDemand({numPoints,batchPoints,heads,weights});
+  const owner={allocations:[],slots:new Map(),leases:[],previousProvider:decoder._slotProvider};
+  decoder._residentQueryWorkOwner=owner;
+  let failed=false,failure;
+  try{
+    await onBeforePhase({name:'decoder-complete-output-allocation',numPoints,heads,
+      workGpuBytes:0,rangeCpuBytes:demand.outputCpuBytes,requiredBytes:demand.outputCpuBytes});
+    owner.leases.push(memoryBudget.reserveCpu(demand.outputCpuBytes,'complete-decoder-results'));
+    const output=Object.fromEntries(heads.map(h=>[h,new Float32Array(numPoints*channels[h])])),ranges=[];
+    let input,staging;
+    decoder._slotProvider={acquire(key,size){
+      let slot=owner.slots.get(key);
+      if(!slot){slot=createEmptyBuffer(device,size,0,'resident-decoder:'+key);owner.slots.set(key,slot);}
+      if(size>slot.size)throw Error('actual decoder slot capacity drift: '+key);
+      return slot;
+    }};
+    for(let start=0;start<numPoints;start+=demand.capacity){
+      const end=Math.min(numPoints,start+demand.capacity),count=end-start;
+      const duty={kind:'decoder-point-range',start,end,numPoints,heads,
+        workGpuBytes:start===0?demand.workGpuBytes:demand.components.uniformBytes,
+        rangeCpuBytes:demand.rangeCpuBytes};
+      duty.requiredBytes=duty.workGpuBytes+duty.rangeCpuBytes;
+      await onBeforeDuty(duty);
+      const encoder=device.createCommandEncoder();
+      let decoded;
+      captureGpuBufferAllocations(()=>{
+        if(!input)input=createEmptyBuffer(device,demand.capacity*12,0,'resident-decoder-input');
+        if(!staging){staging=device.createBuffer({size:demand.components.readbackBytes,
+          usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ,label:'resident-decoder-readback'});
+          owner.allocations.push({buffer:staging,size:staging.size});}
+        device.queue.writeBuffer(input,0,positions.subarray(start*3,end*3));
+        decoded=decoder.decode(encoder,input,triplanesBuf,count,weights,heads);
+      },{ownedAllocations:owner.allocations});
+      device.queue.submit([encoder.finish()]);
+      await device.queue.onSubmittedWorkDone();
+      for(const head of heads){
+        const bytes=count*channels[head]*4,copy=device.createCommandEncoder();
+        copy.copyBufferToBuffer(decoded[head],0,staging,0,bytes);device.queue.submit([copy.finish()]);
+        const lease=memoryBudget.reserveCpu(demand.rangeCpuBytes,'decoder-range-readback');
+        try{await staging.mapAsync(GPUMapMode.READ);
+          const values=new Float32Array(staging.getMappedRange().slice(0,bytes));
+          for(const value of values)if(!Number.isFinite(value))throw Error('nonfinite complete decoder result');
+          output[head].set(values,start*channels[head]);staging.unmap();
+        }finally{lease.release();}
+      }
+      ranges.push({start,end,numPoints,heads:[...heads],queueCompletionAuthority:'actual-prefix-before-range-reuse'});
+      await onAfterDuty?.(ranges.at(-1));
+      await new Promise(resolve=>setTimeout(resolve,0));
+    }
+    const value=await withResult(output);
+    return {value,numPoints,heads:[...heads],batchPoints,demand,ranges,
+      slotInventory:[...owner.slots].map(([slotKey,buffer])=>({slotKey,bytes:buffer.size})),
+      authority:'complete selected point queries; no mesh/material/GLB or reference parity claim'};
+  }catch(error){failed=true;failure=error;throw error;}
+  finally{
+    try{await disposeResidentDecoderQueries(decoder);}
+    catch(error){throw failed?new AggregateError([failure,error],'decoder failed and owned cleanup unresolved',{cause:failure}):error;}
+  }
+}
+
+async function disposeResidentDecoderQueries(decoder){
+  const owner=decoder._residentQueryWorkOwner;if(!owner)return;
+  await decoder.device.queue.onSubmittedWorkDone();
+  const errors=[];
+  for(const allocation of [...owner.allocations]){
+    try{allocation.buffer.destroy();owner.allocations.splice(owner.allocations.indexOf(allocation),1);}
+    catch(error){errors.push(error);}
+  }
+  if(errors.length)throw new AggregateError(errors,'decoder owned retirement unresolved');
+  decoder._slotProvider=owner.previousProvider;decoder._uniformCache.clear();
+  owner.slots.clear();for(const lease of owner.leases)lease.release();owner.leases=[];
+  decoder._residentQueryWorkOwner=null;
+}
+
+/**
+ * clip_prep_core.js — pure CPU preparation for the CLIP material estimator:
+ * alpha-blend, 512→224 bilinear resize + normalize, and the 32×32 patch
+ * embedding (49 patches × 3072 → 768, plus CLS and positional embeddings).
+ *
+ * This is the exact math that lived inline in main.js (blend) and
+ * clip_estimator.js (_preprocessForCLIP / _patchEmbed), extracted unchanged so
+ * it can run on a Web Worker (clip_prep_worker.js) with byte-identical output.
+ * The patch embedding alone is ~115M multiply-adds in JavaScript — the largest
+ * single contiguous main-thread stall in the route (~225ms) when run inline.
+ *
+ * No DOM, no GPU: typed arrays in, typed arrays out.
+ */
+
+const CLIP_HIDDEN_DIM = 768;
+const CLIP_PATCH_SIZE = 32;
+const CLIP_IMAGE_SIZE = 224;
+const CLIP_NUM_PATCHES = (CLIP_IMAGE_SIZE / CLIP_PATCH_SIZE) ** 2; // 49
+const CLIP_NUM_TOKENS = CLIP_NUM_PATCHES + 1; // 50
+const CLIP_PATCH_DIM = 3 * CLIP_PATCH_SIZE * CLIP_PATCH_SIZE; // 3072
+
+const CLIP_MEAN = Object.freeze([0.48145466, 0.4578275, 0.40821073]);
+const CLIP_STD = Object.freeze([0.26862954, 0.26130258, 0.27577711]);
+
+const CLIP_PREP_WEIGHT_NAMES = Object.freeze({
+  conv1W: 'image_estimator.model.visual.conv1.weight',        // [768, 3, 32, 32]
+  classEmb: 'image_estimator.model.visual.class_embedding',    // [768]
+  posEmb: 'image_estimator.model.visual.positional_embedding', // [50, 768]
+});
+
+/**
+ * Pull the three CPU-side prep tensors out of the loaded weight set.
+ * @param {object} weights  the loaded SF3D weights (has _rawGetCPU)
+ */
+function clipPrepWeightsFrom(weights) {
+  const conv1W = weights._rawGetCPU(CLIP_PREP_WEIGHT_NAMES.conv1W);
+  const classEmb = weights._rawGetCPU(CLIP_PREP_WEIGHT_NAMES.classEmb);
+  const posEmb = weights._rawGetCPU(CLIP_PREP_WEIGHT_NAMES.posEmb);
+  return validateClipPrepWeights({ conv1W, classEmb, posEmb });
+}
+
+function validateClipPrepWeights({ conv1W, classEmb, posEmb }) {
+  if (!(conv1W instanceof Float32Array) || conv1W.length !== CLIP_HIDDEN_DIM * CLIP_PATCH_DIM) {
+    throw new Error(`clip conv1 weight must be Float32Array[${CLIP_HIDDEN_DIM * CLIP_PATCH_DIM}], got ${conv1W?.length}`);
+  }
+  if (!(classEmb instanceof Float32Array) || classEmb.length !== CLIP_HIDDEN_DIM) {
+    throw new Error(`clip class embedding must be Float32Array[${CLIP_HIDDEN_DIM}], got ${classEmb?.length}`);
+  }
+  if (!(posEmb instanceof Float32Array) || posEmb.length !== CLIP_NUM_TOKENS * CLIP_HIDDEN_DIM) {
+    throw new Error(`clip positional embedding must be Float32Array[${CLIP_NUM_TOKENS * CLIP_HIDDEN_DIM}], got ${posEmb?.length}`);
+  }
+  return { conv1W, classEmb, posEmb };
+}
+
+/**
+ * Match the PyTorch preprocessing order exactly:
+ *   1. (caller) PIL/canvas resize to cond_image_size on uint8 RGBA
+ *   2. convert to float, alpha-blend with grey [0.5, 0.5, 0.5]
+ *   3. multiply by mask (alpha)
+ * Returns float32 RGBA (premultiplied by mask), same length as the input.
+ * @param {Uint8ClampedArray|Uint8Array} rgba8  width*height*4 bytes
+ */
+function blendClipPixels(rgba8, width, height) {
+  const count = width * height;
+  if (rgba8.length !== count * 4) {
+    throw new Error(`clip input must be ${count * 4} RGBA bytes for ${width}x${height}, got ${rgba8.length}`);
+  }
+  const clipPixels = new Float32Array(count * 4);
+  for (let i = 0; i < rgba8.length; i++) clipPixels[i] = rgba8[i] / 255.0;
+  for (let i = 0; i < count; i++) {
+    const a = clipPixels[i * 4 + 3];
+    clipPixels[i * 4]     = (clipPixels[i * 4] * a + 0.5 * (1 - a)) * a;
+    clipPixels[i * 4 + 1] = (clipPixels[i * 4 + 1] * a + 0.5 * (1 - a)) * a;
+    clipPixels[i * 4 + 2] = (clipPixels[i * 4 + 2] * a + 0.5 * (1 - a)) * a;
+  }
+  return clipPixels;
+}
+
+/**
+ * Float RGBA (blended) → normalized CHW float32 [3, 224, 224].
+ * First resizes to cond_image_size (512) if needed, then 512→224 bilinear
+ * (F.interpolate, align_corners=False) and CLIP mean/std normalization.
+ */
+function preprocessForClip(pixels, width, height) {
+  let img = pixels;
+  let w = width, h = height;
+  const S = CLIP_IMAGE_SIZE;
+  const out = new Float32Array(3 * S * S);
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const srcX = Math.max(0, (x + 0.5) * (w / S) - 0.5);
+      const srcY = Math.max(0, (y + 0.5) * (h / S) - 0.5);
+      const x0 = Math.floor(srcX), y0 = Math.floor(srcY);
+      const x1 = Math.min(x0 + 1, w - 1), y1 = Math.min(y0 + 1, h - 1);
+      const fx = srcX - x0, fy = srcY - y0;
+      for (let c = 0; c < 3; c++) {
+        const v = img[(y0 * w + x0) * 4 + c] * (1-fx)*(1-fy) +
+                  img[(y0 * w + x1) * 4 + c] * fx*(1-fy) +
+                  img[(y1 * w + x0) * 4 + c] * (1-fx)*fy +
+                  img[(y1 * w + x1) * 4 + c] * fx*fy;
+        out[c * S * S + y * S + x] = (v - CLIP_MEAN[c]) / CLIP_STD[c];
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * CLIP ViT-B/32 patch embedding: CHW [3,224,224] → [50, 768] tokens
+ * (CLS + 49 patches), positional embedding added.
+ */
+function patchEmbedClip(image, { conv1W, classEmb, posEmb }) {
+  if (!(image instanceof Float32Array) || image.length !== 3 * CLIP_IMAGE_SIZE * CLIP_IMAGE_SIZE) {
+    throw new Error(`clip image must be Float32Array[${3 * CLIP_IMAGE_SIZE * CLIP_IMAGE_SIZE}], got ${image?.length}`);
+  }
+  const D = CLIP_HIDDEN_DIM, P = CLIP_PATCH_SIZE, S = CLIP_IMAGE_SIZE;
+  const patchDim = CLIP_PATCH_DIM;
+  const result = new Float32Array(CLIP_NUM_TOKENS * D);
+
+  for (let d = 0; d < D; d++) result[d] = classEmb[d];
+
+  for (let py = 0; py < 7; py++) {
+    for (let px = 0; px < 7; px++) {
+      const patchIdx = py * 7 + px;
+      for (let d = 0; d < D; d++) {
+        let sum = 0;
+        for (let c = 0; c < 3; c++) {
+          for (let dy = 0; dy < P; dy++) {
+            for (let dx = 0; dx < P; dx++) {
+              sum += image[c * S * S + (py*P+dy) * S + (px*P+dx)]
+                   * conv1W[d * patchDim + c * P * P + dy * P + dx];
+            }
+          }
+        }
+        result[(patchIdx + 1) * D + d] = sum;
+      }
+    }
+  }
+
+  for (let i = 0; i < CLIP_NUM_TOKENS * D; i++) result[i] += posEmb[i];
+  return result;
+}
+
+/**
+ * The complete CPU prep: uint8 RGBA (already resized to cond size by the
+ * caller's canvas) → [50, 768] token embeddings ready for the transformer.
+ */
+function prepareClipEmbeddings(rgba8, width, height, prepWeights) {
+  const w = validateClipPrepWeights(prepWeights);
+  const blended = blendClipPixels(rgba8, width, height);
+  const chw = preprocessForClip(blended, width, height);
+  return patchEmbedClip(chw, w);
+}
+
+/** Shape check for a prep result (main thread or worker reply). */
+function validateClipEmbeddings(embeddings) {
+  if (!(embeddings instanceof Float32Array) || embeddings.length !== CLIP_NUM_TOKENS * CLIP_HIDDEN_DIM) {
+    throw new Error(`clip embeddings must be Float32Array[${CLIP_NUM_TOKENS * CLIP_HIDDEN_DIM}], got ${embeddings?.length}`);
+  }
+  for (let i = 0; i < embeddings.length; i++) {
+    if (!Number.isFinite(embeddings[i])) throw new Error(`clip embeddings contain a non-finite value at ${i}`);
+  }
+  return embeddings;
+}
+
+/**
+ * clip_estimator.js — CLIP-based material property estimator for SF3D.
+ *
+ * Runs CLIP ViT-B/32 visual encoder on the input image, then two small MLP
+ * heads to predict roughness and metallic as beta distribution modes.
+ *
+ * Architecture:
+ *   - Patch embedding: 32×32 stride-32 conv → 49 patches of 768d
+ *   - CLS token prepend → 50 tokens
+ *   - 12 transformer blocks: LN → fused QKV attention (12 heads) → LN → MLP (GELU)
+ *   - LN → CLS token → visual projection (768→512)
+ *   - Two MLP heads: shared 3-layer (512→512, ReLU) → two branches → beta params → mode
+ */
+
+
+const HIDDEN_DIM = 768;
+const NUM_HEADS = 12;
+const HEAD_DIM = 64;
+const MLP_DIM = 3072;
+const NUM_BLOCKS = 12;
+const NUM_TOKENS = 50; // 49 patches + CLS
+const PROJ_DIM = 512;
+const WG_SIZE = 256;
+
+
+// Pipelines can be shared only within one device. Weight bindings additionally
+// belong to one weight-set identity; neither cache owns the buffers returned
+// by an accessor (an injected accessor may return host-owned resources).
+const _pipelinePromises = new WeakMap();
+const _deviceWeightBuffers = new WeakMap();
+
+const RUNTIME_CLIP_SHADER_URLS = Object.freeze({
+  linear: new URL("data:text/wgsl;base64,Ly8gTGluZWFyIHByb2plY3Rpb246IG91dHB1dCA9IGlucHV0IEAgd2VpZ2h0ICsgYmlhcw0KLy8gQWRhcHRlZCBmcm9tIHdlYmdwdS1zYW1wbGVzIHZpc2lvblRyYW5zZm9ybWVyIG1scC53Z3NsIHdpdGggMkQgZGlzcGF0Y2guDQovLw0KLy8gV2VpZ2h0IGxheW91dCBjb250cm9sbGVkIGJ5IHBhcmFtcy50cmFuc3Bvc2VkOg0KLy8gICB0cmFuc3Bvc2VkPTEgKGRlZmF1bHQpOiB3ZWlnaHQgaXMgW2luRGltLCBvdXREaW1dLCBhY2Nlc3Mgd2VpZ2h0W2sgKiBvdXREaW0gKyBjb2xdDQovLyAgIHRyYW5zcG9zZWQ9MDogd2VpZ2h0IGlzIFtvdXREaW0sIGluRGltXSAoUHlUb3JjaCBuYXRpdmUpLCBhY2Nlc3Mgd2VpZ2h0W2NvbCAqIGluRGltICsga10NCg0Kc3RydWN0IFBhcmFtcyB7DQogIG51bVJvd3M6IHUzMiwNCiAgaW5EaW06IHUzMiwNCiAgb3V0RGltOiB1MzIsDQogIG51bVdvcmtncm91cHNYOiB1MzIsDQogIHRyYW5zcG9zZWQ6IHUzMiwgIC8vIDE9dHJhbnNwb3NlZCBbaW5EaW0sIG91dERpbV0sIDA9bmF0aXZlIFtvdXREaW0sIGluRGltXQ0KfQ0KDQpAZ3JvdXAoMCkgQGJpbmRpbmcoMCkgdmFyPHVuaWZvcm0+IHBhcmFtczogUGFyYW1zOw0KQGdyb3VwKDApIEBiaW5kaW5nKDEpIHZhcjxzdG9yYWdlLCByZWFkPiBpbnB1dDogYXJyYXk8ZjMyPjsNCkBncm91cCgwKSBAYmluZGluZygyKSB2YXI8c3RvcmFnZSwgcmVhZD4gd2VpZ2h0OiBhcnJheTxmMzI+Ow0KQGdyb3VwKDApIEBiaW5kaW5nKDMpIHZhcjxzdG9yYWdlLCByZWFkPiBiaWFzOiBhcnJheTxmMzI+Ow0KQGdyb3VwKDApIEBiaW5kaW5nKDQpIHZhcjxzdG9yYWdlLCByZWFkX3dyaXRlPiBvdXRwdXQ6IGFycmF5PGYzMj47DQoNCmNvbnN0IFdHX1NJWkU6IHUzMiA9IDI1NjsNCg0KQGNvbXB1dGUgQHdvcmtncm91cF9zaXplKFdHX1NJWkUpDQpmbiBtYWluKA0KICBAYnVpbHRpbih3b3JrZ3JvdXBfaWQpIHdnaWQ6IHZlYzM8dTMyPiwNCiAgQGJ1aWx0aW4obG9jYWxfaW52b2NhdGlvbl9pZCkgbGlkOiB2ZWMzPHUzMj4sDQopIHsNCiAgbGV0IGxpbmVhcldHID0gd2dpZC54ICsgd2dpZC55ICogcGFyYW1zLm51bVdvcmtncm91cHNYOw0KICBsZXQgaWR4ID0gbGluZWFyV0cgKiBXR19TSVpFICsgbGlkLng7DQoNCiAgaWYgKGlkeCA+PSBwYXJhbXMubnVtUm93cyAqIHBhcmFtcy5vdXREaW0pIHsgcmV0dXJuOyB9DQoNCiAgbGV0IHJvdyA9IGlkeCAvIHBhcmFtcy5vdXREaW07DQogIGxldCBjb2wgPSBpZHggJSBwYXJhbXMub3V0RGltOw0KDQogIC8vIDQtd2F5IHNwbGl0IGFjY3VtdWxhdGlvbiBmb3IgYmV0dGVyIGZwMzIgcHJlY2lzaW9uIG9uIGxhcmdlIGRvdCBwcm9kdWN0cy4NCiAgdmFyIHMwID0gMC4wOw0KICB2YXIgczEgPSAwLjA7DQogIHZhciBzMiA9IDAuMDsNCiAgdmFyIHMzID0gMC4wOw0KICBsZXQgaW5CYXNlID0gcm93ICogcGFyYW1zLmluRGltOw0KICBsZXQgbGVuNCA9IChwYXJhbXMuaW5EaW0gLyA0dSkgKiA0dTsNCg0KICBpZiAocGFyYW1zLnRyYW5zcG9zZWQgPT0gMXUpIHsNCiAgICAvLyBUcmFuc3Bvc2VkIGxheW91dDogd2VpZ2h0W2ssIGNvbF0gPSB3ZWlnaHRbayAqIG91dERpbSArIGNvbF0NCiAgICBsZXQgd0Jhc2UgPSBjb2w7DQogICAgbGV0IHN0cmlkZSA9IHBhcmFtcy5vdXREaW07DQogICAgZm9yICh2YXIgayA9IDB1OyBrIDwgbGVuNDsgayArPSA0dSkgew0KICAgICAgczAgKz0gaW5wdXRbaW5CYXNlICsga10gICAgICAqIHdlaWdodFsoaykgICAgICAqIHN0cmlkZSArIHdCYXNlXTsNCiAgICAgIHMxICs9IGlucHV0W2luQmFzZSArIGsgKyAxdV0gKiB3ZWlnaHRbKGsgKyAxdSkgKiBzdHJpZGUgKyB3QmFzZV07DQogICAgICBzMiArPSBpbnB1dFtpbkJhc2UgKyBrICsgMnVdICogd2VpZ2h0WyhrICsgMnUpICogc3RyaWRlICsgd0Jhc2VdOw0KICAgICAgczMgKz0gaW5wdXRbaW5CYXNlICsgayArIDN1XSAqIHdlaWdodFsoayArIDN1KSAqIHN0cmlkZSArIHdCYXNlXTsNCiAgICB9DQogICAgZm9yICh2YXIgayA9IGxlbjQ7IGsgPCBwYXJhbXMuaW5EaW07IGsrKykgew0KICAgICAgczAgKz0gaW5wdXRbaW5CYXNlICsga10gKiB3ZWlnaHRbayAqIHN0cmlkZSArIHdCYXNlXTsNCiAgICB9DQogIH0gZWxzZSB7DQogICAgLy8gTmF0aXZlIGxheW91dDogd2VpZ2h0W2NvbCwga10gPSB3ZWlnaHRbY29sICogaW5EaW0gKyBrXQ0KICAgIGxldCB3QmFzZSA9IGNvbCAqIHBhcmFtcy5pbkRpbTsNCiAgICBmb3IgKHZhciBrID0gMHU7IGsgPCBsZW40OyBrICs9IDR1KSB7DQogICAgICBzMCArPSBpbnB1dFtpbkJhc2UgKyBrXSAgICAgICogd2VpZ2h0W3dCYXNlICsga107DQogICAgICBzMSArPSBpbnB1dFtpbkJhc2UgKyBrICsgMXVdICogd2VpZ2h0W3dCYXNlICsgayArIDF1XTsNCiAgICAgIHMyICs9IGlucHV0W2luQmFzZSArIGsgKyAydV0gKiB3ZWlnaHRbd0Jhc2UgKyBrICsgMnVdOw0KICAgICAgczMgKz0gaW5wdXRbaW5CYXNlICsgayArIDN1XSAqIHdlaWdodFt3QmFzZSArIGsgKyAzdV07DQogICAgfQ0KICAgIGZvciAodmFyIGsgPSBsZW40OyBrIDwgcGFyYW1zLmluRGltOyBrKyspIHsNCiAgICAgIHMwICs9IGlucHV0W2luQmFzZSArIGtdICogd2VpZ2h0W3dCYXNlICsga107DQogICAgfQ0KICB9DQogIG91dHB1dFtpZHhdID0gKHMwICsgczEpICsgKHMyICsgczMpICsgYmlhc1tjb2xdOw0KfQ0K", import.meta.url).href,
+  layernorm: new URL("data:text/wgsl;base64,Ly8gTGF5ZXIgbm9ybWFsaXphdGlvbiBmb3IgVmlUIGJhY2tib25lLg0KLy8gRWFjaCB3b3JrZ3JvdXAgbm9ybWFsaXplcyBvbmUgcm93ICh0b2tlbikuDQovLyBUaHJlYWQgMCBjb21wdXRlcyBtZWFuL3ZhcmlhbmNlIHNlcmlhbGx5LCB0aGVuIGFsbCB0aHJlYWRzIG5vcm1hbGl6ZSBpbiBwYXJhbGxlbC4NCi8vIEFkYXB0ZWQgZnJvbSB3ZWJncHUtc2FtcGxlcyB2aXNpb25UcmFuc2Zvcm1lciB3aXRoIDJEIGRpc3BhdGNoIHN1cHBvcnQuDQoNCnN0cnVjdCBQYXJhbXMgew0KICBOOiB1MzIsICAgICAgIC8vIG51bWJlciBvZiByb3dzICh0b2tlbnMpDQogIEQ6IHUzMiwgICAgICAgLy8gZGltZW5zaW9uIHBlciByb3cNCiAgZXBzOiBmMzIsDQp9DQoNCkBncm91cCgwKSBAYmluZGluZygwKSB2YXI8dW5pZm9ybT4gcGFyYW1zOiBQYXJhbXM7DQpAZ3JvdXAoMCkgQGJpbmRpbmcoMSkgdmFyPHN0b3JhZ2UsIHJlYWQ+IGlucHV0OiBhcnJheTxmMzI+Ow0KQGdyb3VwKDApIEBiaW5kaW5nKDIpIHZhcjxzdG9yYWdlLCByZWFkPiBnYW1tYTogYXJyYXk8ZjMyPjsNCkBncm91cCgwKSBAYmluZGluZygzKSB2YXI8c3RvcmFnZSwgcmVhZD4gYmV0YTogYXJyYXk8ZjMyPjsNCkBncm91cCgwKSBAYmluZGluZyg0KSB2YXI8c3RvcmFnZSwgcmVhZF93cml0ZT4gb3V0cHV0OiBhcnJheTxmMzI+Ow0KDQp2YXI8d29ya2dyb3VwPiBzaGFyZWRfbWVhbjogZjMyOw0KdmFyPHdvcmtncm91cD4gc2hhcmVkX2ludl9zdGQ6IGYzMjsNCg0KQGNvbXB1dGUgQHdvcmtncm91cF9zaXplKDI1NikNCmZuIG1haW4oDQogIEBidWlsdGluKHdvcmtncm91cF9pZCkgd2dfaWQ6IHZlYzN1LA0KICBAYnVpbHRpbihsb2NhbF9pbnZvY2F0aW9uX2lkKSBsb2NhbF9pZDogdmVjM3UsDQopIHsNCiAgbGV0IHJvdyA9IHdnX2lkLng7DQogIGxldCB0aWQgPSBsb2NhbF9pZC54Ow0KICBsZXQgRCA9IHBhcmFtcy5EOw0KICBsZXQgYmFzZSA9IHJvdyAqIEQ7DQoNCiAgaWYgKHJvdyA+PSBwYXJhbXMuTikgeyByZXR1cm47IH0NCg0KICAvLyBUaHJlYWQgMCBjb21wdXRlcyBtZWFuIGFuZCB2YXJpYW5jZSAodHdvLXBhc3MgZm9yIG51bWVyaWNhbCBzdGFiaWxpdHkpLg0KICAvLyBUaGUgb25lLXBhc3MgZm9ybXVsYSBFW3jCsl0tRVt4XcKyIHN1ZmZlcnMgY2F0YXN0cm9waGljIGNhbmNlbGxhdGlvbiB3aGVuDQogIC8vIHZhbHVlcyBhcmUgbGFyZ2UgKMKxMjAgY29tbW9uIGluIFZpVCksIGxvc2luZyBzaWduaWZpY2FudCBwcmVjaXNpb24uDQogIGlmICh0aWQgPT0gMHUpIHsNCiAgICB2YXIgc3VtID0gMC4wOw0KICAgIGZvciAodmFyIGkgPSAwdTsgaSA8IEQ7IGkrKykgew0KICAgICAgc3VtICs9IGlucHV0W2Jhc2UgKyBpXTsNCiAgICB9DQogICAgbGV0IG1lYW4gPSBzdW0gLyBmMzIoRCk7DQogICAgdmFyIHZhcl9zdW0gPSAwLjA7DQogICAgZm9yICh2YXIgaSA9IDB1OyBpIDwgRDsgaSsrKSB7DQogICAgICBsZXQgZGlmZiA9IGlucHV0W2Jhc2UgKyBpXSAtIG1lYW47DQogICAgICB2YXJfc3VtICs9IGRpZmYgKiBkaWZmOw0KICAgIH0NCiAgICBsZXQgdmFyaWFuY2UgPSB2YXJfc3VtIC8gZjMyKEQpOw0KICAgIHNoYXJlZF9tZWFuID0gbWVhbjsNCiAgICBzaGFyZWRfaW52X3N0ZCA9IDEuMCAvIHNxcnQodmFyaWFuY2UgKyBwYXJhbXMuZXBzKTsNCiAgfQ0KICB3b3JrZ3JvdXBCYXJyaWVyKCk7DQoNCiAgbGV0IG1lYW4gPSBzaGFyZWRfbWVhbjsNCiAgbGV0IGludl9zdGQgPSBzaGFyZWRfaW52X3N0ZDsNCg0KICAvLyBBbGwgdGhyZWFkcyBub3JtYWxpemUgYW5kIGFwcGx5IGFmZmluZSB0cmFuc2Zvcm0gaW4gcGFyYWxsZWwNCiAgZm9yICh2YXIgaSA9IHRpZDsgaSA8IEQ7IGkgKz0gMjU2dSkgew0KICAgIGxldCB2YWwgPSBpbnB1dFtiYXNlICsgaV07DQogICAgb3V0cHV0W2Jhc2UgKyBpXSA9ICh2YWwgLSBtZWFuKSAqIGludl9zdGQgKiBnYW1tYVtpXSArIGJldGFbaV07DQogIH0NCn0NCg==", import.meta.url).href,
+});
+
+function resolveClipShaderUrls(moduleUrl = import.meta.url) {
+  if (moduleUrl === import.meta.url) return RUNTIME_CLIP_SHADER_URLS;
+  return Object.freeze({
+    linear: new URL('../shaders/linear.wgsl', moduleUrl).href,
+    layernorm: new URL('../shaders/layernorm_vit.wgsl', moduleUrl).href,
+  });
+}
+
+async function fetchClipShaderSource(fetchImpl, url) {
+  const response = await fetchImpl(url);
+  if (!response?.ok) {
+    throw new Error(
+      `CLIP shader fetch failed: ${url} returned ${response?.status ?? 'unknown'} ${response?.statusText || ''}`.trim(),
+    );
+  }
+  const contentType = response.headers?.get?.('content-type') || '';
+  if (/text\/html|application\/xhtml\+xml/i.test(contentType)) {
+    throw new Error(`CLIP shader ${url} returned invalid content type ${contentType}`);
+  }
+  const source = await response.text();
+  if (
+    !source.trim()
+    || /^\s*</.test(source)
+    || !/@compute\b/.test(source)
+    || !/\bfn\s+main\s*\(/.test(source)
+  ) {
+    throw new Error(`CLIP shader ${url} is not valid WGSL source`);
+  }
+  return source;
+}
+
+async function loadClipShaderSources({
+  moduleUrl = import.meta.url,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  if (typeof fetchImpl !== 'function') throw new Error('CLIP shader fetch implementation is required');
+  const urls = resolveClipShaderUrls(moduleUrl);
+  const [linear, layernorm] = await Promise.all([
+    fetchClipShaderSource(fetchImpl, urls.linear),
+    fetchClipShaderSource(fetchImpl, urls.layernorm),
+  ]);
+  return Object.freeze({ linear, layernorm });
+}
+
+async function createValidatedClipPipeline(device, source, shaderUrl) {
+  try {
+    device.pushErrorScope('validation');
+  } catch (error) {
+    throw new Error(
+      `CLIP shader validation scope setup failed for ${shaderUrl}: ${error?.message || error}`,
+      { cause: error },
+    );
+  }
+
+  let pipeline = null;
+  let failure = null;
+  try {
+    const module = device.createShaderModule({
+      code: source,
+      label: `SF3D CLIP ${shaderUrl}`,
+    });
+    if (typeof module.getCompilationInfo === 'function') {
+      const info = await module.getCompilationInfo();
+      const errors = (info.messages || []).filter(message => message.type === 'error');
+      if (errors.length) {
+        const detail = errors.map(message => (
+          `${message.lineNum || '?'}:${message.linePos || '?'} ${message.message}`
+        )).join('; ');
+        throw new Error(`CLIP shader compilation failed for ${shaderUrl}: ${detail}`);
+      }
+    }
+    pipeline = device.createComputePipeline({
+      layout: 'auto',
+      compute: { module, entryPoint: 'main' },
+    });
+  } catch (error) {
+    failure = error;
+  }
+
+  let validationError = null;
+  let scopeFailure = null;
+  try {
+    validationError = await device.popErrorScope();
+  } catch (error) {
+    scopeFailure = error;
+  }
+
+  if (failure || scopeFailure) {
+    const detail = [
+      failure ? `operation failed: ${failure.message || failure}` : null,
+      scopeFailure ? `validation scope pop failed: ${scopeFailure.message || scopeFailure}` : null,
+    ].filter(Boolean).join('; ');
+    throw new Error(
+      `CLIP shader pipeline failed for ${shaderUrl}: ${detail}`,
+      { cause: failure || scopeFailure },
+    );
+  }
+  if (validationError) {
+    throw new Error(`CLIP shader validation failed for ${shaderUrl}: ${validationError.message || validationError}`);
+  }
+  return pipeline;
+}
+
+function ceilDiv(a, b) { return Math.ceil(a / b); }
+function splitWG(total) {
+  const maxX = 65535;
+  if (total <= maxX) return [total, 1];
+  return [maxX, ceilDiv(total, maxX)];
+}
+
+async function _ensurePipelines(device) {
+  let pending = _pipelinePromises.get(device);
+  if (!pending) {
+    pending = (async () => {
+      const urls = resolveClipShaderUrls();
+      const sources = await loadClipShaderSources();
+      return {
+        linear: await createValidatedClipPipeline(device, sources.linear, urls.linear),
+        layernorm: await createValidatedClipPipeline(device, sources.layernorm, urls.layernorm),
+      };
+    })();
+    _pipelinePromises.set(device, pending);
+    pending.catch(() => {
+      if (_pipelinePromises.get(device) === pending) _pipelinePromises.delete(device);
+    });
+  }
+  return pending;
+}
+
+function _ensureWeightBuffers(device, weights) {
+  weights._assertActive?.(device);
+  let cache = _deviceWeightBuffers.get(device);
+  if (!cache) {
+    cache = new WeakMap();
+    _deviceWeightBuffers.set(device, cache);
+  }
+  if (cache.has(weights)) return cache.get(weights);
+  const buffers = {};
+
+  const makeGPU = (name) => weights._rawGet(name);
+
+  // Visual encoder weights
+  buffers.lnPre = { weight: makeGPU('image_estimator.model.visual.ln_pre.weight'),
+                           bias: makeGPU('image_estimator.model.visual.ln_pre.bias') };
+  buffers.lnPost = { weight: makeGPU('image_estimator.model.visual.ln_post.weight'),
+                            bias: makeGPU('image_estimator.model.visual.ln_post.bias') };
+
+  buffers.blocks = [];
+  for (let i = 0; i < NUM_BLOCKS; i++) {
+    const p = `image_estimator.model.visual.transformer.resblocks.${i}`;
+    buffers.blocks.push({
+      ln1: { weight: makeGPU(`${p}.ln_1.weight`), bias: makeGPU(`${p}.ln_1.bias`) },
+      ln2: { weight: makeGPU(`${p}.ln_2.weight`), bias: makeGPU(`${p}.ln_2.bias`) },
+      qkv: { weight: makeGPU(`${p}.attn.in_proj_weight`), bias: makeGPU(`${p}.attn.in_proj_bias`) },
+      outProj: { weight: makeGPU(`${p}.attn.out_proj.weight`), bias: makeGPU(`${p}.attn.out_proj.bias`) },
+      fc: { weight: makeGPU(`${p}.mlp.c_fc.weight`), bias: makeGPU(`${p}.mlp.c_fc.bias`) },
+      proj: { weight: makeGPU(`${p}.mlp.c_proj.weight`), bias: makeGPU(`${p}.mlp.c_proj.bias`) },
+    });
+  }
+  // Publish only a complete set. On failure, loader-created allocations remain
+  // owned by the loader and reusable on retry; borrowed accessors stay borrowed.
+  cache.set(weights, buffers);
+  return buffers;
+}
+
+/**
+ * Run CLIP material estimation on an image.
+ *
+ * @param {Uint8ClampedArray|Uint8Array} rgba8  cond-size (512×512) RGBA bytes
+ *   straight from canvas getImageData — the alpha blend, 512→224 resize, and
+ *   patch embedding happen in clip_prep_core (main thread) or, when
+ *   options.clipPrepWorker is supplied, on that Worker with byte-identical
+ *   output. The CPU prep is ~115M multiply-adds; inline it was the route's
+ *   second-largest contiguous main-thread stall (~240ms).
+ */
+async function estimateMaterials(device, rgba8, imgWidth, imgHeight, weights, options = {}) {
+  weights._assertActive?.(device);
+  const pipelines = await _ensurePipelines(device);
+  const weightBuffers = _ensureWeightBuffers(device, weights);
+
+  // Step 1: CPU preprocessing — blend, resize to 224, normalize, patch embed
+  const embeddings = options.clipPrepWorker
+    ? await withForegroundScope(options, 'clip-prep-worker', () => runClipPrep(
+        options.clipPrepWorker, rgba8, imgWidth, imgHeight, weights,
+        { timeoutMs: options.workerTimeoutMs }))
+    : validateClipEmbeddings(prepareClipEmbeddings(rgba8, imgWidth, imgHeight, clipPrepWeightsFrom(weights)));
+  const features = await _runVisualTransformer(device, embeddings, weights, pipelines, weightBuffers);
+
+  // Step 3: CPU heads (tiny)
+  const roughness = _runHead(features, weights, 'roughness');
+  const metallic = _runHead(features, weights, 'metallic');
+
+  console.log(`CLIP material estimation: roughness=${roughness.toFixed(3)}, metallic=${metallic.toFixed(3)}`);
+  return { roughness, metallic, prepOffloaded: Boolean(options.clipPrepWorker) };
+}
+
+// A CLIP-preparation worker owns one copied 9.4 MB-ish preparation-weight set
+// at a time. Its cache therefore belongs to *both* the worker and the source
+// weight-set identity. Calls through one worker are serialized: a replacement
+// init cannot overwrite the tensors under an earlier preparation request.
+const _clipPrepState = new WeakMap();
+
+function clipPrepStateFor(worker) {
+  let state = _clipPrepState.get(worker);
+  if (!state) {
+    state = { tail: Promise.resolve(), weightIdentity: null, owners: new Map() };
+    _clipPrepState.set(worker, state);
+  }
+  return state;
+}
+
+function queueClipPrep(state, operation) {
+  const queued = state.tail.catch(() => undefined).then(operation);
+  state.tail = queued;
+  return queued;
+}
+
+/**
+ * Register a producer's use of an injected CLIP-preparation worker. The
+ * registration lets producer disposal reset only a cache no sibling producer
+ * still owns; it never terminates a host-owned worker or destroys its weights.
+ */
+function retainClipPrepWorker(worker, weights) {
+  if (!worker) return;
+  const state = clipPrepStateFor(worker);
+  state.owners.set(weights, (state.owners.get(weights) || 0) + 1);
+}
+
+/**
+ * Release the copied preparation tensors installed by one producer. This is
+ * intentionally an acknowledged worker operation, after the caller's run and
+ * foreground drain; clearing the loader's raw map alone cannot release bytes
+ * already transferred to a borrowed worker.
+ */
+async function releaseClipPrepWorker(worker, weights, { timeoutMs = 30000 } = {}) {
+  if (!worker) return;
+  const state = clipPrepStateFor(worker);
+  const owners = state.owners.get(weights) || 0;
+  if (owners > 1) state.owners.set(weights, owners - 1);
+  else state.owners.delete(weights);
+  return queueClipPrep(state, async () => {
+    if (state.weightIdentity !== weights || state.owners.has(weights)) return;
+    // The worker clears its tensors before acknowledging reset. A rejected,
+    // malformed, or lost reply therefore cannot prove that the old binding
+    // remains installed; invalidate the parent model before sending the request
+    // so same-identity reuse must initialize again even when this rejects.
+    state.weightIdentity = null;
+    await callWorker(
+      worker,
+      { type: 'reset', id: `clip-reset-${Math.random().toString(36).slice(2)}` },
+      [],
+      { timeoutMs, onResult: (d) => { if (d.reset !== true) throw new Error('clip prep reset not acknowledged'); return true; } },
+    );
+  });
+}
+
+/**
+ * Run the CLIP CPU prep on a Worker (clip_prep_worker.js). Fail-loud through
+ * callWorker: crash / malformed reply / wedge rejects; never falls back to the
+ * main thread silently. The caller's rgba8 is copied, not detached.
+ */
+async function runClipPrep(worker, rgba8, width, height, weights, { timeoutMs = 30000 } = {}) {
+  const state = clipPrepStateFor(worker);
+  return queueClipPrep(state, async () => {
+    if (state.weightIdentity !== weights) {
+      const prep = weights && typeof weights._rawGetCPU === 'function'
+        ? clipPrepWeightsFrom(weights)
+        : validateClipPrepWeights(weights);
+      const conv1W = prep.conv1W.slice().buffer;
+      const classEmb = prep.classEmb.slice().buffer;
+      const posEmb = prep.posEmb.slice().buffer;
+      try {
+        await callWorker(
+          worker,
+          { type: 'init', id: `clip-init-${Math.random().toString(36).slice(2)}`, conv1W, classEmb, posEmb },
+          [conv1W, classEmb, posEmb],
+          { timeoutMs, onResult: (d) => { if (d.initialized !== true) throw new Error('clip prep init not acknowledged'); return true; } },
+        );
+        state.weightIdentity = weights;
+      } catch (error) {
+        // Worker init revokes its old set before validating the replacement;
+        // never let the caller model a failed swap as still bound to the old one.
+        state.weightIdentity = null;
+        throw error;
+      }
+    }
+    const bytes = (rgba8 instanceof Uint8ClampedArray || rgba8 instanceof Uint8Array)
+      ? rgba8 : new Uint8ClampedArray(rgba8);
+    const rgba = bytes.slice().buffer;
+    return await callWorker(
+      worker,
+      { id: `clip-prep-${Math.random().toString(36).slice(2)}`, rgba, width, height },
+      [rgba],
+      { timeoutMs, onResult: (d) => validateClipEmbeddings(new Float32Array(d.embeddings)) },
+    );
+  });
+}
+
+// Inline CLIP shaders (add / GELU / fused attention) bake their sizes into the
+// WGSL, so each is compiled once per device via the kit's resource caches
+// instead of once per block per run (36+ synchronous pipeline compiles on the
+// main thread per estimate).
+const _clipCaches = new WeakMap();
+function getClipInlinePipeline(device, label, code) {
+  let caches = _clipCaches.get(device);
+  if (!caches) {
+    caches = createWebGpuResourceCaches(device);
+    _clipCaches.set(device, caches);
+  }
+  const module = caches.getShaderModule(label, code);
+  return caches.getComputePipeline(label, {
+    layout: 'auto',
+    compute: { module, entryPoint: 'main' },
+  });
+}
+
+async function _runVisualTransformer(device, embeddings, weights, pipelines, weightBuffers) {
+  const N = NUM_TOKENS, D = HIDDEN_DIM;
+
+  let xBuf = createStorageBuffer(device, new Float32Array(embeddings));
+  let encoder = device.createCommandEncoder();
+
+  // Pre-LN
+  xBuf = _dispatchLN(encoder, device, xBuf, N, D, weightBuffers.lnPre, pipelines);
+
+  for (let b = 0; b < NUM_BLOCKS; b++) {
+    xBuf = encodeClipVisualPhase(encoder, device, xBuf, weightBuffers.blocks[b], pipelines, 'block');
+  }
+
+  // Post-LN
+  xBuf = _dispatchLN(encoder, device, xBuf, N, D, weightBuffers.lnPost, pipelines);
+
+  device.queue.submit([encoder.finish()]);
+  await device.queue.onSubmittedWorkDone();
+
+  // Read CLS token, project to 512d on CPU
+  const allTokens = await readBuffer(device, xBuf, N * D * 4);
+  allTokens.slice(0, D);
+
+  // visual.proj: PyTorch [768, 512], converter transposed to [512, 768]
+  // output[d] = sum_k cls[k] * proj_transposed[d * 768 + k]
+  const projW = weights._rawGetCPU('image_estimator.model.visual.proj');
+  return projectClipFeatures(allTokens, projW);
+}
+
+/** Same complete GPU block used by ordinary and computation-bound consumers. */
+function encodeClipVisualPhase(encoder,device,input,weights,pipelines,phase){
+  const N=NUM_TOKENS,D=HIDDEN_DIM;
+  if(phase==='pre'||phase==='post')return _dispatchLN(encoder,device,input,N,D,weights,pipelines);
+  if(phase!=='block')throw TypeError('canonical visual phase required');
+  const ln1=_dispatchLN(encoder,device,input,N,D,weights.ln1,pipelines);
+  const qkv=_dispatchLinear(encoder,device,ln1,N,D,3*D,weights.qkv,false,pipelines);
+  const attn=_dispatchFusedAttn(encoder,device,qkv,N);
+  const proj=_dispatchLinear(encoder,device,attn,N,D,D,weights.outProj,true,pipelines);
+  const residual=_dispatchAdd(encoder,device,input,proj,N*D);
+  const ln2=_dispatchLN(encoder,device,residual,N,D,weights.ln2,pipelines);
+  const fc=_dispatchLinear(encoder,device,ln2,N,D,MLP_DIM,weights.fc,true,pipelines);
+  const gelu=_dispatchGelu(encoder,device,fc,N*MLP_DIM);
+  const mlp=_dispatchLinear(encoder,device,gelu,N,MLP_DIM,D,weights.proj,true,pipelines);
+  return _dispatchAdd(encoder,device,residual,mlp,N*D);
+}
+
+async function createClipResidentPipelines(device,owner){
+  if(!Array.isArray(owner?.allocations))throw TypeError('reachable resident CLIP inventory required');
+  return {...await _ensurePipelines(device),residentOwner:owner};
+}
+
+function projectClipFeatures(allTokens,projW){
+  const D=HIDDEN_DIM;
+  if(!(allTokens instanceof Float32Array)||allTokens.length!==NUM_TOKENS*D||
+    !(projW instanceof Float32Array)||projW.length!==PROJ_DIM*D)throw TypeError('complete canonical CLIP projection shape required');
+  const cls=allTokens.subarray(0,D);
+  const features = new Float32Array(PROJ_DIM);
+  for (let d = 0; d < PROJ_DIM; d++) {
+    let sum = 0;
+    for (let k = 0; k < D; k++) sum += cls[k] * projW[d * D + k];
+    features[d] = sum;
+  }
+  return features;
+}
+
+const runClipMaterialHead=_runHead;
+
+// --- GPU dispatch helpers ---
+
+function _dispatchLinear(encoder, device, input, rows, inDim, outDim, w, transposed, pipelines) {
+  const totalWG = ceilDiv(rows * outDim, WG_SIZE);
+  const [wgX, wgY] = splitWG(totalWG);
+  const params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  pipelines.residentOwner?.allocations.push({buffer:params,size:32});
+  device.queue.writeBuffer(params, 0, new Uint32Array([rows, inDim, outDim, wgX, transposed ? 1 : 0]));
+  const output = createEmptyBuffer(device, rows * outDim * 4);
+  const bg = device.createBindGroup({
+    layout: pipelines.linear.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: params } },
+      { binding: 1, resource: { buffer: input } },
+      { binding: 2, resource: { buffer: w.weight } },
+      { binding: 3, resource: { buffer: w.bias } },
+      { binding: 4, resource: { buffer: output } },
+    ],
+  });
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipelines.linear);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
+  return output;
+}
+
+function _dispatchLN(encoder, device, input, N, D, norm, pipelines) {
+  const paramsData = new ArrayBuffer(16);
+  const v = new DataView(paramsData);
+  v.setUint32(0, N, true);
+  v.setUint32(4, D, true);
+  v.setFloat32(8, 1e-5, true);
+  const params = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  pipelines.residentOwner?.allocations.push({buffer:params,size:16});
+  device.queue.writeBuffer(params, 0, new Uint8Array(paramsData));
+  const output = createEmptyBuffer(device, N * D * 4);
+  const bg = device.createBindGroup({
+    layout: pipelines.layernorm.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: params } },
+      { binding: 1, resource: { buffer: input } },
+      { binding: 2, resource: { buffer: norm.weight } },
+      { binding: 3, resource: { buffer: norm.bias } },
+      { binding: 4, resource: { buffer: output } },
+    ],
+  });
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipelines.layernorm);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(N);
+  pass.end();
+  return output;
+}
+
+function _dispatchAdd(encoder, device, a, b, count) {
+  const shaderCode = `
+    @group(0) @binding(0) var<storage, read> a: array<f32>;
+    @group(0) @binding(1) var<storage, read> b: array<f32>;
+    @group(0) @binding(2) var<storage, read_write> out: array<f32>;
+    @compute @workgroup_size(256)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+      let i = gid.x;
+      if (i >= ${count}u) { return; }
+      out[i] = a[i] + b[i];
+    }
+  `;
+  const pipeline = getClipInlinePipeline(device, 'sf3d.clip.add', shaderCode);
+  const output = createEmptyBuffer(device, count * 4);
+  const bg = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: a } },
+      { binding: 1, resource: { buffer: b } },
+      { binding: 2, resource: { buffer: output } },
+    ],
+  });
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(ceilDiv(count, 256));
+  pass.end();
+  return output;
+}
+
+function _dispatchGelu(encoder, device, input, count) {
+  const shaderCode = `
+    @group(0) @binding(0) var<storage, read> inp: array<f32>;
+    @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+    @compute @workgroup_size(256)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+      let i = gid.x;
+      if (i >= ${count}u) { return; }
+      let x = inp[i];
+      // Exact GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
+      // WGSL doesn't have erf, use Abramowitz & Stegun approximation
+      let t = 1.0 / (1.0 + 0.3275911 * abs(x * 0.7071067811865476));
+      let erf_approx = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-x * x * 0.5);
+      let erf_val = select(-erf_approx, erf_approx, x >= 0.0);
+      out[i] = x * 0.5 * (1.0 + erf_val);
+    }
+  `;
+  const pipeline = getClipInlinePipeline(device, 'sf3d.clip.gelu', shaderCode);
+  const output = createEmptyBuffer(device, count * 4);
+  const bg = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: input } },
+      { binding: 1, resource: { buffer: output } },
+    ],
+  });
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(ceilDiv(count, 256));
+  pass.end();
+  return output;
+}
+
+function _dispatchFusedAttn(encoder, device, qkvBuf, N) {
+  const D = HIDDEN_DIM;
+  const scale = 1.0 / Math.sqrt(HEAD_DIM);
+  const shaderCode = `
+    @group(0) @binding(0) var<storage, read> qkv: array<f32>;
+    @group(0) @binding(1) var<storage, read_write> output: array<f32>;
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+      let idx = gid.x;
+      if (idx >= ${N * NUM_HEADS}u) { return; }
+      let qi = idx / ${NUM_HEADS}u;
+      let h = idx % ${NUM_HEADS}u;
+      var scores: array<f32, ${N}>;
+      var maxS: f32 = -1e30;
+      for (var ki: u32 = 0u; ki < ${N}u; ki++) {
+        var s: f32 = 0.0;
+        for (var d: u32 = 0u; d < ${HEAD_DIM}u; d++) {
+          s += qkv[qi * ${3*D}u + h * ${HEAD_DIM}u + d]
+             * qkv[ki * ${3*D}u + ${D}u + h * ${HEAD_DIM}u + d];
+        }
+        s *= ${scale};
+        scores[ki] = s;
+        maxS = max(maxS, s);
+      }
+      var sumE: f32 = 0.0;
+      for (var ki: u32 = 0u; ki < ${N}u; ki++) {
+        scores[ki] = exp(scores[ki] - maxS);
+        sumE += scores[ki];
+      }
+      let inv = 1.0 / sumE;
+      for (var d: u32 = 0u; d < ${HEAD_DIM}u; d++) {
+        var val: f32 = 0.0;
+        for (var ki: u32 = 0u; ki < ${N}u; ki++) {
+          val += scores[ki] * inv * qkv[ki * ${3*D}u + ${2*D}u + h * ${HEAD_DIM}u + d];
+        }
+        output[qi * ${D}u + h * ${HEAD_DIM}u + d] = val;
+      }
+    }
+  `;
+  const pipeline = getClipInlinePipeline(device, 'sf3d.clip.fused-attention', shaderCode);
+  const output = createEmptyBuffer(device, N * D * 4);
+  const bg = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: qkvBuf } },
+      { binding: 1, resource: { buffer: output } },
+    ],
+  });
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(ceilDiv(N * NUM_HEADS, 64));
+  pass.end();
+  return output;
+}
+
+// --- CPU head computation ---
+
+function _runHead(features, weights, headName) {
+  const p = `image_estimator.heads.${headName}`;
+  const bias = 1.0;
+  const g = (n) => weights._rawGetCPU(n);
+  let x = new Float32Array(features);
+  for (const l of ['0.0', '0.2', '0.4']) x = _cpuLinearReLU(x, g(`${p}.${l}.weight`), g(`${p}.${l}.bias`));
+  let d1 = _cpuLinear(_cpuLinearReLU(x, g(`${p}.1.0.weight`), g(`${p}.1.0.bias`)),
+                       g(`${p}.1.2.weight`), g(`${p}.1.2.bias`));
+  let d2 = _cpuLinear(_cpuLinearReLU(x, g(`${p}.2.0.weight`), g(`${p}.2.0.bias`)),
+                       g(`${p}.2.2.weight`), g(`${p}.2.2.bias`));
+  const alpha = _softplus(d1[0] + bias), beta = _softplus(d2[0] + bias);
+  if (alpha <= 1 || beta <= 1) return alpha / (alpha + beta);
+  return Math.max(0, Math.min(1, (alpha - 1) / (alpha + beta - 2)));
+}
+
+function _cpuLinear(x, weight, bias) {
+  // Head weights are transposed by converter: [inDim, outDim]
+  // output[o] = sum_i x[i] * weight[i * outDim + o] + bias[o]
+  const inDim = x.length, outDim = bias.length;
+  const out = new Float32Array(outDim);
+  for (let o = 0; o < outDim; o++) {
+    let s = bias[o];
+    for (let i = 0; i < inDim; i++) s += x[i] * weight[i * outDim + o];
+    out[o] = s;
+  }
+  return out;
+}
+
+function _cpuLinearReLU(x, w, b) {
+  const out = _cpuLinear(x, w, b);
+  for (let i = 0; i < out.length; i++) if (out[i] < 0) out[i] = 0;
+  return out;
+}
+
+function _softplus(x) { return x > 20 ? x : Math.log(1 + Math.exp(x)); }
+
+const prefix='image_estimator.model.visual.',tokenBytes=50*768*4;
+const pair=(source,name)=>({weight:source.reference(name+'.weight'),bias:source.reference(name+'.bias')});
+function selectResidentClipPhase(source,phase,index){
+  if(phase==='prep')return Object.fromEntries(Object.entries(CLIP_PREP_WEIGHT_NAMES).map(([k,n])=>[k,source.reference(n)]));
+  if(phase==='pre'||phase==='post')return pair(source,prefix+'ln_'+phase);
+  if(phase==='projection')return {projection:source.reference(prefix+'proj')};
+  if(phase==='block'){
+    if(!Number.isSafeInteger(index)||index<0||index>=12)throw TypeError('complete twelve-block CLIP index required');
+    const p=prefix+'transformer.resblocks.'+index;
+    return {ln1:pair(source,p+'.ln_1'),ln2:pair(source,p+'.ln_2'),
+      qkv:{weight:source.reference(p+'.attn.in_proj_weight'),bias:source.reference(p+'.attn.in_proj_bias')},
+      outProj:pair(source,p+'.attn.out_proj'),fc:pair(source,p+'.mlp.c_fc'),proj:pair(source,p+'.mlp.c_proj')};
+  }
+  if(phase==='roughness'||phase==='metallic'){
+    const p='image_estimator.heads.'+phase,result={};
+    for(const l of ['0.0','0.2','0.4','1.0','1.2','2.0','2.2'])
+      for(const s of ['weight','bias']){const name=p+'.'+l+'.'+s;result[name]=source.reference(name);}
+    for(const t of source.describe(result)){
+      const output=/\.[12]\.2\./.test(t.name)?1:512;
+      const shape=t.name.endsWith('.bias')?[output]:[512,output];
+      if(t.shape?.join(',')!==shape.join(','))throw Error('canonical material head shape mismatch: '+t.name);
+    }
+    return result;
+  }
+  throw TypeError('canonical complete CLIP phase required');
+}
+
+function retireWork(owner,keep=null){
+  const errors=[];
+  for(const a of [...owner.allocations])if(a.buffer!==keep){
+    try{a.buffer.destroy();owner.allocations.splice(owner.allocations.indexOf(a),1);}
+    catch(e){errors.push(e);}
+  }
+  if(errors.length)throw new AggregateError(errors,'CLIP owned retirement unresolved');
+}
+
+/** Actual complete GPU CLIP/CPU heads, no eager raw binding or default material. */
+async function runResidentMaterials({device,handle,memoryBudget,weightsUrl,
+  expectedWeightBytes,expectedSourceETag,rgba,onBeforePhase,onBeforeDuty,onAfterDuty}){
+  if(!isLoaderMemoryBudget(memoryBudget))throw TypeError('authenticated loader budget required');
+  memoryBudget.assertDeviceAcquiredHere(device);
+  if(handle?.device!==device||handle._residentClipOwner)throw Error('owned nonquarantined CLIP handle required');
+  if(!(rgba instanceof Uint8Array||rgba instanceof Uint8ClampedArray)||rgba.length!==512*512*4)
+    throw TypeError('complete condition-size canonical RGBA required');
+  if(typeof onBeforePhase!=='function'||typeof onBeforeDuty!=='function')throw TypeError('fresh phase and duty guards required');
+  const owner={source:null,allocations:[],leases:[],current:null,embeddings:null,tokens:null,features:null};
+  handle._residentClipOwner=owner;
+  const lease=(size,label)=>{const l=memoryBudget.reserveCpu(size,label);owner.leases.push(l);return l;};
+  let failed=false,failure;
+  try{
+    owner.source=await createWeightPhaseSource(device,weightsUrl,{memoryBudget,expectedWeightBytes,expectedSourceETag,
+      onBeforeSourceIntake:onBeforePhase});
+    const source=owner.source,duties=[];
+    const describe=async(name,selection,storageKind,rangeCpuBytes=0)=>{
+      await onBeforePhase({name,tensors:source.describe(selection),storageKind,workGpuBytes:0,rangeCpuBytes});
+    };
+    const prep=selectResidentClipPhase(source,'prep'),prepTransient=512*512*4*4+3*224*224*4;
+    await describe('clip-preparation-weights',prep,'cpu-fp32',prepTransient+tokenBytes);
+    const embeddingLease=lease(tokenBytes,'clip-embeddings'),prepLease=lease(prepTransient,'clip-preparation-intermediates');
+    owner.embeddings=await source.withCpuWeights(prep,w=>validateClipEmbeddings(prepareClipEmbeddings(rgba,512,512,w)));
+    prepLease.release();
+    await onBeforeDuty({name:'clip-pipeline-acquisition',workGpuBytes:0,rangeCpuBytes:0,requiredBytes:0});
+    const pipelines=await createClipResidentPipelines(device,owner);
+    const gpuPhase=async(name,kind,selection,workGpuBytes)=>{
+      await describe(name+'-weights',selection,'gpu-buffer');
+      await source.withWeights(selection,async weights=>{
+        const duty={name,kind,workGpuBytes,rangeCpuBytes:0,requiredBytes:workGpuBytes};
+        await onBeforeDuty(duty);
+        const encoder=device.createCommandEncoder();
+        const before=owner.allocations.length;
+        const output=captureGpuBufferAllocations(()=>{
+          if(kind==='pre'){
+            owner.current=createEmptyBuffer(device,tokenBytes,0,'clip-resident-input');
+            device.queue.writeBuffer(owner.current,0,owner.embeddings);
+          }
+          return encodeClipVisualPhase(encoder,device,owner.current,weights,pipelines,kind);
+        },{ownedAllocations:owner.allocations}).value;
+        const allocated=owner.allocations.slice(before).reduce((n,a)=>n+a.size,0);
+        if(allocated>workGpuBytes)throw Error('actual CLIP work demand drift');
+        device.queue.submit([encoder.finish()]);await device.queue.onSubmittedWorkDone();
+        owner.current=output;retireWork(owner,output);
+        duties.push({...duty,actualNewGpuBytes:allocated,queueCompletionAuthority:'actual-prefix-before-retirement'});
+        await onAfterDuty?.(duties.at(-1));await new Promise(resolve=>setTimeout(resolve,0));
+      });
+    };
+    await gpuPhase('clip-pre','pre',selectResidentClipPhase(source,'pre'),2*tokenBytes+16);
+    owner.embeddings=null;embeddingLease.release();
+    for(let b=0;b<12;b++)await gpuPhase('clip-block-'+b,'block',selectResidentClipPhase(source,'block',b),18*tokenBytes+160);
+    await gpuPhase('clip-post','post',selectResidentClipPhase(source,'post'),tokenBytes+16);
+    const readback={name:'clip-complete-token-readback',workGpuBytes:tokenBytes,rangeCpuBytes:2*tokenBytes,
+      requiredBytes:3*tokenBytes};await onBeforeDuty(readback);
+    const tokenLease=lease(2*tokenBytes,'clip-complete-token-readback');
+    const staging=device.createBuffer({size:tokenBytes,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+    owner.allocations.push({buffer:staging,size:tokenBytes});
+    const copy=device.createCommandEncoder();copy.copyBufferToBuffer(owner.current,0,staging,0,tokenBytes);
+    device.queue.submit([copy.finish()]);await device.queue.onSubmittedWorkDone();
+    await staging.mapAsync(GPUMapMode.READ);
+    owner.tokens=new Float32Array(staging.getMappedRange().slice(0));staging.unmap();
+    validateClipEmbeddings(owner.tokens);retireWork(owner);owner.current=null;
+    const projection=selectResidentClipPhase(source,'projection');
+    await describe('clip-visual-projection',projection,'cpu-fp32',512*4);
+    const featureLease=lease(512*4,'clip-projected-features');
+    owner.features=await source.withCpuWeights(projection,w=>projectClipFeatures(owner.tokens,w.projection));
+    if([...owner.features].some(v=>!Number.isFinite(v)))throw Error('nonfinite canonical projected CLIP features');
+    owner.tokens=null;tokenLease.release();
+    const result={};
+    for(const head of ['roughness','metallic']){
+      const selection=selectResidentClipPhase(source,head);
+      // Existing head: copied512 + three512 shared + two(512 + one scalar).
+      const headBytes=(512+3*512+2*(512+1))*4;
+      await describe('clip-'+head+'-head',selection,'cpu-fp32',headBytes);
+      const headLease=lease(headBytes,'clip-head-intermediates');
+      result[head]=await source.withCpuWeights(selection,w=>runClipMaterialHead(owner.features,
+        {_rawGetCPU(name){if(!Object.hasOwn(w,name))throw Error('unselected canonical head tensor: '+name);return w[name];}},head));
+      headLease.release();if(!Number.isFinite(result[head])||result[head]<0||result[head]>1)
+        throw Error('invalid actual '+head+' material');
+    }
+    owner.features=null;featureLease.release();
+    return {...result,prepOffloaded:false,visualBackend:'webgpu-complete-12-blocks',tokens:50,
+      duties,loadingReport:source.loadingReport,weightPhases:source.phases,
+      authority:'complete canonical material computation; no native fit/numerical-reference/GLB/foreground claim'};
+  }catch(error){failed=true;failure=error;throw error;}
+  finally{try{await disposeResidentMaterials(handle);}
+    catch(error){throw failed?new AggregateError([failure,error],
+      'resident CLIP failed and cleanup unresolved',{cause:failure}):error;}}
+}
+
+async function disposeResidentMaterials(handle){
+  const owner=handle._residentClipOwner;if(!owner)return;
+  await handle.device.queue.onSubmittedWorkDone();retireWork(owner);
+  if(owner.source){await owner.source.dispose();owner.source=null;}
+  owner.embeddings=null;owner.tokens=null;owner.features=null;owner.current=null;
+  for(const l of owner.leases)l.release();owner.leases=[];handle._residentClipOwner=null;
+}
+
+/**
+ * materialize_core.js — pure, DOM/GPU-free texture materialization.
+ *
+ * Extracted from bakeTexture so the exact same albedo build + normal-map
+ * (default fill + TBN world→tangent transform) + dilation runs on either the
+ * main thread OR a Web Worker, byte-identical. This is Cranial's assay's ~752ms
+ * single-threaded CPU tail (albedo dilation ~375ms + normal dilation ~369ms);
+ * moving it to a worker removes it from the main thread with no GPU sync and no
+ * per-duty fence floor.
+ *
+ * Inputs are plain typed arrays; outputs are the albedo + normal Uint8Arrays.
+ */
+
+/**
+ * Dilate texture to fill empty pixels by averaging nearest occupied neighbors.
+ * Exact copy of bakeTexture's _dilateTexture (must stay byte-identical).
+ */
+function dilateTexture(texture, mask, resolution, iterations = 6) {
+  const workMask = new Uint8Array(mask);
+
+  for (let iter = 0; iter < iterations; iter++) {
+    const newPixels = [];
+
+    for (let y = 0; y < resolution; y++) {
+      for (let x = 0; x < resolution; x++) {
+        const idx = y * resolution + x;
+        if (workMask[idx]) continue;
+
+        let sumR = 0, sumG = 0, sumB = 0, count = 0;
+        const neighbors = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
+        for (const [nx, ny] of neighbors) {
+          if (nx < 0 || nx >= resolution || ny < 0 || ny >= resolution) continue;
+          const nIdx = ny * resolution + nx;
+          if (workMask[nIdx]) {
+            sumR += texture[nIdx * 4];
+            sumG += texture[nIdx * 4 + 1];
+            sumB += texture[nIdx * 4 + 2];
+            count++;
+          }
+        }
+
+        if (count > 0) {
+          newPixels.push({
+            idx,
+            r: Math.round(sumR / count),
+            g: Math.round(sumG / count),
+            b: Math.round(sumB / count),
+          });
+        }
+      }
+    }
+
+    for (const p of newPixels) {
+      texture[p.idx * 4] = p.r;
+      texture[p.idx * 4 + 1] = p.g;
+      texture[p.idx * 4 + 2] = p.b;
+      texture[p.idx * 4 + 3] = 255;
+      workMask[p.idx] = 1;
+    }
+
+    if (newPixels.length === 0) break;
+  }
+}
+
+/**
+ * Build albedo + normal-map textures from decoded features/normals, transform
+ * normals to tangent space, and dilate. Byte-identical to bakeTexture's inline
+ * materialization.
+ *
+ * @param {object} o
+ * @param {Float32Array} o.featuresCPU     [numOccupied*3] decoded albedo features
+ * @param {Float32Array} o.normalsCPU      [numOccupied*3] decoded world-space normals
+ * @param {Uint32Array}  o.occupiedIndices [numOccupied] texel indices
+ * @param {Float32Array} o.tbnData         [resolution^2 * 9] per-texel TBN basis
+ * @param {Uint8Array}   o.mask            [resolution^2] occupancy mask
+ * @param {number}       o.resolution
+ * @param {number}       o.numOccupied
+ * @returns {{ albedo: Uint8Array, normalMap: Uint8Array }}
+ */
+function materializeTextures({ featuresCPU, normalsCPU, occupiedIndices, tbnData, mask, resolution, numOccupied, dilationScratch = null }) {
+  // Build albedo RGBA texture
+  const albedo = new Uint8Array(resolution * resolution * 4);
+  for (let i = 0; i < numOccupied; i++) {
+    const texIdx = occupiedIndices[i];
+    albedo[texIdx * 4] = Math.max(0, Math.min(255, Math.round(featuresCPU[i * 3] * 255)));
+    albedo[texIdx * 4 + 1] = Math.max(0, Math.min(255, Math.round(featuresCPU[i * 3 + 1] * 255)));
+    albedo[texIdx * 4 + 2] = Math.max(0, Math.min(255, Math.round(featuresCPU[i * 3 + 2] * 255)));
+    albedo[texIdx * 4 + 3] = 255;
+  }
+
+  // Build normal map: transform perturb_normal from world space to tangent space
+  const normalMap = new Uint8Array(resolution * resolution * 4);
+  // Default normal (pointing straight out): [0.5, 0.5, 1.0] in encoded space
+  for (let i = 0; i < resolution * resolution; i++) {
+    normalMap[i * 4 + 2] = 255; // blue channel = 1.0
+    normalMap[i * 4 + 3] = 255;
+  }
+
+  for (let i = 0; i < numOccupied; i++) {
+    const texIdx = occupiedIndices[i];
+    const tbnBase = texIdx * 9;
+
+    const nx = normalsCPU[i * 3];
+    const ny = normalsCPU[i * 3 + 1];
+    const nz = normalsCPU[i * 3 + 2];
+
+    const tx = tbnData[tbnBase], ty = tbnData[tbnBase + 1], tz = tbnData[tbnBase + 2];
+    const bx = tbnData[tbnBase + 3], by = tbnData[tbnBase + 4], bz = tbnData[tbnBase + 5];
+    const fnx = tbnData[tbnBase + 6], fny = tbnData[tbnBase + 7], fnz = tbnData[tbnBase + 8];
+
+    // Transform to tangent space: n_tangent = TBN^T * n_world
+    const ntx = tx * nx + ty * ny + tz * nz;
+    const nty = bx * nx + by * ny + bz * nz;
+    const ntz = fnx * nx + fny * ny + fnz * nz;
+
+    // Encode from [-1,1] to [0,1]
+    const r = Math.max(0, Math.min(255, Math.round((ntx * 0.5 + 0.5) * 255)));
+    const g = Math.max(0, Math.min(255, Math.round((nty * 0.5 + 0.5) * 255)));
+    const b = Math.max(0, Math.min(255, Math.round((ntz * 0.5 + 0.5) * 255)));
+
+    normalMap[texIdx * 4] = r;
+    normalMap[texIdx * 4 + 1] = g;
+    normalMap[texIdx * 4 + 2] = b;
+    normalMap[texIdx * 4 + 3] = 255;
+  }
+
+  // Dilate both textures (matching PyTorch: resolution // 150 ≈ 7 at 1024)
+  const dilateIters = Math.max(1, Math.round(resolution / 150));
+  if (dilationScratch) {
+    dilateTextureCounted(albedo, mask, resolution, dilateIters, dilationScratch);
+    dilateTextureCounted(normalMap, mask, resolution, dilateIters, dilationScratch);
+  } else {
+    dilateTexture(albedo, mask, resolution, dilateIters);
+    dilateTexture(normalMap, mask, resolution, dilateIters);
+  }
+
+  return { albedo, normalMap };
+}
+
+/** Complete pixel capacity, not a retained-output cap. Caller admits 8*N bytes. */
+function createDilationScratch(pixels) {
+  if (!Number.isSafeInteger(pixels) || pixels < 1) throw TypeError('complete pixel count required');
+  return {workMask:new Uint8Array(pixels),indices:new Uint32Array(pixels),rgb:new Uint8Array(3*pixels)};
+}
+
+function dilateTextureCounted(texture,mask,resolution,iterations,scratch) {
+  const pixels=resolution*resolution,{workMask,indices,rgb}=scratch;
+  if(workMask.length!==pixels||indices.length!==pixels||rgb.length!==3*pixels||
+    mask.length!==pixels||texture.length!==4*pixels)throw Error('complete dilation backing shape mismatch');
+  workMask.set(mask);
+  for(let iter=0;iter<iterations;iter++) {
+    let pending=0;
+    for(let y=0;y<resolution;y++)for(let x=0;x<resolution;x++) {
+      const idx=y*resolution+x;if(workMask[idx])continue;
+      let r=0,g=0,b=0,count=0;
+      for(let neighbor=0;neighbor<4;neighbor++) {
+        const nx=x+(neighbor===0?-1:neighbor===1?1:0),ny=y+(neighbor===2?-1:neighbor===3?1:0);
+        if(nx<0||nx>=resolution||ny<0||ny>=resolution)continue;
+        const n=ny*resolution+nx;if(!workMask[n])continue;
+        r+=texture[4*n];g+=texture[4*n+1];b+=texture[4*n+2];count++;
+      }
+      if(count){indices[pending]=idx;rgb[3*pending]=Math.round(r/count);
+        rgb[3*pending+1]=Math.round(g/count);rgb[3*pending+2]=Math.round(b/count);pending++;}
+    }
+    for(let i=0;i<pending;i++){const idx=indices[i];texture[4*idx]=rgb[3*i];
+      texture[4*idx+1]=rgb[3*i+1];texture[4*idx+2]=rgb[3*i+2];texture[4*idx+3]=255;workMask[idx]=1;}
+    if(!pending)break;
+  }
+}
+
+/**
+ * texture_baker.js — UV unwrapping + texture baking for SF3D WebGPU.
+ *
+ * Pipeline:
+ *   1. Cube-projection UV unwrapping with bbox normalization
+ *   2. CPU rasterization of UV space → 3D positions (with depth buffer)
+ *   3. GPU triplane query + features decoder → RGB
+ *   4. Texture dilation to fill seams
+ *
+ * The triplane query and decoder reuse triplane_decoder.js.
+ */
+
+
+/**
+ * UV unwrap a mesh using cube projection with bounding-box normalization.
+ *
+ * Each triangle is assigned to one of 6 cube faces based on its face normal,
+ * then projected onto that face's 2D plane using the mesh's actual bounding
+ * box (not a fixed radius) for UV normalization. The 6 projections are packed
+ * into a 3×2 grid in UV space.
+ *
+ * Vertices are duplicated per-face (no sharing across faces) to allow
+ * per-face UVs without seam issues.
+ *
+ * @param {Float32Array} vertices - [N_v * 3] vertex positions
+ * @param {Uint32Array} faces - [N_f * 3] triangle indices
+ * @param {number} numVertices
+ * @param {number} numFaces
+ * @param {number} radius - model space radius (unused, kept for API compat)
+ * @returns {{ uvs, newVertices, newNormals, newFaces, newNumVertices, newNumFaces, faceAssignment }}
+ */
+function unwrapUV(vertices, faces, numVertices, numFaces, radius = 0.87, streamOverlaps = false) {
+  // --- PCA alignment: rotate vertex positions so principal axes align with
+  // canonical X/Y/Z, matching PyTorch _align_mesh_with_main_axis.
+  // ONLY used for UV generation; output newVertices remain unrotated. ---
+  const rotMat = _computePCARotation(vertices, numVertices);
+  const rotVerts = new Float32Array(numVertices * 3);
+  for (let i = 0; i < numVertices; i++) {
+    const x = vertices[i*3], y = vertices[i*3+1], z = vertices[i*3+2];
+    rotVerts[i*3]   = rotMat[0]*x + rotMat[1]*y + rotMat[2]*z;
+    rotVerts[i*3+1] = rotMat[3]*x + rotMat[4]*y + rotMat[5]*z;
+    rotVerts[i*3+2] = rotMat[6]*x + rotMat[7]*y + rotMat[8]*z;
+  }
+
+  // Compute smooth vertex normals from ROTATED vertex positions.
+  // Area-weighted: each face contributes its (unnormalized) cross product
+  // to all 3 vertices. Larger faces contribute more. Then normalize.
+  const smoothNormals = new Float32Array(numVertices * 3);
+  const faceAssignment = new Uint8Array(numFaces);
+
+  for (let f = 0; f < numFaces; f++) {
+    const i0 = faces[f * 3], i1 = faces[f * 3 + 1], i2 = faces[f * 3 + 2];
+    const v0x = rotVerts[i0*3], v0y = rotVerts[i0*3+1], v0z = rotVerts[i0*3+2];
+    const v1x = rotVerts[i1*3], v1y = rotVerts[i1*3+1], v1z = rotVerts[i1*3+2];
+    const v2x = rotVerts[i2*3], v2y = rotVerts[i2*3+1], v2z = rotVerts[i2*3+2];
+
+    const e1x = v1x - v0x, e1y = v1y - v0y, e1z = v1z - v0z;
+    const e2x = v2x - v0x, e2y = v2y - v0y, e2z = v2z - v0z;
+    let nx = e1y * e2z - e1z * e2y;
+    let ny = e1z * e2x - e1x * e2z;
+    let nz = e1x * e2y - e1y * e2x;
+
+    // Accumulate unnormalized face normal to each vertex (area-weighted)
+    for (const idx of [i0, i1, i2]) {
+      smoothNormals[idx * 3] += nx;
+      smoothNormals[idx * 3 + 1] += ny;
+      smoothNormals[idx * 3 + 2] += nz;
+    }
+  }
+
+  // Normalize accumulated normals
+  for (let i = 0; i < numVertices; i++) {
+    const nx = smoothNormals[i*3], ny = smoothNormals[i*3+1], nz = smoothNormals[i*3+2];
+    const len = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
+    smoothNormals[i*3] /= len;
+    smoothNormals[i*3+1] /= len;
+    smoothNormals[i*3+2] /= len;
+  }
+
+  // Assign face to cube face using mean vertex normal (matching PyTorch)
+  for (let f = 0; f < numFaces; f++) {
+    const i0 = faces[f * 3], i1 = faces[f * 3 + 1], i2 = faces[f * 3 + 2];
+    const fnx = smoothNormals[i0*3] + smoothNormals[i1*3] + smoothNormals[i2*3];
+    const fny = smoothNormals[i0*3+1] + smoothNormals[i1*3+1] + smoothNormals[i2*3+1];
+    const fnz = smoothNormals[i0*3+2] + smoothNormals[i1*3+2] + smoothNormals[i2*3+2];
+    const ax = Math.abs(fnx), ay = Math.abs(fny), az = Math.abs(fnz);
+    if (ax >= ay && ax >= az) {
+      faceAssignment[f] = fnx > 0 ? 0 : 1;
+    } else if (ay >= ax && ay >= az) {
+      faceAssignment[f] = fny > 0 ? 2 : 3;
+    } else {
+      faceAssignment[f] = fnz > 0 ? 4 : 5;
+    }
+  }
+
+  // Compute bbox from ROTATED vertices for UV normalization
+  let bboxMin = [Infinity, Infinity, Infinity];
+  let bboxMax = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < numVertices; i++) {
+    for (let a = 0; a < 3; a++) {
+      const v = rotVerts[i * 3 + a];
+      if (v < bboxMin[a]) bboxMin[a] = v;
+      if (v > bboxMax[a]) bboxMax[a] = v;
+    }
+  }
+  const bboxRange = [
+    (bboxMax[0] - bboxMin[0]) || 1,
+    (bboxMax[1] - bboxMin[1]) || 1,
+    (bboxMax[2] - bboxMin[2]) || 1,
+  ];
+
+  // Normalize ROTATED vertex positions to [-1, 1] matching PyTorch
+  const vNorm = new Float32Array(numVertices * 3);
+  for (let i = 0; i < numVertices; i++) {
+    for (let a = 0; a < 3; a++) {
+      vNorm[i * 3 + a] = (rotVerts[i * 3 + a] - bboxMin[a]) / bboxRange[a] * 2 - 1;
+    }
+  }
+
+  // UV projection axes matching PyTorch exactly:
+  //   +X (0): uc = y,  vc = -z
+  //   -X (1): uc = y,  vc = -z
+  //   +Y (2): uc = x,  vc = -z
+  //   -Y (3): uc = x,  vc = -z
+  //   +Z (4): uc = x,  vc = y
+  //   -Z (5): uc = x,  vc = -y
+  // abs_axis uses the corresponding position axis for max_dim_div
+  // +X/-X use abs(x), +Y/-Y use abs(y), +Z/-Z use abs(z)
+
+  // Depth axis per cube face (perpendicular to projection plane)
+  const depthAxis = [0, 0, 1, 1, 2, 2];
+  const depthKeepMax = [true, false, true, false, true, false];
+
+  // --- Step 1: Compute raw [0,1] UVs and depth centroids ---
+  // Matching PyTorch: project normalized positions, divide by max_dim_div per face, then to [0,1]
+  const rawU = new Float32Array(numFaces * 3);
+  const rawV = new Float32Array(numFaces * 3);
+  const centroidDepth = new Float32Array(numFaces);
+
+  for (let f = 0; f < numFaces; f++) {
+    const cubeF = faceAssignment[f];
+    const dAxis = depthAxis[cubeF];
+
+    let depthSum = 0;
+    for (let vi = 0; vi < 3; vi++) {
+      const idx = faces[f * 3 + vi];
+      let uc, vc;
+      // Project matching PyTorch axes (positions already in [-1, 1])
+      if (cubeF <= 1) {       // +X, -X: uc = y, vc = -z
+        uc = vNorm[idx * 3 + 1];
+        vc = -vNorm[idx * 3 + 2];
+      } else if (cubeF <= 3) { // +Y, -Y: uc = x, vc = -z
+        uc = vNorm[idx * 3];
+        vc = -vNorm[idx * 3 + 2];
+      } else if (cubeF === 4) { // +Z: uc = x, vc = y
+        uc = vNorm[idx * 3];
+        vc = vNorm[idx * 3 + 1];
+      } else {                  // -Z: uc = x, vc = -y
+        uc = vNorm[idx * 3];
+        vc = -vNorm[idx * 3 + 1];
+      }
+      // Map from [-1, 1] to [0, 1] (max_dim_div is always 1.0 in PyTorch)
+      rawU[f * 3 + vi] = Math.max(0, Math.min(1, (uc + 1) * 0.5));
+      rawV[f * 3 + vi] = Math.max(0, Math.min(1, (vc + 1) * 0.5));
+      depthSum += rotVerts[idx * 3 + dAxis];
+    }
+    centroidDepth[f] = depthSum / 3;
+  }
+
+  // --- Step 1b: Rotate UV slices to consistent tangent space ---
+  // Uses ROTATED positions and normals (same coordinate space as UV projection).
+  _rotateUVSlicesConsistentSpace(
+    rotVerts, smoothNormals, faces, rawU, rawV, faceAssignment, numVertices, numFaces
+  );
+
+  // --- Step 2: Detect UV overlaps and assign atlas indices ---
+  // 0-5 = primary, 6-11 = first overlap, 12 = remaining
+  const atlasIndex = new Int32Array(numFaces);
+  for (let f = 0; f < numFaces; f++) atlasIndex[f] = faceAssignment[f];
+
+  _detectOverlapsBVH(numFaces, atlasIndex, rawU, rawV, centroidDepth, depthKeepMax, 0, streamOverlaps);
+  _detectOverlapsBVH(numFaces, atlasIndex, rawU, rawV, centroidDepth, depthKeepMax, 6, streamOverlaps);
+
+  // --- Step 2b: Per-island UV normalization for secondary tier (slots 6-11) ---
+  // Matching PyTorch _handle_slice_uvs: rescale all faces in each secondary
+  // slot so their UVs fill [0,1], with max 2x magnification (clip denom at 0.5).
+  for (let slot = 6; slot < 12; slot++) {
+    let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+    let count = 0;
+    for (let f = 0; f < numFaces; f++) {
+      if (atlasIndex[f] !== slot) continue;
+      count++;
+      for (let vi = 0; vi < 3; vi++) {
+        const u = rawU[f*3+vi], v = rawV[f*3+vi];
+        if (u < minU) minU = u; if (u > maxU) maxU = u;
+        if (v < minV) minV = v; if (v > maxV) maxV = v;
+      }
+    }
+    if (count === 0) continue;
+    const rangeU = Math.max(maxU - minU, 0.5); // clip at 0.5 = max 2x magnification
+    const rangeV = Math.max(maxV - minV, 0.5);
+    for (let f = 0; f < numFaces; f++) {
+      if (atlasIndex[f] !== slot) continue;
+      for (let vi = 0; vi < 3; vi++) {
+        rawU[f*3+vi] = (rawU[f*3+vi] - minU) / rangeU;
+        rawV[f*3+vi] = (rawV[f*3+vi] - minV) / rangeV;
+      }
+    }
+  }
+
+  // --- Step 3: Build per-face-vertex arrays ---
+  // Compute UNROTATED smooth normals for GLB export (from original vertices).
+  const origNormals = new Float32Array(numVertices * 3);
+  for (let f = 0; f < numFaces; f++) {
+    const i0 = faces[f * 3], i1 = faces[f * 3 + 1], i2 = faces[f * 3 + 2];
+    const e1x = vertices[i1*3] - vertices[i0*3];
+    const e1y = vertices[i1*3+1] - vertices[i0*3+1];
+    const e1z = vertices[i1*3+2] - vertices[i0*3+2];
+    const e2x = vertices[i2*3] - vertices[i0*3];
+    const e2y = vertices[i2*3+1] - vertices[i0*3+1];
+    const e2z = vertices[i2*3+2] - vertices[i0*3+2];
+    const nx = e1y * e2z - e1z * e2y;
+    const ny = e1z * e2x - e1x * e2z;
+    const nz = e1x * e2y - e1y * e2x;
+    for (const idx of [i0, i1, i2]) {
+      origNormals[idx*3] += nx; origNormals[idx*3+1] += ny; origNormals[idx*3+2] += nz;
+    }
+  }
+  for (let i = 0; i < numVertices; i++) {
+    const nx = origNormals[i*3], ny = origNormals[i*3+1], nz = origNormals[i*3+2];
+    const len = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
+    origNormals[i*3] /= len; origNormals[i*3+1] /= len; origNormals[i*3+2] /= len;
+  }
+
+  const newNumVertices = numFaces * 3;
+  const newNumFaces = numFaces;
+  const newVertices = new Float32Array(newNumVertices * 3);
+  const newNormals = new Float32Array(newNumVertices * 3);
+  const newFaces = new Uint32Array(newNumFaces * 3);
+  const uvs = new Float32Array(newNumVertices * 2);
+
+  for (let f = 0; f < numFaces; f++) {
+    for (let vi = 0; vi < 3; vi++) {
+      const origIdx = faces[f * 3 + vi];
+      const newIdx = f * 3 + vi;
+      // ORIGINAL unrotated vertices and normals for output (triplane queries + GLB export)
+      newVertices[newIdx * 3] = vertices[origIdx * 3];
+      newVertices[newIdx * 3 + 1] = vertices[origIdx * 3 + 1];
+      newVertices[newIdx * 3 + 2] = vertices[origIdx * 3 + 2];
+      newNormals[newIdx * 3] = origNormals[origIdx * 3];
+      newNormals[newIdx * 3 + 1] = origNormals[origIdx * 3 + 1];
+      newNormals[newIdx * 3 + 2] = origNormals[origIdx * 3 + 2];
+      newFaces[f * 3 + vi] = newIdx;
+    }
+  }
+
+  // --- Step 4: Pack UVs into atlas ---
+  // Layout matching PyTorch _find_slice_offset_and_scale:
+  //   Primary (0-5):   3×2 grid, cell=1/3×1/3, region [0,1]×[0,2/3]
+  //   Secondary (6-11): 3×2 grid, cell=1/6×1/6, region [0,1/2]×[2/3,1]
+  //   Remaining (12+):  sub-cell grid in region [1/2,1]×[2/3,1]
+  const pad = 0.005;
+
+  const slotCol = [0, 1, 2, 0, 1, 2];
+  const slotRow = [0, 0, 0, 1, 1, 1];
+
+  // Collect remaining faces (atlasIndex >= 12) and compute their sub-cell grid
+  const remainingFaces = [];
+  for (let f = 0; f < numFaces; f++) {
+    if (atlasIndex[f] >= 12) remainingFaces.push(f);
+  }
+  // Sub-cell grid for remaining faces: pack into [0.5,1]×[2/3,1] = 0.5 × 1/3
+  const remRegionW = 0.5, remRegionH = 1 / 3;
+  const remRegionX = 0.5, remRegionY = 2 / 3;
+  let remGridW = 1, remGridH = 1;
+  if (remainingFaces.length > 0) {
+    const ratio = remRegionW / remRegionH; // aspect ratio of remaining region
+    const mult = Math.sqrt(remainingFaces.length / ratio);
+    remGridW = Math.max(1, Math.ceil(ratio * mult));
+    remGridH = Math.max(1, Math.ceil(remainingFaces.length / remGridW));
+  }
+  const remCellW = remRegionW / remGridW;
+  const remCellH = remRegionH / remGridH;
+
+  // Build a map from face index to remaining-grid position
+  const remFaceGridIdx = new Map();
+  for (let i = 0; i < remainingFaces.length; i++) {
+    remFaceGridIdx.set(remainingFaces[i], i);
+  }
+
+  for (let f = 0; f < numFaces; f++) {
+    const ai = atlasIndex[f];
+    const tier = Math.floor(ai / 6);
+    const slot = ai % 6;
+    const sc = slotCol[slot], sr = slotRow[slot];
+
+    let offX, offY, cellW, cellH;
+    if (tier === 0) {
+      cellW = 1/3; cellH = 1/3;
+      offX = cellW * sc;
+      offY = cellH * sr;
+    } else if (tier === 1) {
+      cellW = 1/6; cellH = 1/6;
+      offX = cellW * sc;
+      offY = 2/3 + cellH * sr;
+    } else {
+      // Remaining: each face gets its own sub-cell
+      cellW = remCellW; cellH = remCellH;
+      const gi = remFaceGridIdx.get(f) || 0;
+      const gx = gi % remGridW;
+      const gy = Math.floor(gi / remGridW);
+      offX = remRegionX + gx * cellW;
+      offY = remRegionY + gy * cellH;
+    }
+
+    for (let vi = 0; vi < 3; vi++) {
+      const idx = f * 3 + vi;
+      // Per-face UV normalization for remaining tier:
+      // normalize each triangle's UVs to fill [0,1] within its sub-cell
+      let u = rawU[idx], v = rawV[idx];
+      if (tier >= 2) {
+        // Normalize per-triangle: find min/max across this triangle's 3 verts
+        const u0 = rawU[f*3], u1 = rawU[f*3+1], u2 = rawU[f*3+2];
+        const v0 = rawV[f*3], v1 = rawV[f*3+1], v2 = rawV[f*3+2];
+        const uMin = Math.min(u0, u1, u2), uMax = Math.max(u0, u1, u2);
+        const vMin = Math.min(v0, v1, v2), vMax = Math.max(v0, v1, v2);
+        const uRange = uMax - uMin || 1;
+        const vRange = vMax - vMin || 1;
+        // Clamp scale to prevent extreme magnification (match PyTorch clip_val)
+        const clipVal = Math.min(cellW, cellH) * 1.5;
+        u = (u - uMin) / Math.max(uRange, clipVal);
+        v = (v - vMin) / Math.max(vRange, clipVal);
+      }
+      uvs[idx * 2] = offX + pad + u * (cellW - 2 * pad);
+      uvs[idx * 2 + 1] = offY + pad + v * (cellH - 2 * pad);
+    }
+  }
+
+  // Diagnostic: check for degenerate UVs and out-of-bounds
+  let degenerateCount = 0, oobCount = 0;
+  const degFaces = [];
+  for (let f = 0; f < numFaces; f++) {
+    const u0 = uvs[f*6], v0 = uvs[f*6+1];
+    const u1 = uvs[f*6+2], v1 = uvs[f*6+3];
+    const u2 = uvs[f*6+4], v2 = uvs[f*6+5];
+    // UV triangle area via cross product
+    const area = Math.abs((u1-u0)*(v2-v0) - (u2-u0)*(v1-v0)) * 0.5;
+    if (area < 1e-10) {
+      degenerateCount++;
+      if (degFaces.length < 10) degFaces.push({ f, tier: Math.floor(atlasIndex[f]/6), ai: atlasIndex[f], area, u0, v0, u1, v1, u2, v2 });
+    }
+    // Check OOB
+    if (u0 < 0 || u0 > 1 || v0 < 0 || v0 > 1 ||
+        u1 < 0 || u1 > 1 || v1 < 0 || v1 > 1 ||
+        u2 < 0 || u2 > 1 || v2 < 0 || v2 > 1) oobCount++;
+  }
+  console.log(`UV diagnostics: degenerate=${degenerateCount}, out-of-bounds=${oobCount}, total=${numFaces}`);
+  if (degFaces.length > 0) console.log(`Sample degenerate faces: ${JSON.stringify(degFaces.slice(0, 5))}`);
+
+  // Also check: faces where all 3 UV verts map to the same texel at 1024 res
+  let sameTexelCount = 0;
+  const sameTexelFaces = [];
+  for (let f = 0; f < numFaces; f++) {
+    const px0 = Math.floor(uvs[f*6] * 1024), py0 = Math.floor(uvs[f*6+1] * 1024);
+    const px1 = Math.floor(uvs[f*6+2] * 1024), py1 = Math.floor(uvs[f*6+3] * 1024);
+    const px2 = Math.floor(uvs[f*6+4] * 1024), py2 = Math.floor(uvs[f*6+5] * 1024);
+    if (px0 === px1 && px1 === px2 && py0 === py1 && py1 === py2) {
+      sameTexelCount++;
+      if (sameTexelFaces.length < 5) sameTexelFaces.push({ f, tier: Math.floor(atlasIndex[f]/6), ai: atlasIndex[f] });
+    }
+  }
+  console.log(`Faces mapping to single texel at 1024: ${sameTexelCount} (these get 0 rasterized texels)`);
+  // Check: how many secondary/remaining faces have UV area < 1 texel at 1024?
+  let subTexelSecondary = 0, subTexelRemaining = 0;
+  for (let f = 0; f < numFaces; f++) {
+    const tier = Math.floor(atlasIndex[f] / 6);
+    if (tier === 0) continue;
+    const u0 = uvs[f*6], v0 = uvs[f*6+1];
+    const u1 = uvs[f*6+2], v1 = uvs[f*6+3];
+    const u2 = uvs[f*6+4], v2 = uvs[f*6+5];
+    const texelArea = Math.abs((u1-u0)*(v2-v0) - (u2-u0)*(v1-v0)) * 0.5 * 1024 * 1024;
+    if (texelArea < 1.0) {
+      if (tier === 1) subTexelSecondary++;
+      else subTexelRemaining++;
+    }
+  }
+  console.log(`Sub-texel faces: secondary=${subTexelSecondary}, remaining=${subTexelRemaining}`);
+  if (sameTexelFaces.length > 0) console.log(`Sample same-texel faces: ${JSON.stringify(sameTexelFaces)}`);
+
+  // Diagnostic: count faces per tier
+  const tierCounts = [0, 0, 0];
+  for (let f = 0; f < numFaces; f++) {
+    const t = Math.min(Math.floor(atlasIndex[f] / 6), 2);
+    tierCounts[t]++;
+  }
+  console.log(`Atlas tiers: primary=${tierCounts[0]}, secondary=${tierCounts[1]}, remaining=${tierCounts[2]}, total=${numFaces}`);
+
+  return { uvs, newVertices, newNormals, newFaces, newNumVertices, newNumFaces, faceAssignment: atlasIndex };
+}
+
+/**
+ * Detect UV overlaps using BVH-accelerated triangle-triangle intersection.
+ * Matching PyTorch's BVH approach: build a BVH per cube face slot, test each
+ * triangle against the BVH, bump the occluded face (by depth) to slot+6.
+ */
+function _detectOverlapsBVH(numFaces, atlasIndex, rawU, rawV, centroidDepth,
+    depthKeepMax, slotOffset, streamOverlaps = false) {
+
+  for (let slot = slotOffset; slot < slotOffset + 6; slot++) {
+    const slotFaces = [];
+    for (let f = 0; f < numFaces; f++) {
+      if (atlasIndex[f] === slot) slotFaces.push(f);
+    }
+    if (slotFaces.length < 2) continue;
+
+    const baseSlot = slot % 6;
+    const keepMax = depthKeepMax[baseSlot];
+
+    // Build BVH from triangles in this slot
+    const tris = slotFaces.map(f => ({
+      f,
+      u0: rawU[f*3], v0: rawV[f*3],
+      u1: rawU[f*3+1], v1: rawV[f*3+1],
+      u2: rawU[f*3+2], v2: rawV[f*3+2],
+      minU: Math.min(rawU[f*3], rawU[f*3+1], rawU[f*3+2]),
+      maxU: Math.max(rawU[f*3], rawU[f*3+1], rawU[f*3+2]),
+      minV: Math.min(rawV[f*3], rawV[f*3+1], rawV[f*3+2]),
+      maxV: Math.max(rawV[f*3], rawV[f*3+1], rawV[f*3+2]),
+    }));
+
+    const bvh = _buildBVH2D(tris);
+
+    // For each triangle, query the BVH for overlapping triangles
+    const bumped = new Set();
+    // Collect all unique intersection pairs first (matching PyTorch)
+    const pairs = streamOverlaps ? null : [];
+    const occludedSet = new Set();
+
+    for (const tri of tris) {
+      if (bumped.has(tri.f)) continue;
+      const candidates = _queryBVH2D(bvh, tri);
+      for (const other of candidates) {
+        if (other.f === tri.f || bumped.has(other.f)) continue;
+        if (_trianglesOverlap2D(tri, other)) {
+          const a = Math.min(tri.f, other.f);
+          const b = Math.max(tri.f, other.f);
+          if(streamOverlaps) {
+            // Duplicate intersections select the same face; Set insertion is
+            // idempotent. Still bump only after the complete unchanged query.
+            occludedSet.add(keepMax ? (centroidDepth[a]>=centroidDepth[b]?a:b) :
+              (centroidDepth[a]<=centroidDepth[b]?a:b));
+          } else pairs.push([a, b]);
+        }
+      }
+    }
+
+    // Deduplicate pairs and determine which face to bump (by depth)
+    const seen = new Set();
+    for (const [a, b] of pairs ?? []) {
+      const key = a * numFaces + b;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      // Determine which is occluded based on depth along cube face axis
+      let occluded;
+      if (keepMax) {
+        occluded = (centroidDepth[a] >= centroidDepth[b]) ? a : b;
+      } else {
+        occluded = (centroidDepth[a] <= centroidDepth[b]) ? a : b;
+      }
+      occludedSet.add(occluded);
+    }
+
+    // Bump all occluded faces
+    for (const f of occludedSet) {
+      atlasIndex[f] = Math.min(atlasIndex[f] + 6, 12);
+      bumped.add(f);
+    }
+  }
+}
+
+/** Same complete UV algorithm; discard duplicate-pair storage, not faces. */
+function unwrapResidentUV(vertices,faces,numVertices,numFaces) {
+  return unwrapUV(vertices,faces,numVertices,numFaces,0.87,true);
+}
+
+/** Build a simple 2D AABB BVH over triangles. */
+function _buildBVH2D(tris) {
+  if (tris.length <= 4) return { tris, left: null, right: null };
+
+  // Find split axis (longest extent)
+  let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
+  for (const t of tris) {
+    if (t.minU < minU) minU = t.minU;
+    if (t.maxU > maxU) maxU = t.maxU;
+    if (t.minV < minV) minV = t.minV;
+    if (t.maxV > maxV) maxV = t.maxV;
+  }
+
+  const extU = maxU - minU, extV = maxV - minV;
+  const axis = extU >= extV ? 'u' : 'v';
+
+  // Sort by centroid on split axis and split at median
+  const sorted = tris.slice().sort((a, b) => {
+    const ca = axis === 'u' ? (a.minU + a.maxU) : (a.minV + a.maxV);
+    const cb = axis === 'u' ? (b.minU + b.maxU) : (b.minV + b.maxV);
+    return ca - cb;
+  });
+
+  const mid = sorted.length >> 1;
+  return {
+    tris: null,
+    minU, maxU, minV, maxV,
+    left: _buildBVH2D(sorted.slice(0, mid)),
+    right: _buildBVH2D(sorted.slice(mid)),
+  };
+}
+
+/** Query a 2D BVH for triangles whose AABB overlaps the query triangle's AABB. */
+function _queryBVH2D(node, tri) {
+  if (node.tris) {
+    // Leaf: return triangles whose AABBs overlap
+    const result = [];
+    for (const t of node.tris) {
+      if (t.maxU >= tri.minU && t.minU <= tri.maxU &&
+          t.maxV >= tri.minV && t.minV <= tri.maxV) {
+        result.push(t);
+      }
+    }
+    return result;
+  }
+
+  // Interior: check AABB overlap with node bounds
+  if (node.maxU < tri.minU || node.minU > tri.maxU ||
+      node.maxV < tri.minV || node.minV > tri.maxV) {
+    return [];
+  }
+
+  const left = _queryBVH2D(node.left, tri);
+  const right = _queryBVH2D(node.right, tri);
+  return left.concat(right);
+}
+
+/**
+ * 2D triangle-triangle overlap test with area threshold.
+ * Matching PyTorch: two triangles "overlap" only if their intersection polygon
+ * has area > 1e-10. This filters out edge-touching adjacent faces (zero area)
+ * while catching true UV overlaps from different surfaces.
+ */
+function _trianglesOverlap2D(a, b) {
+  // Compute intersection polygon via Sutherland-Hodgman clipping
+  const area = _triangleIntersectionArea2D(
+    a.u0, a.v0, a.u1, a.v1, a.u2, a.v2,
+    b.u0, b.v0, b.u1, b.v1, b.u2, b.v2
+  );
+  return area > 1e-10;
+}
+
+/** Compute the area of intersection between two 2D triangles via polygon clipping. */
+function _triangleIntersectionArea2D(
+  au0,av0,au1,av1,au2,av2,
+  bu0,bv0,bu1,bv1,bu2,bv2
+) {
+  // Sutherland-Hodgman: clip triangle B against all edges of triangle A
+  let poly = [[bu0,bv0],[bu1,bv1],[bu2,bv2]];
+  const clip = [[au0,av0],[au1,av1],[au2,av2]];
+
+  for (let i = 0; i < 3; i++) {
+    if (poly.length === 0) return 0;
+    const [ex, ey] = clip[i];
+    const [fx, fy] = clip[(i + 1) % 3];
+    const output = [];
+
+    for (let j = 0; j < poly.length; j++) {
+      const [cx, cy] = poly[j];
+      const [dx, dy] = poly[(j + 1) % poly.length];
+      const cSide = (fx - ex) * (cy - ey) - (fy - ey) * (cx - ex);
+      const dSide = (fx - ex) * (dy - ey) - (fy - ey) * (dx - ex);
+
+      if (cSide >= 0) {
+        output.push([cx, cy]);
+        if (dSide < 0) {
+          output.push(_lineIntersect2D(cx, cy, dx, dy, ex, ey, fx, fy));
+        }
+      } else if (dSide >= 0) {
+        output.push(_lineIntersect2D(cx, cy, dx, dy, ex, ey, fx, fy));
+      }
+    }
+    poly = output;
+  }
+
+  if (poly.length < 3) return 0;
+
+  // Shoelace formula for polygon area
+  let area = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const [x1, y1] = poly[i];
+    const [x2, y2] = poly[(i + 1) % poly.length];
+    area += x1 * y2 - x2 * y1;
+  }
+  return Math.abs(area) * 0.5;
+}
+
+function _lineIntersect2D(ax, ay, bx, by, cx, cy, dx, dy) {
+  const denom = (ax - bx) * (cy - dy) - (ay - by) * (cx - dx);
+  if (Math.abs(denom) < 1e-15) return [(ax + bx) * 0.5, (ay + by) * 0.5];
+  const t = ((ax - cx) * (cy - dy) - (ay - cy) * (cx - dx)) / denom;
+  return [ax + t * (bx - ax), ay + t * (by - ay)];
+}
+
+/**
+ * Rasterize UV space to get 3D positions and TBN basis at each texel.
+ *
+ * For each triangle in UV space, rasterize its bounding box and compute
+ * barycentric interpolation of 3D positions. Also computes per-face
+ * tangent/bitangent/normal basis from UV edges and position edges.
+ *
+ * @param {Float32Array} uvs - [N_v * 2] UV coordinates
+ * @param {Float32Array} positions - [N_v * 3] vertex positions
+ * @param {Uint32Array} faces - [N_f * 3] face indices
+ * @param {number} numFaces
+ * @param {number} resolution - texture resolution (default 1024)
+ * @param {Uint8Array} [_faceAssignment] - unused, kept for API compat
+ * @returns {{ positions3D: Float32Array, mask: Uint8Array, tbnData: Float32Array }}
+ */
+function rasterizeUV(uvs, positions, faces, numFaces, resolution = 1024, _faceAssignment = null) {
+  const positions3D = new Float32Array(resolution * resolution * 3);
+  const mask = new Uint8Array(resolution * resolution);
+  // TBN: 9 floats per texel (tangent[3], bitangent[3], normal[3])
+  const tbnData = new Float32Array(resolution * resolution * 9);
+
+  for (let f = 0; f < numFaces; f++) {
+    const i0 = faces[f * 3], i1 = faces[f * 3 + 1], i2 = faces[f * 3 + 2];
+
+    const u0 = uvs[i0 * 2], v0 = uvs[i0 * 2 + 1];
+    const u1 = uvs[i1 * 2], v1 = uvs[i1 * 2 + 1];
+    const u2 = uvs[i2 * 2], v2 = uvs[i2 * 2 + 1];
+
+    const p0x = positions[i0*3], p0y = positions[i0*3+1], p0z = positions[i0*3+2];
+    const p1x = positions[i1*3], p1y = positions[i1*3+1], p1z = positions[i1*3+2];
+    const p2x = positions[i2*3], p2y = positions[i2*3+1], p2z = positions[i2*3+2];
+
+    // Compute face TBN from edges and UV deltas
+    const e1x = p1x-p0x, e1y = p1y-p0y, e1z = p1z-p0z;
+    const e2x = p2x-p0x, e2y = p2y-p0y, e2z = p2z-p0z;
+    const duv1u = u1-u0, duv1v = v1-v0;
+    const duv2u = u2-u0, duv2v = v2-v0;
+
+    // Face normal
+    let fnx = e1y*e2z - e1z*e2y;
+    let fny = e1z*e2x - e1x*e2z;
+    let fnz = e1x*e2y - e1y*e2x;
+    let fnLen = Math.sqrt(fnx*fnx + fny*fny + fnz*fnz) || 1;
+    fnx /= fnLen; fny /= fnLen; fnz /= fnLen;
+
+    // Tangent from UV gradients: T = (e1 * duv2v - e2 * duv1v) / det
+    const det = duv1u * duv2v - duv1v * duv2u;
+    let tx, ty, tz, bx, by, bz;
+    if (Math.abs(det) > 1e-10) {
+      const invDet = 1.0 / det;
+      tx = (e1x * duv2v - e2x * duv1v) * invDet;
+      ty = (e1y * duv2v - e2y * duv1v) * invDet;
+      tz = (e1z * duv2v - e2z * duv1v) * invDet;
+    } else {
+      // Degenerate UV: pick arbitrary tangent perpendicular to normal
+      tx = 1; ty = 0; tz = 0;
+      if (Math.abs(fnx) > 0.9) { tx = 0; ty = 1; }
+    }
+
+    // Orthogonalize tangent against normal (Gram-Schmidt)
+    const tDotN = tx*fnx + ty*fny + tz*fnz;
+    tx -= tDotN * fnx; ty -= tDotN * fny; tz -= tDotN * fnz;
+    let tLen = Math.sqrt(tx*tx + ty*ty + tz*tz) || 1;
+    tx /= tLen; ty /= tLen; tz /= tLen;
+
+    // Bitangent = cross(normal, tangent)
+    bx = fny*tz - fnz*ty;
+    by = fnz*tx - fnx*tz;
+    bz = fnx*ty - fny*tx;
+    let bLen = Math.sqrt(bx*bx + by*by + bz*bz) || 1;
+    bx /= bLen; by /= bLen; bz /= bLen;
+
+    // Bounding box in pixel coords
+    const minPx = Math.max(0, Math.floor(Math.min(u0, u1, u2) * resolution));
+    const maxPx = Math.min(resolution - 1, Math.ceil(Math.max(u0, u1, u2) * resolution));
+    const minPy = Math.max(0, Math.floor(Math.min(v0, v1, v2) * resolution));
+    const maxPy = Math.min(resolution - 1, Math.ceil(Math.max(v0, v1, v2) * resolution));
+
+    const denom = (v1 - v2) * (u0 - u2) + (u2 - u1) * (v0 - v2);
+    if (Math.abs(denom) < 1e-10) continue;
+    const invDenom = 1.0 / denom;
+
+    for (let py = minPy; py <= maxPy; py++) {
+      for (let px = minPx; px <= maxPx; px++) {
+        const u = (px + 0.5) / resolution;
+        const v = (py + 0.5) / resolution;
+
+        const w0 = ((v1 - v2) * (u - u2) + (u2 - u1) * (v - v2)) * invDenom;
+        const w1 = ((v2 - v0) * (u - u2) + (u0 - u2) * (v - v2)) * invDenom;
+        const w2 = 1 - w0 - w1;
+
+        if (w0 >= -1e-3 && w1 >= -1e-3 && w2 >= -1e-3) {
+          const pixIdx = py * resolution + px;
+          mask[pixIdx] = 1;
+          positions3D[pixIdx * 3] = w0 * p0x + w1 * p1x + w2 * p2x;
+          positions3D[pixIdx * 3 + 1] = w0 * p0y + w1 * p1y + w2 * p2y;
+          positions3D[pixIdx * 3 + 2] = w0 * p0z + w1 * p1z + w2 * p2z;
+          // TBN is constant per face (vertices are duplicated per face)
+          const tbnBase = pixIdx * 9;
+          tbnData[tbnBase]   = tx; tbnData[tbnBase+1] = ty; tbnData[tbnBase+2] = tz;
+          tbnData[tbnBase+3] = bx; tbnData[tbnBase+4] = by; tbnData[tbnBase+5] = bz;
+          tbnData[tbnBase+6] = fnx; tbnData[tbnBase+7] = fny; tbnData[tbnBase+8] = fnz;
+        }
+      }
+    }
+  }
+
+  // Sub-texel face coverage: for faces whose UV triangle is smaller than
+  // 1 texel, write face centroid position to unoccupied texels only.
+  // CONDITIONAL write: never overwrite texels already covered by the main
+  // rasterization pass, to avoid corrupting larger faces' data.
+  for (let f = 0; f < numFaces; f++) {
+    const i0 = faces[f * 3], i1 = faces[f * 3 + 1], i2 = faces[f * 3 + 2];
+    const u0 = uvs[i0*2], v0 = uvs[i0*2+1];
+    const u1 = uvs[i1*2], v1 = uvs[i1*2+1];
+    const u2 = uvs[i2*2], v2 = uvs[i2*2+1];
+
+    // Check UV triangle area in texels
+    const texelArea = Math.abs((u1-u0)*(v2-v0) - (u2-u0)*(v1-v0)) * 0.5 * resolution * resolution;
+    if (texelArea >= 1.0) continue; // adequately rasterized, skip
+
+    // Face centroid in 3D
+    const p0x = positions[i0*3], p0y = positions[i0*3+1], p0z = positions[i0*3+2];
+    const p1x = positions[i1*3], p1y = positions[i1*3+1], p1z = positions[i1*3+2];
+    const p2x = positions[i2*3], p2y = positions[i2*3+1], p2z = positions[i2*3+2];
+    const cx = (p0x + p1x + p2x) / 3;
+    const cy = (p0y + p1y + p2y) / 3;
+    const cz = (p0z + p1z + p2z) / 3;
+
+    // Face TBN
+    const e1x = p1x-p0x, e1y = p1y-p0y, e1z = p1z-p0z;
+    const e2x = p2x-p0x, e2y = p2y-p0y, e2z = p2z-p0z;
+    let fnx = e1y*e2z - e1z*e2y, fny = e1z*e2x - e1x*e2z, fnz = e1x*e2y - e1y*e2x;
+    const fnLen = Math.sqrt(fnx*fnx + fny*fny + fnz*fnz) || 1;
+    fnx /= fnLen; fny /= fnLen; fnz /= fnLen;
+    let tx = 1, ty = 0, tz = 0;
+    if (Math.abs(fnx) > 0.9) { tx = 0; ty = 1; }
+    const tDotN = tx*fnx + ty*fny + tz*fnz;
+    tx -= tDotN*fnx; ty -= tDotN*fny; tz -= tDotN*fnz;
+    const tLen = Math.sqrt(tx*tx + ty*ty + tz*tz) || 1;
+    tx /= tLen; ty /= tLen; tz /= tLen;
+    const bx = fny*tz - fnz*ty, by = fnz*tx - fnx*tz, bz = fnx*ty - fny*tx;
+
+    // Write to unoccupied texels at vertex and centroid positions
+    const texels = new Set();
+    for (const [pu, pv] of [[u0,v0],[u1,v1],[u2,v2],[(u0+u1+u2)/3,(v0+v1+v2)/3]]) {
+      const px = Math.min(resolution-1, Math.max(0, Math.floor(pu * resolution)));
+      const py = Math.min(resolution-1, Math.max(0, Math.floor(pv * resolution)));
+      texels.add(py * resolution + px);
+    }
+
+    for (const pixIdx of texels) {
+      if (mask[pixIdx]) continue; // don't overwrite correctly-rasterized texels
+      mask[pixIdx] = 1;
+      positions3D[pixIdx * 3] = cx;
+      positions3D[pixIdx * 3 + 1] = cy;
+      positions3D[pixIdx * 3 + 2] = cz;
+      const tbnBase = pixIdx * 9;
+      tbnData[tbnBase] = tx; tbnData[tbnBase+1] = ty; tbnData[tbnBase+2] = tz;
+      tbnData[tbnBase+3] = bx; tbnData[tbnBase+4] = by; tbnData[tbnBase+5] = bz;
+      tbnData[tbnBase+6] = fnx; tbnData[tbnBase+7] = fny; tbnData[tbnBase+8] = fnz;
+    }
+  }
+
+  return { positions3D, mask, tbnData };
+}
+
+/**
+ * Bake albedo texture and normal map by querying the triplane decoder.
+ *
+ * @param {GPUDevice} device
+ * @param {Object} triplaneDecoder - TriplaneDecoder instance
+ * @param {GPUBuffer} triplanesBuf - [3, 40, 384, 384] triplane features
+ * @param {Object} decoderWeights - decoder weights
+ * @param {Float32Array} positions3D - [res*res, 3] from rasterizeUV
+ * @param {Uint8Array} mask - [res*res] from rasterizeUV
+ * @param {Float32Array} tbnData - [res*res, 9] TBN basis from rasterizeUV
+ * @param {number} resolution
+ * @returns {{ albedo: Uint8Array, normalMap: Uint8Array }} - [res, res, 4] RGBA textures
+ */
+/**
+ * Decode features + perturb_normal for numOccupied query positions.
+ *
+ * Monolithic by default (one decode dispatch + one fence + one readback).
+ * When `options.cooperativeBatch(batchStart, batchEnd, decodeBatch)` is supplied,
+ * the texels are split into fixed batches and each batch is decoded as its own
+ * GPU command duty via the caller's cooperative driver — collapsing the single
+ * ~231ms contiguous decode+readback into yieldable batches. Per-texel decode is
+ * independent, so batch outputs concatenated in order are byte-identical to the
+ * monolithic path.
+ *
+ * @returns {Promise<{featuresCPU: Float32Array, normalsCPU: Float32Array}>}
+ */
+async function decodeTexelFeatures(device, triplaneDecoder, triplanesBuf, decoderWeights,
+                                          queryPositions, numOccupied, options = {}) {
+  const decodeRange = async (start, end) => {
+    const count = end - start;
+    const sub = queryPositions.subarray(start * 3, end * 3);
+    const startedAtMs = performance.now();
+    const { value, allocations } = captureGpuBufferAllocations(() => {
+      const posBuf = createStorageBuffer(device, sub);
+      const encoder = device.createCommandEncoder({ label: `texel-decode-${start}-${end}` });
+      const decoded = triplaneDecoder.decode(
+        encoder, posBuf, triplanesBuf, count, decoderWeights, ['features', 'perturb_normal']);
+      return { encoder, decoded, count };
+    });
+    return {
+      ...value,
+      hostEncodeMs: performance.now() - startedAtMs,
+      scratchResources: allocations,
+    };
+  };
+
+  const featuresCPU = new Float32Array(numOccupied * 3);
+  const normalsCPU = new Float32Array(numOccupied * 3);
+
+  if (typeof options.cooperativeBatch === 'function') {
+    // Cooperative path: each batch's decode is a GPU duty (submit + facade
+    // fence + browser yield). Crucially, batch outputs are copied into ONE
+    // shared persistent buffer on the GPU (no per-batch readback) and read back
+    // exactly ONCE at the end — otherwise a per-batch mapAsync forces a GPU sync
+    // per batch and fine batching regresses badly (measured 1808ms at 61
+    // batches). Coalesced readback keeps cooperation between decode duties only.
+    //
+    // Optional decoder scratch arena (options.arena): when present, the decoder
+    // reuses one pre-allocated buffer per slot across all ranges instead of
+    // rebuilding ~30 transient buffers per range (~1.015GB churn per Cranial's
+    // assay). Arena slots bypass createEmptyBuffer, so captureGpuBufferAllocations
+    // no longer records them — per-range scratchResources collapses to just the
+    // small query-position buffer, and the existing per-prefix retire logic
+    // still lawfully retires that. Exact per-range prefix completion is unchanged.
+    const priorSlotProvider = triplaneDecoder._slotProvider;
+    if (options.arena) triplaneDecoder._slotProvider = options.arena;
+    const featuresAll = createEmptyBuffer(device, numOccupied * 3 * 4);
+    const normalsAll = createEmptyBuffer(device, numOccupied * 3 * 4);
+    try {
+    await options.cooperativeBatch(numOccupied, async (start, end) => {
+      const { encoder, decoded, count, hostEncodeMs, scratchResources } = await decodeRange(start, end);
+      // Copy this batch's decode outputs into their slice of the shared buffers,
+      // in the SAME command buffer, so no extra submit/sync is needed.
+      encoder.copyBufferToBuffer(decoded.features, 0, featuresAll, start * 3 * 4, count * 3 * 4);
+      encoder.copyBufferToBuffer(decoded.perturb_normal, 0, normalsAll, start * 3 * 4, count * 3 * 4);
+      return {
+        encode: () => encoder.finish(),
+        submit: (cb) => device.queue.submit([cb]),
+        hostEncodeMs,
+        scratchResources,
+      };
+    });
+    // Single coalesced readback of all batches.
+    const readbackStartedAtMs = performance.now();
+    let f;
+    let n;
+    try {
+      f = await readBuffer(device, featuresAll, numOccupied * 3 * 4);
+      n = await readBuffer(device, normalsAll, numOccupied * 3 * 4);
+    } finally {
+      featuresAll.destroy();
+      normalsAll.destroy();
+    }
+    if (options.telemetry) {
+      const readbackCompletedAtMs = performance.now();
+      options.telemetry.readbackMs = readbackCompletedAtMs - readbackStartedAtMs;
+      options.telemetry.readbackInterval = {
+        startMs: readbackStartedAtMs,
+        endMs: readbackCompletedAtMs,
+      };
+      options.telemetry.aggregateOutputBytes = numOccupied * 3 * 4 * 2;
+      options.telemetry.aggregateOutputsRetired = true;
+    }
+    featuresCPU.set(f.subarray(0, numOccupied * 3));
+    normalsCPU.set(n.subarray(0, numOccupied * 3));
+    return { featuresCPU, normalsCPU };
+    } finally {
+      // Restore the decoder's slot provider so a non-arena decode later is
+      // unaffected. The arena's own lifetime (allocation/retirement) is owned by
+      // the phase-resource lease at the call site, not here.
+      triplaneDecoder._slotProvider = priorSlotProvider;
+    }
+  }
+
+  // Monolithic default (unchanged behavior).
+  const { encoder, decoded } = await decodeRange(0, numOccupied);
+  device.queue.submit([encoder.finish()]);
+  await device.queue.onSubmittedWorkDone();
+  const f = await readBuffer(device, decoded.features, numOccupied * 3 * 4);
+  const n = await readBuffer(device, decoded.perturb_normal, numOccupied * 3 * 4);
+  featuresCPU.set(f.subarray(0, numOccupied * 3));
+  normalsCPU.set(n.subarray(0, numOccupied * 3));
+  return { featuresCPU, normalsCPU };
+}
+
+async function bakeTexture(device, triplaneDecoder, triplanesBuf, decoderWeights,
+                                   positions3D, mask, tbnData, resolution = 1024, options = {}) {
+  const cpuPrepStartedAtMs = performance.now();
+  // Collect occupied texel positions
+  const occupiedIndices = [];
+  for (let i = 0; i < resolution * resolution; i++) {
+    if (mask[i]) occupiedIndices.push(i);
+  }
+
+  const numOccupied = occupiedIndices.length;
+  console.log(`Texture bake: ${numOccupied} occupied texels out of ${resolution * resolution}`);
+
+  const emptyTex = new Uint8Array(resolution * resolution * 4);
+  if (numOccupied === 0) {
+    return { albedo: emptyTex, normalMap: new Uint8Array(emptyTex) };
+  }
+
+  // Pack occupied positions into a dense array
+  const queryPositions = new Float32Array(numOccupied * 3);
+  for (let i = 0; i < numOccupied; i++) {
+    const idx = occupiedIndices[i];
+    queryPositions[i * 3] = positions3D[idx * 3];
+    queryPositions[i * 3 + 1] = positions3D[idx * 3 + 1];
+    queryPositions[i * 3 + 2] = positions3D[idx * 3 + 2];
+  }
+
+  // Decode features + perturb_normal for every occupied texel. Per-texel decode
+  // is fully independent, so this is monolithic by default but can be driven in
+  // cooperative batches via options.cooperativeBatch (see decodeTexelFeatures).
+  if (options.telemetry) {
+    const cpuPrepCompletedAtMs = performance.now();
+    options.telemetry.cpuPrepMs = cpuPrepCompletedAtMs - cpuPrepStartedAtMs;
+    options.telemetry.cpuPrepInterval = {
+      startMs: cpuPrepStartedAtMs,
+      endMs: cpuPrepCompletedAtMs,
+    };
+  }
+  const { featuresCPU, normalsCPU } = await decodeTexelFeatures(
+    device, triplaneDecoder, triplanesBuf, decoderWeights, queryPositions, numOccupied, options);
+  const materializationStartedAtMs = performance.now();
+
+  // Materialize albedo + normal textures (+ dilation). Cranial's assay's ~752ms
+  // single-threaded CPU tail. Optionally offloaded to a Web Worker
+  // (options.materializeWorker) — byte-identical (same materialize_core math),
+  // with no GPU sync and no per-duty fence floor. Main-thread path is the same
+  // pure function.
+  let albedo, normalMap, workerTransferMs = null;
+  const matInput = { featuresCPU, normalsCPU, occupiedIndices, tbnData, mask, resolution, numOccupied };
+
+  if (options.materializeWorker) {
+    const worker = options.materializeWorker;
+    const id = `mat-${Math.random().toString(36).slice(2)}`;
+    // Copy the transferables so the caller's arrays stay intact; one copy each.
+    const featuresBuf = featuresCPU.slice().buffer;
+    const normalsBuf = normalsCPU.slice().buffer;
+    const occupiedBuf = (occupiedIndices instanceof Uint32Array ? occupiedIndices : Uint32Array.from(occupiedIndices)).slice().buffer;
+    const tbnBuf = tbnData.slice().buffer;
+    const maskBuf = mask.slice().buffer;
+    const transferStart = performance.now();
+    const out = await withForegroundScope(options, 'texture-materialize-worker', () => callWorker(
+      worker,
+      { featuresBuf, normalsBuf, occupiedBuf, tbnBuf, maskBuf, resolution, numOccupied, id },
+      [featuresBuf, normalsBuf, occupiedBuf, tbnBuf, maskBuf],
+      {
+        timeoutMs: options.workerTimeoutMs || 60000,
+        onResult: (d) => {
+          const a = new Uint8Array(d.albedo);
+          const n = new Uint8Array(d.normalMap);
+          const expected = resolution * resolution * 4;
+          if (a.length !== expected || n.length !== expected) {
+            throw new Error(`materialize output size ${a.length}/${n.length} != ${expected}`);
+          }
+          return { albedo: a, normalMap: n };
+        },
+      },
+    ));
+    albedo = out.albedo; normalMap = out.normalMap;
+    workerTransferMs = performance.now() - transferStart;
+  } else {
+    const m = materializeTextures(matInput);
+    albedo = m.albedo; normalMap = m.normalMap;
+  }
+  const materializationCompletedAtMs = performance.now();
+
+  if (options.telemetry) {
+    options.telemetry.cpuMaterializationMs = materializationCompletedAtMs - materializationStartedAtMs;
+    options.telemetry.cpuMaterializationInterval = {
+      startMs: materializationStartedAtMs,
+      endMs: materializationCompletedAtMs,
+    };
+    options.telemetry.materializationOffloaded = Boolean(options.materializeWorker);
+    options.telemetry.materializationWorkerTransferMs = workerTransferMs;
+  }
+  return { albedo, normalMap };
+}
+
+/**
+ * Export mesh as GLB (binary glTF 2.0).
+ *
+ * @param {Float32Array} vertices - [N_v * 3]
+ * @param {Float32Array} vertexNormals - [N_v * 3] pre-computed smooth normals
+ * @param {Uint32Array} faces - [N_f * 3]
+ * @param {Float32Array} uvs - [N_v * 2]
+ * @param {Uint8Array} albedoTexture - [res, res, 4] RGBA
+ * @param {Uint8Array|null} normalMapTexture - [res, res, 4] RGBA or null
+ * @param {number} numVertices
+ * @param {number} numFaces
+ * @param {number} textureResolution
+ * @param {number} roughness
+ * @param {number} metallic
+ * @returns {ArrayBuffer} GLB binary
+ */
+async function exportGLB(vertices, vertexNormals, faces, uvs,
+                                 albedoTexture, normalMapTexture,
+                                 numVertices, numFaces, textureResolution = 1024,
+                                 roughness = 0.5, metallic = 0.0, options = {}) {
+  if (numVertices === 0 || numFaces === 0) {
+    throw new Error('Cannot export empty mesh as GLB');
+  }
+
+  // Apply coordinate transforms to match glTF conventions
+  // Combined: rot(-90, X) then rot(+90, Y) gives (x,y,z) → (-y, z, -x)
+  // Then invert face winding to match PyTorch's mesh.invert()
+  await options.onBeforeCpuAllocation?.('glb-transforms',24*numVertices+12*numFaces);
+  const transformedVerts = new Float32Array(numVertices * 3);
+  for (let i = 0; i < numVertices; i++) {
+    const x = vertices[i * 3];
+    const y = vertices[i * 3 + 1];
+    const z = vertices[i * 3 + 2];
+    const rx = x, ry = z, rz = -y;
+    transformedVerts[i * 3] = rz;
+    transformedVerts[i * 3 + 1] = ry;
+    transformedVerts[i * 3 + 2] = -rx;
+  }
+
+  const invertedFaces = new Uint32Array(numFaces * 3);
+  for (let f = 0; f < numFaces; f++) {
+    invertedFaces[f * 3] = faces[f * 3];
+    invertedFaces[f * 3 + 1] = faces[f * 3 + 2];
+    invertedFaces[f * 3 + 2] = faces[f * 3 + 1];
+  }
+
+  // Apply same rotation to pre-computed smooth normals, then negate
+  // for face inversion (winding flip makes outward normals point inward)
+  // Rotation (x,y,z)→(-y,z,-x), then negate: (y,-z,x)
+  const normals = new Float32Array(numVertices * 3);
+  for (let i = 0; i < numVertices; i++) {
+    const nx = vertexNormals[i * 3];
+    const ny = vertexNormals[i * 3 + 1];
+    const nz = vertexNormals[i * 3 + 2];
+    normals[i * 3] = ny;
+    normals[i * 3 + 1] = -nz;
+    normals[i * 3 + 2] = nx;
+  }
+
+  // Encode textures as JPEG
+  await options.onBeforeCpuAllocation?.('glb-albedo-image-data',4*textureResolution*textureResolution);
+  const albedoBlob = await _textureToJPEG(albedoTexture, textureResolution);
+  if (!albedoBlob) throw new Error('Failed to encode albedo texture as JPEG');
+  await options.onBeforeCpuAllocation?.('glb-albedo-encoded',albedoBlob.size);
+  const albedoBytes = new Uint8Array(await albedoBlob.arrayBuffer());
+
+  let normalBytes = null;
+  if (normalMapTexture) {
+    await options.onBeforeCpuAllocation?.('glb-normal-image-data',4*textureResolution*textureResolution);
+    const normalBlob = await _textureToJPEG(normalMapTexture, textureResolution, 0.95);
+    if (normalBlob) {
+      await options.onBeforeCpuAllocation?.('glb-normal-encoded',normalBlob.size);
+      normalBytes = new Uint8Array(await normalBlob.arrayBuffer());
+    }
+  }
+  if(options.requireNormalTexture&&!normalBytes)throw Error('complete learned normal texture encode required');
+
+  // Compute bounding box
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (let i = 0; i < numVertices; i++) {
+    const x = transformedVerts[i*3], y = transformedVerts[i*3+1], z = transformedVerts[i*3+2];
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+  }
+
+  const pad4 = (n) => (n + 3) & -4;
+
+  const vertexBytes = new Uint8Array(transformedVerts.buffer, transformedVerts.byteOffset, transformedVerts.byteLength);
+  const vnormalBytes = new Uint8Array(normals.buffer, normals.byteOffset, normals.byteLength);
+  const indexBytes = new Uint8Array(invertedFaces.buffer, invertedFaces.byteOffset, invertedFaces.byteLength);
+  const uvBytes = new Uint8Array(uvs.buffer, uvs.byteOffset, uvs.byteLength);
+
+  const vertexLen = pad4(vertexBytes.byteLength);
+  const vnormalLen = pad4(vnormalBytes.byteLength);
+  const indexLen = pad4(indexBytes.byteLength);
+  const uvLen = pad4(uvBytes.byteLength);
+  const albedoLen = pad4(albedoBytes.byteLength);
+  const normalTexLen = normalBytes ? pad4(normalBytes.byteLength) : 0;
+  const totalBinLen = vertexLen + vnormalLen + indexLen + uvLen + albedoLen + normalTexLen;
+
+  let off = 0;
+  const bufferViews = [
+    { buffer: 0, byteOffset: (off), byteLength: vertexBytes.byteLength, target: 34962 },
+    { buffer: 0, byteOffset: (off += vertexLen), byteLength: vnormalBytes.byteLength, target: 34962 },
+    { buffer: 0, byteOffset: (off += vnormalLen), byteLength: indexBytes.byteLength, target: 34963 },
+    { buffer: 0, byteOffset: (off += indexLen), byteLength: uvBytes.byteLength, target: 34962 },
+    { buffer: 0, byteOffset: (off += uvLen), byteLength: albedoBytes.byteLength }, // albedo image
+  ];
+  const albedoImageBV = 4;
+  let normalImageBV = -1;
+  if (normalBytes) {
+    normalImageBV = bufferViews.length;
+    bufferViews.push({ buffer: 0, byteOffset: (off += albedoLen), byteLength: normalBytes.byteLength });
+  }
+
+  const accessors = [
+    { bufferView: 0, componentType: 5126, count: numVertices, type: 'VEC3',
+      min: [minX, minY, minZ], max: [maxX, maxY, maxZ] },
+    { bufferView: 1, componentType: 5126, count: numVertices, type: 'VEC3' },
+    { bufferView: 2, componentType: 5125, count: numFaces * 3, type: 'SCALAR' },
+    { bufferView: 3, componentType: 5126, count: numVertices, type: 'VEC2' },
+  ];
+
+  const images = [{ bufferView: albedoImageBV, mimeType: 'image/jpeg' }];
+  const textures = [{ source: 0, sampler: 0 }];
+  if (normalBytes) {
+    images.push({ bufferView: normalImageBV, mimeType: 'image/jpeg' });
+    textures.push({ source: 1, sampler: 0 });
+  }
+
+  const material = {
+    pbrMetallicRoughness: {
+      baseColorTexture: { index: 0 },
+      roughnessFactor: roughness,
+      metallicFactor: metallic,
+    },
+  };
+  if (normalBytes) {
+    material.normalTexture = { index: 1 };
+  }
+
+  const gltf = {
+    asset: { version: '2.0', generator: 'SF3D-WebGPU' },
+    scene: 0,
+    scenes: [{ nodes: [0] }],
+    nodes: [{ mesh: 0 }],
+    meshes: [{
+      primitives: [{
+        attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 3 },
+        indices: 2,
+        material: 0,
+      }],
+    }],
+    materials: [material],
+    textures,
+    images,
+    samplers: [{ magFilter: 9729, minFilter: 9729 }],
+    accessors,
+    bufferViews,
+    buffers: [{ byteLength: totalBinLen }],
+  };
+
+  const jsonStr = JSON.stringify(gltf);
+  // This exporter authors ASCII-only keys/values and finite numeric metadata.
+  // Refuse drift rather than underdeclare TextEncoder's actual byte count.
+  if(options.onBeforeCpuAllocation){
+    if(/[^\x00-\x7f]/.test(jsonStr))throw Error('GLB authored JSON UTF8 demand changed');
+    await options.onBeforeCpuAllocation('glb-json',jsonStr.length);
+  }
+  const jsonBytes = new TextEncoder().encode(jsonStr);
+  const jsonPadLen = pad4(jsonBytes.byteLength);
+
+  const glbLen = 12 + 8 + jsonPadLen + 8 + totalBinLen;
+  await options.onBeforeCpuAllocation?.('glb-complete-buffer',glbLen);
+  const glb = new ArrayBuffer(glbLen); // zero-initialized per JS spec (BIN padding = 0x00)
+  const view = new DataView(glb);
+  const bytes = new Uint8Array(glb);
+
+  view.setUint32(0, 0x46546C67, true); // "glTF"
+  view.setUint32(4, 2, true);
+  view.setUint32(8, glbLen, true);
+
+  let offset = 12;
+  view.setUint32(offset, jsonPadLen, true);
+  view.setUint32(offset + 4, 0x4E4F534A, true); // "JSON"
+  offset += 8;
+  bytes.set(jsonBytes, offset);
+  for (let i = jsonBytes.byteLength; i < jsonPadLen; i++) bytes[offset + i] = 0x20;
+  offset += jsonPadLen;
+
+  view.setUint32(offset, totalBinLen, true);
+  view.setUint32(offset + 4, 0x004E4942, true); // "BIN\0"
+  offset += 8;
+
+  bytes.set(vertexBytes, offset); offset += vertexLen;
+  bytes.set(vnormalBytes, offset); offset += vnormalLen;
+  bytes.set(indexBytes, offset); offset += indexLen;
+  bytes.set(uvBytes, offset); offset += uvLen;
+  bytes.set(albedoBytes, offset); offset += albedoLen;
+  if (normalBytes) { bytes.set(normalBytes, offset); }
+
+  return glb;
+}
+
+/**
+ * Compute PCA rotation matrix that aligns the mesh's principal axes
+ * with canonical X/Y/Z. Matching PyTorch _align_mesh_with_main_axis.
+ *
+ * Returns a 9-element Float32Array representing a 3×3 row-major rotation matrix.
+ */
+function _computePCARotation(vertices, numVertices) {
+  // Center vertices
+  let cx = 0, cy = 0, cz = 0;
+  for (let i = 0; i < numVertices; i++) {
+    cx += vertices[i*3]; cy += vertices[i*3+1]; cz += vertices[i*3+2];
+  }
+  cx /= numVertices; cy /= numVertices; cz /= numVertices;
+
+  // Compute 3×3 covariance matrix (symmetric)
+  let c00 = 0, c01 = 0, c02 = 0, c11 = 0, c12 = 0, c22 = 0;
+  for (let i = 0; i < numVertices; i++) {
+    const dx = vertices[i*3] - cx, dy = vertices[i*3+1] - cy, dz = vertices[i*3+2] - cz;
+    c00 += dx*dx; c01 += dx*dy; c02 += dx*dz;
+    c11 += dy*dy; c12 += dy*dz; c22 += dz*dz;
+  }
+
+  // Jacobi eigendecomposition for symmetric 3×3 matrix.
+  // Matrix A (symmetric, row-major): [c00, c01, c02, c01, c11, c12, c02, c12, c22]
+  // Eigenvector matrix V starts as identity.
+  const A = [c00, c01, c02, c01, c11, c12, c02, c12, c22];
+  const V = [1,0,0, 0,1,0, 0,0,1]; // eigenvectors as columns
+
+  for (let iter = 0; iter < 50; iter++) {
+    // Find largest off-diagonal element
+    let maxVal = 0, p = 0, q = 1;
+    for (let i = 0; i < 3; i++) {
+      for (let j = i + 1; j < 3; j++) {
+        const absVal = Math.abs(A[i*3+j]);
+        if (absVal > maxVal) { maxVal = absVal; p = i; q = j; }
+      }
+    }
+    if (maxVal < 1e-12) break; // converged
+
+    // Compute Jacobi rotation
+    const app = A[p*3+p], aqq = A[q*3+q], apq = A[p*3+q];
+    const tau = (aqq - app) / (2 * apq);
+    const t = Math.sign(tau) / (Math.abs(tau) + Math.sqrt(1 + tau*tau));
+    const c = 1 / Math.sqrt(1 + t*t);
+    const s = t * c;
+
+    // Update A: rotate rows/cols p and q
+    const newA = A.slice();
+    newA[p*3+p] = c*c*app - 2*s*c*apq + s*s*aqq;
+    newA[q*3+q] = s*s*app + 2*s*c*apq + c*c*aqq;
+    newA[p*3+q] = 0; newA[q*3+p] = 0;
+    for (let r = 0; r < 3; r++) {
+      if (r === p || r === q) continue;
+      const arp = A[r*3+p], arq = A[r*3+q];
+      newA[r*3+p] = c*arp - s*arq; newA[p*3+r] = newA[r*3+p];
+      newA[r*3+q] = s*arp + c*arq; newA[q*3+r] = newA[r*3+q];
+    }
+    for (let i = 0; i < 9; i++) A[i] = newA[i];
+
+    // Update V: rotate columns p and q
+    for (let r = 0; r < 3; r++) {
+      const vp = V[r*3+p], vq = V[r*3+q];
+      V[r*3+p] = c*vp - s*vq;
+      V[r*3+q] = s*vp + c*vq;
+    }
+  }
+
+  // Eigenvalues are diagonal of A; eigenvectors are columns of V
+  const eigenvalues = [A[0], A[4], A[8]];
+  // Sort eigenvectors by descending eigenvalue (largest variance = main axis)
+  const order = [0, 1, 2].sort((a, b) => eigenvalues[b] - eigenvalues[a]);
+
+  // Extract sorted eigenvectors
+  let mainAxis = [V[0*3+order[0]], V[1*3+order[0]], V[2*3+order[0]]];
+  let secAxis  = [V[0*3+order[1]], V[1*3+order[1]], V[2*3+order[1]]];
+
+  // Normalize main axis
+  let len = Math.sqrt(mainAxis[0]**2 + mainAxis[1]**2 + mainAxis[2]**2) || 1;
+  mainAxis = mainAxis.map(v => v / len);
+
+  // Orthogonalize secondary against main (Gram-Schmidt)
+  const dot = secAxis[0]*mainAxis[0] + secAxis[1]*mainAxis[1] + secAxis[2]*mainAxis[2];
+  secAxis = secAxis.map((v, i) => v - dot * mainAxis[i]);
+  len = Math.sqrt(secAxis[0]**2 + secAxis[1]**2 + secAxis[2]**2) || 1;
+  secAxis = secAxis.map(v => v / len);
+
+  // Third axis = cross(main, secondary)
+  let thirdAxis = [
+    mainAxis[1]*secAxis[2] - mainAxis[2]*secAxis[1],
+    mainAxis[2]*secAxis[0] - mainAxis[0]*secAxis[2],
+    mainAxis[0]*secAxis[1] - mainAxis[1]*secAxis[0],
+  ];
+  len = Math.sqrt(thirdAxis[0]**2 + thirdAxis[1]**2 + thirdAxis[2]**2) || 1;
+  thirdAxis = thirdAxis.map(v => v / len);
+
+  // Assign each PCA axis to the canonical axis it's most aligned with
+  let mainIdx = _argmaxAbs(mainAxis);
+  let secIdx = _argmaxAbs(secAxis);
+  let thirdIdx = _argmaxAbs(thirdAxis);
+
+  // Resolve conflicts (matching PyTorch logic)
+  const used = new Set([mainIdx, secIdx, thirdIdx]);
+  if (used.size !== 3) {
+    const all = new Set([0, 1, 2]);
+    let curIndex = 1;
+    while (new Set([mainIdx, secIdx, thirdIdx]).size !== 3) {
+      const missing = [...all].filter(x => ![mainIdx, secIdx, thirdIdx].includes(x))[0];
+      if (curIndex === 1) thirdIdx = missing;
+      else if (curIndex === 2) secIdx = missing;
+      curIndex++;
+      if (curIndex > 3) break;
+    }
+  }
+
+  // Build rotation matrix: place each PCA axis in the row of its canonical axis
+  // rot_mat = stack(axes, dim=1).T → axes[canonicalIdx] = pcaAxis → row canonicalIdx = pcaAxis
+  const rotMat = new Float32Array(9);
+  const axes = [mainAxis, secAxis, thirdAxis];
+  const indices = [mainIdx, secIdx, thirdIdx];
+  for (let i = 0; i < 3; i++) {
+    rotMat[indices[i]*3 + 0] = axes[i][0];
+    rotMat[indices[i]*3 + 1] = axes[i][1];
+    rotMat[indices[i]*3 + 2] = axes[i][2];
+  }
+
+  return rotMat;
+}
+
+function _argmaxAbs(v) {
+  const a0 = Math.abs(v[0]), a1 = Math.abs(v[1]), a2 = Math.abs(v[2]);
+  if (a0 >= a1 && a0 >= a2) return 0;
+  if (a1 >= a0 && a1 >= a2) return 1;
+  return 2;
+}
+
+/**
+ * Rotate UV slices so adjacent cube faces have consistent texture flow.
+ *
+ * For each cube face, computes the mean UV-derived tangent direction and
+ * compares it against a canonical "expected" tangent derived from world-space
+ * position and normals. Rotates all UVs in that face by the angle between
+ * actual and expected tangents, then renormalizes to [0,1].
+ *
+ * Matches PyTorch's _rotate_uv_slices_consistent_space.
+ */
+function _rotateUVSlicesConsistentSpace(
+  vertices, smoothNormals, faces, rawU, rawV, faceAssignment, numVertices, numFaces
+) {
+  // Step 1: Compute per-vertex tangents from UV gradients (area-weighted)
+  const tangents = new Float32Array(numVertices * 3);
+  const tanCount = new Float32Array(numVertices * 3);
+
+  for (let f = 0; f < numFaces; f++) {
+    const i0 = faces[f * 3], i1 = faces[f * 3 + 1], i2 = faces[f * 3 + 2];
+
+    // Position edges
+    const dp1x = vertices[i1*3] - vertices[i0*3];
+    const dp1y = vertices[i1*3+1] - vertices[i0*3+1];
+    const dp1z = vertices[i1*3+2] - vertices[i0*3+2];
+    const dp2x = vertices[i2*3] - vertices[i0*3];
+    const dp2y = vertices[i2*3+1] - vertices[i0*3+1];
+    const dp2z = vertices[i2*3+2] - vertices[i0*3+2];
+
+    // UV edges
+    const du1 = rawU[f*3+1] - rawU[f*3];
+    const dv1 = rawV[f*3+1] - rawV[f*3];
+    const du2 = rawU[f*3+2] - rawU[f*3];
+    const dv2 = rawV[f*3+2] - rawV[f*3];
+
+    // Tangent numerator: dpos1 * dv2 - dpos2 * dv1
+    const tx = dp1x * dv2 - dp2x * dv1;
+    const ty = dp1y * dv2 - dp2y * dv1;
+    const tz = dp1z * dv2 - dp2z * dv1;
+
+    // Denominator: du1 * dv2 - dv1 * du2
+    const denom = Math.max(du1 * dv2 - dv1 * du2, 1e-6);
+    const ttx = tx / denom, tty = ty / denom, ttz = tz / denom;
+
+    // Accumulate to all 3 vertices
+    for (const idx of [i0, i1, i2]) {
+      tangents[idx*3] += ttx;
+      tangents[idx*3+1] += tty;
+      tangents[idx*3+2] += ttz;
+      tanCount[idx*3] += 1;
+      tanCount[idx*3+1] += 1;
+      tanCount[idx*3+2] += 1;
+    }
+  }
+
+  // Average, normalize, then Gram-Schmidt orthogonalize against normals
+  for (let i = 0; i < numVertices; i++) {
+    const c = tanCount[i*3] || 1;
+    let tx = tangents[i*3] / c, ty = tangents[i*3+1] / c, tz = tangents[i*3+2] / c;
+
+    // Normalize
+    let len = Math.sqrt(tx*tx + ty*ty + tz*tz) || 1;
+    tx /= len; ty /= len; tz /= len;
+
+    // Gram-Schmidt: t = normalize(t - dot(t, n) * n)
+    const nx = smoothNormals[i*3], ny = smoothNormals[i*3+1], nz = smoothNormals[i*3+2];
+    const tdn = tx*nx + ty*ny + tz*nz;
+    tx -= tdn * nx; ty -= tdn * ny; tz -= tdn * nz;
+    len = Math.sqrt(tx*tx + ty*ty + tz*tz) || 1;
+    tangents[i*3] = tx / len;
+    tangents[i*3+1] = ty / len;
+    tangents[i*3+2] = tz / len;
+  }
+
+  // Step 2: Compute expected tangents per vertex
+  // expected = normalize(cross(normal, cross([-y, x, 0], normal)))
+  const expectedTangents = new Float32Array(numVertices * 3);
+  for (let i = 0; i < numVertices; i++) {
+    const nx = smoothNormals[i*3], ny = smoothNormals[i*3+1], nz = smoothNormals[i*3+2];
+    // pos_stack = [-y, x, 0]
+    const px = -vertices[i*3+1], py = vertices[i*3], pz = 0;
+
+    // inner = cross(pos_stack, normal)
+    const ix = py * nz - pz * ny;
+    const iy = pz * nx - px * nz;
+    const iz = px * ny - py * nx;
+
+    // outer = cross(normal, inner)
+    let ex = ny * iz - nz * iy;
+    let ey = nz * ix - nx * iz;
+    let ez = nx * iy - ny * ix;
+
+    // Normalize
+    const len = Math.sqrt(ex*ex + ey*ey + ez*ez) || 1;
+    expectedTangents[i*3] = ex / len;
+    expectedTangents[i*3+1] = ey / len;
+    expectedTangents[i*3+2] = ez / len;
+  }
+
+  // Step 3: Per cube face, compute mean actual and expected tangent (3D),
+  // find 2D rotation angle, rotate UVs
+  for (let slot = 0; slot < 6; slot++) {
+    // Collect mean actual and expected tangents across all faces in this slot
+    // (averaged over all 3 vertices of each face, matching PyTorch's mean(dim=(0,1)))
+    let actSumX = 0, actSumY = 0, actSumZ = 0;
+    let expSumX = 0, expSumY = 0, expSumZ = 0;
+    let count = 0;
+
+    for (let f = 0; f < numFaces; f++) {
+      if (faceAssignment[f] !== slot) continue;
+      for (let vi = 0; vi < 3; vi++) {
+        const idx = faces[f * 3 + vi];
+        actSumX += tangents[idx*3];
+        actSumY += tangents[idx*3+1];
+        actSumZ += tangents[idx*3+2];
+        expSumX += expectedTangents[idx*3];
+        expSumY += expectedTangents[idx*3+1];
+        expSumZ += expectedTangents[idx*3+2];
+        count++;
+      }
+    }
+
+    if (count === 0) continue;
+
+    // Mean tangent vectors (3D)
+    const amx = actSumX / count, amy = actSumY / count, amz = actSumZ / count;
+    const emx = expSumX / count, emy = expSumY / count, emz = expSumZ / count;
+
+    // 2D angle between actual and expected: dot and cross of 3D vectors
+    // PyTorch does dot and cross on the mean 3D tangent vectors directly
+    const dot = amx * emx + amy * emy + amz * emz;
+    const cross = amx * emy - amy * emx;
+    const angle = Math.atan2(cross, dot);
+
+    const cosA = Math.cos(angle), sinA = Math.sin(angle);
+
+    // Rotate all UVs in this slot:
+    // Center to [-1, 1], rotate, then rescale to [0, 1]
+    // First pass: rotate
+    for (let f = 0; f < numFaces; f++) {
+      if (faceAssignment[f] !== slot) continue;
+      for (let vi = 0; vi < 3; vi++) {
+        const idx = f * 3 + vi;
+        const u = rawU[idx] * 2 - 1;
+        const v = rawV[idx] * 2 - 1;
+        rawU[idx] = cosA * u - sinA * v;
+        rawV[idx] = sinA * u + cosA * v;
+      }
+    }
+
+    // Second pass: rescale to [0, 1] using joint min/max across both U and V
+    // (matching PyTorch: uv[mask] = (uv[mask] - uv[mask].min()) / (uv[mask].max() - uv[mask].min()))
+    // This preserves aspect ratio after rotation.
+    let jointMin = Infinity, jointMax = -Infinity;
+    for (let f = 0; f < numFaces; f++) {
+      if (faceAssignment[f] !== slot) continue;
+      for (let vi = 0; vi < 3; vi++) {
+        const idx = f * 3 + vi;
+        if (rawU[idx] < jointMin) jointMin = rawU[idx];
+        if (rawU[idx] > jointMax) jointMax = rawU[idx];
+        if (rawV[idx] < jointMin) jointMin = rawV[idx];
+        if (rawV[idx] > jointMax) jointMax = rawV[idx];
+      }
+    }
+    const jointRange = jointMax - jointMin || 1;
+    for (let f = 0; f < numFaces; f++) {
+      if (faceAssignment[f] !== slot) continue;
+      for (let vi = 0; vi < 3; vi++) {
+        const idx = f * 3 + vi;
+        rawU[idx] = (rawU[idx] - jointMin) / jointRange;
+        rawV[idx] = (rawV[idx] - jointMin) / jointRange;
+      }
+    }
+  }
+}
+
+function _textureToJPEG(texture, resolution, quality = 0.92) {
+  const canvas = document.createElement('canvas');
+  canvas.width = resolution;
+  canvas.height = resolution;
+  const ctx = canvas.getContext('2d');
+  const imgData = ctx.createImageData(resolution, resolution);
+  imgData.data.set(texture);
+  ctx.putImageData(imgData, 0, 0);
+  return new Promise((resolve) => {
+    canvas.toBlob(resolve, 'image/jpeg', quality);
+  });
+}
+
+const RESIDENT_ARTIFACT_CONFIG=Object.freeze({gridPoints:535882,tetrahedra:2971452,
+  gridResolution:160,radius:0.87,threshold:10,textureResolution:1024,batchPoints:4096,
+  gridBytes:6430584,tetBytes:47543232,
+  gridSha256:'16f4ee01a050d1757c19b13a7e1dbd4d0918d08208d961c105ff74cbfc345dac',
+  tetSha256:'606cc8b47f8744a64ff6f1f3c088d9d9113ff80539bd62cb1651f8dc629d1f1e'});
+const hex=bytes=>Array.from(new Uint8Array(bytes),b=>b.toString(16).padStart(2,'0')).join('');
+
+/** Complete canonical consumer of BORROWED live postprocessor planes.
+ * No eager source, sampled grid, material defaults or escaping uncharged arrays.
+ * The final consumer is awaited while every output lease is still owned.
+ * Explicit backing accounting excludes DOM/canvas/JS metadata and driver memory;
+ * a caller's fresh process/host guard remains mandatory, not a capacity claim. */
+async function runResidentArtifact({device,handle,memoryBudget,triplanesBuf,conditionRgba,
+  weightsUrl,expectedWeightBytes,expectedSourceETag,onBeforePhase,onBeforeDuty,
+  onAfterDuty,onGeometry,withResult,withForeground,onProgress}) {
+  if(!isLoaderMemoryBudget(memoryBudget))throw TypeError('authenticated loader budget required');
+  memoryBudget.assertDeviceAcquiredHere(device);
+  if(handle?.device!==device||handle._residentArtifactOwner)throw Error('owned nonquarantined artifact handle required');
+  if(triplanesBuf?.size!==70778880||!(conditionRgba instanceof Uint8Array)||conditionRgba.length!==512*512*4)
+    throw TypeError('complete borrowed postprocessor and actual condition RGBA required');
+  if(typeof onBeforePhase!=='function'||typeof onBeforeDuty!=='function'||typeof withResult!=='function')
+    throw TypeError('fresh allocation/range observers and awaited actual artifact consumer required');
+  const c=RESIDENT_ARTIFACT_CONFIG,leases=[],meshHandle={},spans=[],guardPhases=[];
+  const owner={active:true,disposal:null,leases,meshHandle,decoder:null,clipHandle:{device},refs:{}};
+  handle._residentArtifactOwner=owner;
+  let gridRaw,tets,positions,sdf,mesh,uv,raster,queryPositions,occupied,texture,dilationScratch;
+  const reserve=(bytes,label)=>{const lease=memoryBudget.reserveCpu(bytes,label);leases.push(lease);return lease;};
+  const guard=async(name,bytes,details={})=>{
+    const phase={name,tensors:[],workGpuBytes:0,rangeCpuBytes:bytes,requiredBytes:bytes,...details};
+    await onBeforePhase(phase);guardPhases.push(phase);return reserve(bytes,name);
+  };
+  const timed=async(name,work)=>{onProgress?.(name);const start=performance.now();
+    const result=await work();spans.push({name,start,end:performance.now()});return result;};
+  const cpu=(name,work)=>timed(name,()=>withForegroundScope({withForeground},name,work));
+  const scoped=scope=>async phase=>{const descriptor={...phase,name:scope+'-'+phase.name};
+    await onBeforePhase(descriptor);guardPhases.push(descriptor);};
+  const dutyScoped=scope=>async duty=>{const descriptor={...duty,name:scope+'-'+(duty.name??duty.kind),scope};
+    await onBeforeDuty(descriptor);guardPhases.push(descriptor);};
+  const load=async(name,url,bytes,sha)=>{
+    await onBeforePhase({name,tensors:[],workGpuBytes:0,rangeCpuBytes:2*bytes,
+      requiredBytes:2*bytes,sourceBytes:bytes,sourceSha256:sha});
+    const retained=reserve(bytes,name+'-retained'),transport=reserve(bytes,name+'-transport');
+    try{const response=await fetch(url,{cache:'no-store'});
+      if(!response.ok||Number(response.headers.get('Content-Length'))!==bytes)throw Error('complete canonical asset response required: '+name);
+      const buffer=await response.arrayBuffer();
+      if(buffer.byteLength!==bytes||hex(await crypto.subtle.digest('SHA-256',buffer))!==sha)
+        throw Error('canonical asset content identity mismatch: '+name);
+      owner.refs[name]=buffer;
+      return {buffer,lease:retained};
+    }finally{transport.release();}
+  };
+  let geometry,materials,bake,failed=false,failure;
+  try {
+    const grid=await load('artifact-grid-source','/tets/_grid_vertices.bin',c.gridBytes,c.gridSha256);
+    gridRaw=new Float32Array(grid.buffer);
+    const indices=await load('artifact-tets-source','/tets/indices.bin',c.tetBytes,c.tetSha256);
+    tets=new Int32Array(indices.buffer);
+    const scaledLease=await guard('artifact-grid-scale',c.gridBytes,{gridPoints:c.gridPoints});
+    positions=scaleTensor(gridRaw,[0,1],[-c.radius,c.radius]);gridRaw=null;
+    // The local grid object retains its borrowed buffer until this scope ends;
+    // keep its source lease, rather than claiming GC by retiring it early.
+    await onBeforePhase({name:'artifact-decoder-pipelines',tensors:[],workGpuBytes:0,rangeCpuBytes:0,requiredBytes:0});
+    const decoder=owner.decoder=new TriplaneDecoder(device);decoder.init();
+    const args={device,decoder,memoryBudget,weightsUrl,expectedWeightBytes,expectedSourceETag,
+      triplanesBuf,batchPoints:c.batchPoints,onAfterDuty};
+    geometry=await timed('complete-geometry',()=>runResidentDecoder({...args,positions,heads:['density','vertex_offset'],
+      onBeforeSourceIntake:scoped('geometry-source'),onBeforePhase:scoped('geometry'),onBeforeDuty:dutyScoped('geometry'),
+      async withResult(output){
+        const sdfLease=await guard('artifact-threshold-sdf',4*c.gridPoints,{gridPoints:c.gridPoints,threshold:c.threshold});
+        sdf=new Float32Array(output.density);for(let i=0;i<sdf.length;i++)sdf[i]-=c.threshold;
+        mesh=await cpu('complete-marching',()=>runResidentMarchingTetrahedra({handle:meshHandle,memoryBudget,
+          gridVertices:positions,sdf,tetIndices:tets,vertexOffsets:output.vertex_offset,resolution:c.gridResolution,
+          onBeforePhase}));
+        sdf=null;sdfLease.release();
+        if(!mesh.numVertices||!mesh.numFaces)throw Error('actual full geometry is empty; no blank/default artifact');
+        await onGeometry?.(mesh);
+        return {numVertices:mesh.numVertices,numFaces:mesh.numFaces};
+      }}));
+    positions=null;tets=null;scaledLease.release();
+    // Canonical source buffers remain charged until this function completes.
+    materials=await timed('actual-clip-materials',()=>runResidentMaterials({device,handle:owner.clipHandle,memoryBudget,
+      weightsUrl,expectedWeightBytes,expectedSourceETag,rgba:conditionRgba,
+      onBeforePhase:scoped('materials'),onBeforeDuty:dutyScoped('materials'),onAfterDuty}));
+    const uvBytes=84*mesh.numVertices+141*mesh.numFaces+36;
+    await guard('artifact-uv-complete-typed-backing',uvBytes,{numVertices:mesh.numVertices,numFaces:mesh.numFaces,
+      backingAuthority:'all explicit typed UV allocations; BVH/JS metadata excluded, no physical capacity claim'});
+    uv=await cpu('complete-uv',()=>unwrapResidentUV(mesh.vertices,mesh.faces,mesh.numVertices,mesh.numFaces));
+    // Retain the original mesh through final consumer, not just local UV use.
+    await guard('artifact-full-raster',49*c.textureResolution*c.textureResolution,{textureResolution:c.textureResolution});
+    raster=await cpu('complete-raster',()=>rasterizeUV(uv.uvs,uv.newVertices,uv.newFaces,uv.newNumFaces,c.textureResolution,uv.faceAssignment));
+    let numOccupied=0;for(const bit of raster.mask)if(bit)numOccupied++;
+    if(!numOccupied)throw Error('complete raster has no occupied texels; no empty texture fallback');
+    await guard('artifact-all-occupied-queries',16*numOccupied,{numOccupied,textureResolution:c.textureResolution});
+    occupied=new Uint32Array(numOccupied);queryPositions=new Float32Array(numOccupied*3);
+    let j=0;for(let i=0;i<raster.mask.length;i++)if(raster.mask[i]){occupied[j]=i;
+      queryPositions.set(raster.positions3D.subarray(i*3,i*3+3),j*3);j++;}
+    bake=await timed('complete-texture-queries',()=>runResidentDecoder({...args,positions:queryPositions,
+      heads:['features','perturb_normal'],onBeforeSourceIntake:scoped('bake-source'),
+      onBeforePhase:scoped('bake'),onBeforeDuty:dutyScoped('bake'),
+      async withResult(output){
+        await guard('artifact-complete-textures-and-dilation',16*c.textureResolution*c.textureResolution,
+          {textureResolution:c.textureResolution,numOccupied});
+        dilationScratch=createDilationScratch(c.textureResolution*c.textureResolution);
+        texture=await cpu('complete-texture-materialize',()=>materializeTextures({featuresCPU:output.features,
+          normalsCPU:output.perturb_normal,occupiedIndices:occupied,tbnData:raster.tbnData,
+          mask:raster.mask,resolution:c.textureResolution,numOccupied,dilationScratch}));
+        return {numOccupied,albedoBytes:texture.albedo.byteLength,normalBytes:texture.normalMap.byteLength};
+      }}));
+    const glb=await cpu('actual-glb-export',()=>exportGLB(uv.newVertices,uv.newNormals,uv.newFaces,uv.uvs,
+      texture.albedo,texture.normalMap,uv.newNumVertices,uv.newNumFaces,c.textureResolution,
+      materials.roughness,materials.metallic,{requireNormalTexture:true,
+        onBeforeCpuAllocation:(name,bytes)=>guard(name,bytes)}));
+    owner.refs.glb=glb;
+    const metadata={config:c,numVertices:mesh.numVertices,numFaces:mesh.numFaces,
+      uvNumVertices:uv.newNumVertices,uvNumFaces:uv.newNumFaces,numOccupied,glbBytes:glb.byteLength,
+      geometry,materials,bake,spans,guardPhases,
+      authority:'actual complete canonical consumer; output/foreground/native evidence requires caller witness; identified backing excludes opaque JS/canvas/driver allocations'};
+    await withResult({glb,mesh,uv,texture,metadata});
+    return metadata;
+  } catch(error) {failed=true;failure=error;throw error;
+  } finally {
+    Object.assign(owner.refs,{gridRaw,tets,positions,sdf,mesh,uv,raster,queryPositions,occupied,texture,dilationScratch});
+    owner.active=false;
+    try {await disposeResidentArtifact(handle);}
+    catch(error){throw failed?new AggregateError([failure,error],
+      'artifact failed and reachable owned cleanup unresolved',{cause:failure}):error;}
+  }
+}
+
+/** Retry exact owned cleanup after settlement; never destroy borrowed device or
+ * planes. Failed child cleanup retains the entire artifact owner and charges.
+ * An active invocation cannot be detached during an awaited allocation guard. */
+async function disposeResidentArtifact(handle) {
+  const owner=handle?._residentArtifactOwner;if(!owner)return;
+  if(owner.active)throw Error('cannot dispose an active artifact invocation');
+  if(owner.disposal)return owner.disposal;
+  const operation=(async()=>{
+    const errors=[];
+    if(owner.decoder)try{await disposeResidentDecoder(owner.decoder);}catch(error){errors.push(error);}
+    try{await disposeResidentMaterials(owner.clipHandle);}catch(error){errors.push(error);}
+    if(errors.length)throw new AggregateError(errors,'artifact owned retirement unresolved');
+    disposeResidentMarchingTetrahedra(owner.meshHandle);
+    owner.refs={};for(const lease of owner.leases)lease.release();owner.leases.length=0;
+    handle._residentArtifactOwner=null;
+  })();
+  owner.disposal=operation;
+  try{return await operation;}finally{owner.disposal=null;}
+}
+
+/**
+ * decoder_scratch_arena.js — one capacity-bound reusable scratch arena for the
+ * triplane decoder, held under the kit's phase-resource working-set lease.
+ *
+ * Cranial's reviewed assay (b7809c7) proved the texture-bake residual is
+ * allocation churn: the decoder rebuilds ~30 transient scratch buffers PER range
+ * (~1.015GB cumulative across a route), then a single-threaded CPU
+ * materialization tail. This arena removes the churn: it pre-allocates one buffer
+ * per proven decoder slot, sized for the maximum batch N, and every range reuses
+ * the same physical buffers via TriplaneDecoder's _slotProvider.acquire(slotKey).
+ *
+ * Exact per-range prefix completion (the facade's per-duty queue fence) is
+ * RETAINED — the arena only removes allocation, it does not change scheduling or
+ * fence semantics. A slot reused across ranges is safe because each range's GPU
+ * work completes (prefix fence) before the next range's dispatch overwrites it.
+ *
+ * The slot graph is the proven output of tools/prove_decoder_slot_graph.mjs:
+ * 30 slots for heads [features, perturb_normal], each size = perTexelBytes * N
+ * (all bases 0 except the 4-byte SiLU :dummy workspace). Capacity at maxBatch:
+ * ~16.9MB @ 4096, ~67.4MB @ 16384 — replacing ~1.015GB churn.
+ */
+
+
+/**
+ * Proven decoder scratch slot graph (bake heads [features, perturb_normal]).
+ * Each entry: { slotKey, perTexelBytes, baseBytes }. Source of truth:
+ * tools/prove_decoder_slot_graph.mjs against the composed head.
+ */
+const DECODER_BAKE_SLOT_GRAPH = Object.freeze([
+  { slotKey: 'scaledPos', perTexelBytes: 12, baseBytes: 0 },
+  { slotKey: 'grid:XY', perTexelBytes: 8, baseBytes: 0 },
+  { slotKey: 'grid:XZ', perTexelBytes: 8, baseBytes: 0 },
+  { slotKey: 'grid:YZ', perTexelBytes: 8, baseBytes: 0 },
+  { slotKey: 'sampled:XY', perTexelBytes: 160, baseBytes: 0 },
+  { slotKey: 'sampled:XZ', perTexelBytes: 160, baseBytes: 0 },
+  { slotKey: 'sampled:YZ', perTexelBytes: 160, baseBytes: 0 },
+  { slotKey: 'concatFeatures', perTexelBytes: 480, baseBytes: 0 },
+  { slotKey: 'head:features:lin:0', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:features:silu:0:dummy', perTexelBytes: 0, baseBytes: 4 },
+  { slotKey: 'head:features:silu:0', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:features:lin:1', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:features:silu:1:dummy', perTexelBytes: 0, baseBytes: 4 },
+  { slotKey: 'head:features:silu:1', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:features:lin:2', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:features:silu:2:dummy', perTexelBytes: 0, baseBytes: 4 },
+  { slotKey: 'head:features:silu:2', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:features:rawOut', perTexelBytes: 12, baseBytes: 0 },
+  { slotKey: 'head:features:sigmoid', perTexelBytes: 12, baseBytes: 0 },
+  { slotKey: 'head:perturb_normal:lin:0', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:perturb_normal:silu:0:dummy', perTexelBytes: 0, baseBytes: 4 },
+  { slotKey: 'head:perturb_normal:silu:0', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:perturb_normal:lin:1', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:perturb_normal:silu:1:dummy', perTexelBytes: 0, baseBytes: 4 },
+  { slotKey: 'head:perturb_normal:silu:1', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:perturb_normal:lin:2', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:perturb_normal:silu:2:dummy', perTexelBytes: 0, baseBytes: 4 },
+  { slotKey: 'head:perturb_normal:silu:2', perTexelBytes: 256, baseBytes: 0 },
+  { slotKey: 'head:perturb_normal:rawOut', perTexelBytes: 12, baseBytes: 0 },
+  { slotKey: 'head:perturb_normal:normalize3', perTexelBytes: 12, baseBytes: 0 },
+]);
+
+const align4 = (n) => Math.ceil(n / 4) * 4;
+const slotCapacityBytes = (slot, maxBatch) => align4(slot.baseBytes + slot.perTexelBytes * maxBatch);
+
+/**
+ * Compute the total arena byte capacity for a given max batch and slot graph.
+ */
+function decoderArenaCapacityBytes(maxBatch, slotGraph = DECODER_BAKE_SLOT_GRAPH) {
+  return slotGraph.reduce((sum, s) => sum + slotCapacityBytes(s, maxBatch), 0);
+}
+
+/**
+ * Create the decoder scratch arena.
+ *
+ * @param {GPUDevice} device
+ * @param {object} o
+ * @param {number} o.maxBatch   maximum texels any range will decode
+ * @param {Array}  [o.slotGraph=DECODER_BAKE_SLOT_GRAPH]
+ * @returns a provider with acquire(slotKey, size), plus telemetry + destroy.
+ */
+function createDecoderScratchArena(device, { maxBatch, slotGraph = DECODER_BAKE_SLOT_GRAPH }) {
+  if (!Number.isSafeInteger(maxBatch) || maxBatch <= 0) {
+    throw new TypeError('maxBatch must be a positive safe integer');
+  }
+  const slots = new Map();
+  let totalBytes = 0;
+  for (const slot of slotGraph) {
+    const capacity = slotCapacityBytes(slot, maxBatch);
+    const buffer = createEmptyBuffer(device, capacity, 0, `arena:${slot.slotKey}`);
+    slots.set(slot.slotKey, { buffer, capacity, perTexelBytes: slot.perTexelBytes, baseBytes: slot.baseBytes });
+    totalBytes += capacity;
+  }
+  let destroyed = false;
+  let acquireCount = 0;
+
+  return {
+    slotCount: slots.size,
+    totalBytes,
+    maxBatch,
+
+    /**
+     * TriplaneDecoder._slotProvider.acquire(slotKey, size) — return the
+     * pre-allocated slot buffer. Fail loud on an unknown slot or an overflow
+     * (size exceeding the slot's max-batch capacity), never silently truncate.
+     */
+    acquire(slotKey, size) {
+      if (destroyed) throw new Error('decoder scratch arena is destroyed');
+      const slot = slots.get(slotKey);
+      if (!slot) throw new Error(`decoder arena has no slot "${slotKey}" (slot graph mismatch)`);
+      if (size > slot.capacity) {
+        throw new Error(`decoder arena slot "${slotKey}" overflow: need ${size} > capacity ${slot.capacity} (maxBatch ${maxBatch})`);
+      }
+      acquireCount++;
+      return slot.buffer;
+    },
+
+    snapshot() {
+      return {
+        slotCount: slots.size,
+        totalBytes,
+        maxBatch,
+        acquireCount,
+        destroyed,
+      };
+    },
+
+    destroy() {
+      if (destroyed) return { retired: 0 };
+      let retired = 0;
+      for (const slot of slots.values()) {
+        try { slot.buffer.destroy(); retired++; } catch { /* best-effort */ }
+      }
+      slots.clear();
+      destroyed = true;
+      return { retired };
+    },
+  };
+}
+
+/**
+ * Cooperative texture-bake boundary — second SF3D cooperative uptake of the
+ * Kaminos cooperative porting spine.
+ *
+ * Profiling (foreground-tail-stage-attribution_2026-07-24) showed the texture
+ * bake's single monolithic triplane-decode dispatch + readback owns a ~231ms
+ * contiguous foreground gap — the largest GPU gap in the pipeline. Per-texel
+ * decode is fully independent, so we split the occupied texels into fixed
+ * batches and decode each as its own GPU command duty through the cooperative
+ * facade (submit + queue-prefix fence + browser yield between batches),
+ * collapsing the one big gap into yieldable pieces while preserving byte-
+ * identical texture output.
+ *
+ * Reuses the exact command-duty pattern proven at the DINO boundary: the
+ * adapter-owned thin runtime (createSf3dCooperativeRuntime) and the boundary/
+ * duty facade. This is the GPU cooperative mechanism, not a CPU worker offload.
+ */
+
+
+const TEXTURE_BAKE_MANIFEST_ID = 'sf3d.texture-bake-cooperative-boundaries.v0';
+const TEXTURE_BAKE_BOUNDARY_ID = 'texture-bake-texel-batches';
+const DECODER_ARENA_RESOURCE_ID = 'sf3d.decoder-scratch-arena';
+
+/**
+ * Run `fn(arena)` with a decoder scratch arena held under the kit's phase-
+ * resource working-set lease (Cranial's constraint: one managed resource, no
+ * competing manager). The working set acquires the arena when transitioning into
+ * the texture-bake phase and retires it on close — giving the arena lawful
+ * lease-owned lifetime, cancellation, and terminal retirement.
+ *
+ * @param {GPUDevice} device
+ * @param {object} o { maxBatch, signal }
+ * @param {(arena, workingSetSnapshot)=>Promise<any>} fn
+ */
+async function withDecoderArenaLease(device, { maxBatch, signal }, fn) {
+  const declaredBytes = decoderArenaCapacityBytes(maxBatch);
+  let arena = null;
+  const workingSet = createWebGpuPhaseResourceWorkingSet({
+    controllerId: 'sf3d.texture-bake.decoder-arena',
+    plan: {
+      planId: 'sf3d.texture-bake.decoder-arena.v0',
+      resources: [{ resourceId: DECODER_ARENA_RESOURCE_ID, declaredBytes }],
+      phases: [{ phaseId: 'texture-bake', requiredResourceIds: [DECODER_ARENA_RESOURCE_ID] }],
+    },
+    acquireResource: ({ resource }) => {
+      arena = createDecoderScratchArena(device, { maxBatch });
+      return {
+        resourceId: resource.resourceId,
+        value: arena,
+        release: () => {
+          const r = arena.destroy();
+          return r.retired >= 0 ? 'released' : 'released';
+        },
+      };
+    },
+    residencySnapshot: () => (arena ? arena.snapshot() : { slotCount: 0, totalBytes: 0 }),
+  });
+  try {
+    await workingSet.transitionToPhase('texture-bake', { signal });
+    return await fn(arena, workingSet.snapshot());
+  } finally {
+    workingSet.close();
+  }
+}
+
+/**
+ * Declare the texture-bake cooperative boundary manifest: one gpu-command
+ * boundary over the occupied texels, fixed chunking by batchTexels.
+ */
+function defineTextureBakeManifest(numOccupied, batchTexels) {
+  if (!Number.isSafeInteger(numOccupied) || numOccupied <= 0) {
+    throw new TypeError('numOccupied must be a positive safe integer');
+  }
+  if (!Number.isSafeInteger(batchTexels) || batchTexels <= 0) {
+    throw new TypeError('batchTexels must be a positive safe integer');
+  }
+  return defineWebGpuCooperativeBoundaryManifest({
+    manifestId: TEXTURE_BAKE_MANIFEST_ID,
+    routeId: SF3D_ROUTE_ID,
+    phases: [
+      {
+        phaseId: 'texture-bake',
+        boundaries: [
+          {
+            boundaryId: TEXTURE_BAKE_BOUNDARY_ID,
+            kind: 'gpu-command',
+            unit: 'texel-batch',
+            totalItems: numOccupied,
+            progressWeight: numOccupied,
+            commandDutyKind: 'compute',
+            chunking: { mode: 'fixed', chunkItems: batchTexels },
+            yieldPolicy: 'after-duty',
+            resources: {
+              retain: ['triplane.features', 'decoder.weights'],
+              produce: ['texture.albedo', 'texture.normal'],
+              release: [],
+            },
+          },
+        ],
+      },
+    ],
+    metadata: { source: 'sf3d-webgpu-cooperative-texture-bake' },
+  });
+}
+
+/**
+ * Build the `cooperativeBatch` callback that bakeTexture/decodeTexelFeatures
+ * consumes. It runs a real cooperative execution over the texel boundary and,
+ * for each batch, encodes+submits the decode duty (facade fences the queue
+ * prefix) and then reads back that batch's outputs.
+ *
+ * @param {GPUDevice} device
+ * @param {object} opts { batchTexels, schedulingMode, onProgress, signal, invocationId }
+ * @returns {(numOccupied:number, makeBatch:(start,end)=>Promise<{encode,submit,readback}>)=>Promise<object>}
+ *   The returned function resolves to the cooperative execution report.
+ */
+function makeCooperativeTextureBake(device, opts = {}) {
+  const {
+    batchTexels = 16384,
+    schedulingMode = 'cooperative',
+    onProgress,
+    signal,
+    invocationId = `sf3d:texture-bake:${schedulingMode}`,
+    onBrowserYield,
+  } = opts;
+
+  return async function cooperativeBatch(numOccupied, makeBatch) {
+    const now = () => globalThis.performance?.now?.() ?? Date.now();
+    const batch = Math.min(batchTexels, numOccupied);
+    const manifest = defineTextureBakeManifest(numOccupied, batch);
+    const ranges = [];
+    const queueFences = [];
+    const cleanupEvents = [];
+    const scratch = {
+      allocatedCount: 0,
+      allocatedBytes: 0,
+      retiredCount: 0,
+      retiredBytes: 0,
+      activeCount: 0,
+      activeBytes: 0,
+    };
+    let activeRange = null;
+    const unsubmittedScratch = [];
+    const submittedScratch = [];
+
+    const retireScratch = (resources, reason) => {
+      const startedAtMs = now();
+      let retiredBytes = 0;
+      let retiredCount = 0;
+      while (resources.length > 0) {
+        const resource = resources[0];
+        if (!resource || typeof resource.buffer?.destroy !== 'function') {
+          throw new TypeError('scratch resource must expose buffer.destroy()');
+        }
+        resource.buffer.destroy();
+        resources.shift();
+        retiredBytes += resource.size;
+        retiredCount += 1;
+        scratch.retiredCount += 1;
+        scratch.retiredBytes += resource.size;
+        scratch.activeCount -= 1;
+        scratch.activeBytes -= resource.size;
+      }
+      const completedAtMs = now();
+      cleanupEvents.push({
+        reason,
+        retiredCount,
+        retiredBytes,
+        interval: { startMs: startedAtMs, endMs: completedAtMs },
+      });
+      return {
+        retiredCount,
+        retiredBytes,
+        interval: { startMs: startedAtMs, endMs: completedAtMs },
+      };
+    };
+
+    const runtime = createSf3dCooperativeRuntime(device, {
+      foregroundOpportunities: opts.foregroundOpportunities ?? null,
+      async onQueueFenceResolved(fence) {
+        const retirement = retireScratch(submittedScratch, 'queue-prefix-resolved');
+        queueFences.push({
+          rangeIndex: activeRange?.rangeIndex ?? null,
+          itemStart: activeRange?.itemStart ?? null,
+          itemEnd: activeRange?.itemEnd ?? null,
+          queueWaitMs: fence.queueWaitMs,
+          queueInterval: {
+            startMs: fence.startedAtMs,
+            endMs: fence.completedAtMs,
+          },
+          retirementMs: retirement.interval.endMs - retirement.interval.startMs,
+          retirementInterval: retirement.interval,
+          retiredCount: retirement.retiredCount,
+          retiredBytes: retirement.retiredBytes,
+        });
+      },
+      async onBrowserYield(yieldEvent) {
+        if (activeRange) {
+          activeRange.browserYieldMs += yieldEvent.elapsedMs;
+          activeRange.browserYieldIntervals.push({
+            startMs: yieldEvent.startedAtMs,
+            endMs: yieldEvent.completedAtMs,
+          });
+        }
+        if (typeof onBrowserYield === 'function') await onBrowserYield(yieldEvent);
+      },
+    });
+    const execution = createWebGpuCooperativeExecution({
+      runtime, manifest, invocationId, schedulingMode, onProgress, signal,
+    });
+
+    try {
+      await execution.run(async (cooperative) => {
+        const gpu = cooperative.startBoundary(TEXTURE_BAKE_BOUNDARY_ID);
+        let range;
+        while ((range = gpu.nextRange()) != null) {
+          const start = range.itemStart, end = range.itemEnd;
+          const prepareEncodeStartedAtMs = now();
+          const b = await makeBatch(start, end);
+          const resources = Array.isArray(b.scratchResources) ? b.scratchResources : [];
+          for (const resource of resources) {
+            if (!Number.isFinite(resource?.size) || resource.size < 0) {
+              throw new TypeError('scratch resource size must be a non-negative finite number');
+            }
+          }
+          const allocatedBytes = resources.reduce((sum, resource) => sum + resource.size, 0);
+          unsubmittedScratch.push(...resources);
+          scratch.allocatedCount += resources.length;
+          scratch.allocatedBytes += allocatedBytes;
+          scratch.activeCount += resources.length;
+          scratch.activeBytes += allocatedBytes;
+
+          const rangeTelemetry = {
+            rangeIndex: range.rangeIndex,
+            itemStart: start,
+            itemEnd: end,
+            itemCount: range.itemCount,
+            modelEncodeMs: Number.isFinite(b.hostEncodeMs) ? b.hostEncodeMs : null,
+            hostEncodeMs: 0,
+            dutyLifecycleMs: 0,
+            dutyWallMs: 0,
+            browserYieldMs: 0,
+            prepareEncodeInterval: {
+              startMs: prepareEncodeStartedAtMs,
+              endMs: prepareEncodeStartedAtMs,
+            },
+            submitInterval: null,
+            dutyLifecycleInterval: {
+              startMs: 0,
+              endMs: 0,
+            },
+            browserYieldIntervals: [],
+            scratchAllocatedCount: resources.length,
+            scratchAllocatedBytes: allocatedBytes,
+          };
+          activeRange = rangeTelemetry;
+          const dutyStartedAtMs = now();
+          rangeTelemetry.dutyLifecycleInterval.startMs = dutyStartedAtMs;
+          try {
+            // kit >=0.1.41: encode returns the command buffer; the kit submits it
+            // (submit callbacks unsupported). The scratch-lifetime bookkeeping
+            // that previously lived in the submit callback (marking this range's
+            // scratch as submitted so the per-prefix retire can destroy it once
+            // the queue prefix fences) moves into encode, right after the command
+            // buffer is built — at which point the kit is about to submit it, so
+            // the scratch is committed to queued work before onQueueFenceResolved.
+            await gpu.runGpuDuty(range, {
+              encode: () => {
+                const submitStartedAtMs = now();
+                try {
+                  const commandBuffer = b.encode();
+                  submittedScratch.push(...unsubmittedScratch);
+                  unsubmittedScratch.length = 0;
+                  return commandBuffer;
+                } finally {
+                  rangeTelemetry.prepareEncodeInterval.endMs = now();
+                  rangeTelemetry.hostEncodeMs = (
+                    rangeTelemetry.prepareEncodeInterval.endMs
+                    - rangeTelemetry.prepareEncodeInterval.startMs
+                  );
+                  rangeTelemetry.submitInterval = {
+                    startMs: submitStartedAtMs,
+                    endMs: now(),
+                  };
+                }
+              },
+            });
+          } finally {
+            rangeTelemetry.dutyLifecycleInterval.endMs = now();
+            rangeTelemetry.dutyLifecycleMs = (
+              rangeTelemetry.dutyLifecycleInterval.endMs
+              - rangeTelemetry.dutyLifecycleInterval.startMs
+            );
+            rangeTelemetry.dutyWallMs = rangeTelemetry.dutyLifecycleMs;
+            ranges.push(rangeTelemetry);
+            activeRange = null;
+          }
+          // No per-batch readback: each batch copies its decode into a shared GPU
+          // buffer and the whole texture is read back once after the boundary.
+        }
+      });
+    } catch (error) {
+      const cleanup = {
+        unsubmitted: null,
+        recoveryFence: null,
+        submitted: null,
+      };
+      try {
+        if (unsubmittedScratch.length > 0) {
+          cleanup.unsubmitted = retireScratch(unsubmittedScratch, 'failure-before-submit');
+        }
+        if (submittedScratch.length > 0) {
+          const startedAtMs = now();
+          let fenceError = null;
+          try {
+            await device.queue.onSubmittedWorkDone();
+          } catch (recoveryError) {
+            fenceError = recoveryError;
+          }
+          cleanup.recoveryFence = {
+            startMs: startedAtMs,
+            endMs: now(),
+            status: fenceError ? 'rejected-device-unavailable' : 'resolved',
+            error: fenceError?.message ?? null,
+          };
+          cleanup.submitted = retireScratch(
+            submittedScratch,
+            fenceError ? 'device-unavailable-after-recovery-fence' : 'terminal-recovery-fence',
+          );
+        }
+      } catch (cleanupError) {
+        cleanup.error = cleanupError.message;
+      }
+      error.textureBakeCleanup = Object.freeze(cleanup);
+      throw error;
+    }
+
+    if (
+      unsubmittedScratch.length !== 0
+      || submittedScratch.length !== 0
+      || scratch.activeCount !== 0
+      || scratch.activeBytes !== 0
+    ) {
+      throw new Error('texture-bake scratch resources remained active after queue completion');
+    }
+    return Object.freeze({
+      ...execution.finish(),
+      textureBakeTelemetry: Object.freeze({
+        schema: 'sf3d.texture-bake-duty-telemetry.v1',
+        ranges: Object.freeze(ranges.map(range => Object.freeze({ ...range }))),
+        queueFences: Object.freeze(queueFences.map(fence => Object.freeze({ ...fence }))),
+        cleanupEvents: Object.freeze(cleanupEvents.map(event => Object.freeze({ ...event }))),
+        scratch: Object.freeze({ ...scratch }),
+      }),
+    });
+  };
+}
+
+/**
+ * full_pipeline.js — single-image → textured GLB, the complete
+ * sf3d.image-to-mesh.webgpu-local.v0 route as one callable.
+ *
+ * This is the exact step 1–6 sequence main.js runs (inference → CLIP materials →
+ * UV unwrap → rasterize → texture bake → GLB export), extracted so the
+ * acceptance capsule exercises the SAME route the app does, for both the control
+ * (kit 0.1.36) and candidate (kit 0.1.38) arms, without duplicating the sequence
+ * inside a browser-eval string.
+ *
+ * `options` is forwarded to runInference (e.g. { cooperativeDino,
+ * dinoSchedulingMode, dinoChunkBlocks, cooperativePostProcessor,
+ * postProcessorSchedulingMode, postProcessorDutyGranularity,
+ * postProcessorChannelsPerDuty,
+ * captureDinoPayload }), so a capsule can select cooperative execution per arm
+ * while the rest of the route stays identical.
+ */
+
+
+const COND_SIZE = 512;
+const TEX_RESOLUTION$1 = 1024;
+
+/**
+ * Run UV unwrap on the main thread, or on a Web Worker when one is supplied.
+ * Byte-identical output either way (same unwrapUV code). Vertices/faces are
+ * transferred zero-copy to the worker; outputs transferred back.
+ */
+async function runUvUnwrap(vertices, faces, numVertices, numFaces, worker, workerTimeoutMs) {
+  if (!worker) return unwrapUV(vertices, faces, numVertices, numFaces);
+  // Transfer sliced copies (one copy) so the caller's arrays stay intact while
+  // the worker gets zero-copy ownership.
+  const vBuf = vertices.slice().buffer, fBuf = faces.slice().buffer;
+  const id = `uv-${Math.random().toString(36).slice(2)}`;
+  // Fail-loud lifecycle (crash / malformed / wedge) via callWorker.
+  return await callWorker(
+    worker,
+    { vertices: vBuf, faces: fBuf, numVertices, numFaces, id },
+    [vBuf, fBuf],
+    {
+      timeoutMs: workerTimeoutMs || 30000,
+      // Every array at its declared length, finite floats, in-range face
+      // indices and chart ids (worker_reply_validation.js); malformed replies
+      // throw here rather than reach rasterization / the texture baker.
+      onResult: (d) => validateUvUnwrapReply(d),
+    },
+  );
+}
+
+async function runFullPipelineToGlb(device, pipelines, weights, inputImage, options = {}, onProgress) {
+  const report = (msg) => { if (onProgress) onProgress(msg); };
+  const t0 = performance.now();
+
+  // Absolute-timestamp stage spans on the same performance.now() clock as any
+  // caller-side rAF probe, so each foreground frame gap can be attributed to the
+  // stage executing during it. Inference substages (dinov2/two-stream/triplane/
+  // marching) come back from runInference; the outer steps are marked here.
+  const spans = [];
+  const mark = (name, start, end) => spans.push({ name, start, end });
+  const timed = async (name, fn) => { const s = performance.now(); const r = await fn(); mark(name, s, performance.now()); return r; };
+
+  // Step 1: inference → untextured mesh + triplane data (+ optional DINO payload)
+  const meshResult = await runInference(
+    device, pipelines, weights, inputImage, report,
+    { ...options, recordStageSpans: spans });
+
+  // Step 2: CLIP material estimation (exact PyTorch preprocessing order)
+  const clipStart = performance.now();
+  const clipRaw = meshResult._conditionRgba;
+  // Blend / resize / patch-embed run in clip_prep_core — on the main thread, or
+  // on options.clipPrepWorker with byte-identical output.
+  const { roughness, metallic } = await estimateMaterials(
+    device, clipRaw, COND_SIZE, COND_SIZE, weights,
+    { clipPrepWorker: options.clipPrepWorker, workerTimeoutMs: options.workerTimeoutMs, withForeground: options.withForeground });
+  mark('clip-material-estimate', clipStart, performance.now());
+
+  // Step 3: UV unwrap (CPU). Optionally offloaded to a Web Worker
+  // (options.uvUnwrapWorker) — the second-largest CPU foreground gap (~216ms);
+  // byte-identical output (same unwrapUV code).
+  const uvResult = await timed('uv-unwrap', () => withForegroundScope(options,
+    options.uvUnwrapWorker ? 'uv-unwrap-worker' : 'uv-unwrap',
+    () => runUvUnwrap(
+      meshResult.vertices, meshResult.faces, meshResult.numVertices, meshResult.numFaces,
+      options.uvUnwrapWorker, options.workerTimeoutMs)));
+
+  // Step 4: rasterize UV → per-texel 3D positions (CPU, synchronous)
+  const rasterResult = await timed('uv-rasterize', () => withForegroundScope(options, 'uv-rasterize', () => rasterizeUV(
+    uvResult.uvs, uvResult.newVertices, uvResult.newFaces,
+    uvResult.newNumFaces, TEX_RESOLUTION$1, uvResult.faceAssignment)));
+
+  // Step 5: texture bake (GPU triplane query). Optionally cooperative — batch
+  // the per-texel decode into yieldable GPU duties (options.cooperativeBake).
+  let bakeReport = null;
+  const bakeOptions = {};
+  if (options.cooperativeBake) {
+    const bakeTelemetry = {};
+    const cooperativeBatch = makeCooperativeTextureBake(device, {
+      foregroundOpportunities: options.foregroundOpportunities ?? null,
+      batchTexels: options.bakeBatchTexels || 16384,
+      schedulingMode: options.bakeSchedulingMode === 'disabled' ? 'disabled' : 'cooperative',
+      onProgress: (p) => { if (p.percent != null) report(`Texture bake ${p.completedItems}/${p.totalItems} (${p.percent.toFixed(0)}%)`); },
+    });
+    bakeOptions.cooperativeBatch = async (numOccupied, makeBatch) => { bakeReport = await cooperativeBatch(numOccupied, makeBatch); };
+    bakeOptions.telemetry = bakeTelemetry;
+    bakeOptions.finalizeTelemetry = () => bakeTelemetry;
+  }
+  // Optional worker materialization of albedo/normal/dilation (~752ms CPU tail).
+  if (options.materializeWorker) {
+    bakeOptions.materializeWorker = options.materializeWorker;
+    bakeOptions.workerTimeoutMs = options.workerTimeoutMs;
+  }
+  bakeOptions.withForeground = options.withForeground;
+  // Optional decoder scratch arena (options.decoderArena): removes ~1.015GB
+  // per-route decode allocation churn by reusing one buffer per slot across
+  // ranges, held under the phase-resource working-set lease. maxBatch is the
+  // cooperative batch size (the largest N any range decodes).
+  const runBake = () => bakeTexture(
+    device, meshResult._triplaneDecoder, meshResult._triplanesBuf,
+    meshResult._decoderWeights, rasterResult.positions3D, rasterResult.mask,
+    rasterResult.tbnData, TEX_RESOLUTION$1, bakeOptions);
+  let arenaSnapshot = null;
+  const bakeResult = await timed('texture-bake', async () => {
+    if (options.decoderArena && options.cooperativeBake) {
+      const maxBatch = options.bakeBatchTexels || 16384;
+      return await withDecoderArenaLease(device, { maxBatch }, async (arena, snap) => {
+        bakeOptions.arena = arena;
+        arenaSnapshot = snap;
+        const r = await runBake();
+        arenaSnapshot = arena.snapshot();
+        return r;
+      });
+    }
+    return runBake();
+  });
+  if (bakeReport && bakeOptions.finalizeTelemetry) {
+    bakeReport = Object.freeze({
+      ...bakeReport,
+      textureBakeTelemetry: Object.freeze({
+        ...bakeReport.textureBakeTelemetry,
+        phases: Object.freeze({ ...bakeOptions.finalizeTelemetry() }),
+      }),
+    });
+  }
+
+  // Step 6: GLB export
+  const glb = await timed('glb-export', () => withForegroundScope(options, 'glb-export', () => exportGLB(
+    uvResult.newVertices, uvResult.newNormals, uvResult.newFaces, uvResult.uvs,
+    bakeResult.albedo, bakeResult.normalMap,
+    uvResult.newNumVertices, uvResult.newNumFaces, TEX_RESOLUTION$1,
+    roughness, metallic)));
+
+  // Which CPU phases ran off the main thread. Every worker dispatcher is
+  // fail-loud (callWorker never falls back silently), so a requested worker is
+  // an effective worker or a thrown error — this is an effective-route record.
+  const offloads = Object.freeze({
+    preprocess: options.preprocessWorker ? 'worker' : 'main',
+    clipPrep: options.clipPrepWorker ? 'worker' : 'main',
+    marchingTet: options.marchingTetWorker ? 'worker' : 'main',
+    uvUnwrap: options.uvUnwrapWorker ? 'worker' : 'main',
+    materialize: options.materializeWorker ? 'worker' : 'main',
+  });
+
+  return {
+    stageSpans: spans,
+    glb,                                   // ArrayBuffer
+    numVertices: meshResult.numVertices,
+    numFaces: meshResult.numFaces,
+    vertices: meshResult.vertices,         // Float32Array [numVertices*3]
+    faces: meshResult.faces,               // Uint32Array [numFaces*3]
+    offloads,
+    uvNumVertices: uvResult.newNumVertices,
+    uvNumFaces: uvResult.newNumFaces,
+    roughness,
+    metallic,
+    cooperativeReports: { ...(meshResult._cooperativeReports || {}), ...(bakeReport ? { 'texture-bake': bakeReport } : {}) },
+    arenaSnapshot,
+    dinoPayload: meshResult._dinoPayload || null,   // { shape, length, tokens } or null
+    sdf: meshResult._sdf,
+    isosurfaceThreshold: meshResult._isosurfaceThreshold,
+    stageTimings: meshResult._stageTimings || {},
+    totalMs: performance.now() - t0,
+  };
+}
+
+/**
+ * product_route.js — the product default composition of the SF3D route.
+ *
+ * Every foreground-liveness mechanism the port has proven in isolation
+ * (cooperative DINO / two-stream / post-processor GPU duties, decoder scratch
+ * arena, and CPU worker offload for preprocess, CLIP prep, marching tet,
+ * UV unwrap, and texture materialization) lived behind options in
+ * full_pipeline.js and was only ever switched on by harness arms. This module
+ * is the single place where the product path turns them all on with the
+ * settings those harnesses measured, so main.js and the witness harnesses run
+ * the same route.
+ *
+ * The defaults are frozen data so a contract test can pin them; the worker
+ * factory is separate because Workers are browser objects that a Node contract
+ * test cannot construct.
+ */
+
+// Settings measured green in the A/B harnesses:
+//   DINO: 24 fixed one-block duties (capsule + conformance).
+//   two-stream: attention-tile duties, 256 linear rows per duty — the Pareto
+//     profile from the clean paired assay (2,922 duties, zero local gaps over
+//     16.7ms, 1.7x wall); 128 rows (4,218 duties) was rejected as too slow.
+//   post-processor: channel-range duties, 16 channels per duty, bounded-prefix
+//     depth 2 (702 duties; validator-backed acceptance).
+//   texture bake: 4096-texel cooperative batches + decoder scratch arena +
+//     worker materialization (five-arm paired product comparison).
+const PRODUCT_ROUTE_DEFAULTS = Object.freeze({
+  cooperativeDino: true,
+  dinoSchedulingMode: 'cooperative',
+  dinoChunkBlocks: 1,
+
+  cooperativeTwoStream: true,
+  twoStreamSchedulingMode: 'cooperative',
+  twoStreamDutyGranularity: 'attention-tile',
+  twoStreamLinearRowsPerDuty: 256,
+
+  cooperativePostProcessor: true,
+  postProcessorSchedulingMode: 'cooperative',
+  postProcessorDutyGranularity: 'channel-range',
+  postProcessorChannelsPerDuty: 16,
+  postProcessorCompletionPolicy: 'bounded-prefix',
+  postProcessorMaxInFlightGpuDuties: 2,
+
+  cooperativeBake: true,
+  bakeSchedulingMode: 'cooperative',
+  bakeBatchTexels: 4096,
+  decoderArena: true,
+
+  workerTimeoutMs: 120000,
+});
+
+/** Worker roles the product route offloads, keyed by the option name each one fills. */
+const PRODUCT_ROUTE_WORKER_ROLES = Object.freeze({
+  preprocessWorker: './preprocess_worker.js',
+  clipPrepWorker: './clip_prep_worker.js',
+  marchingTetWorker: './marching_tet_worker.js',
+  uvUnwrapWorker: './uv_unwrap_worker.js',
+  materializeWorker: './materialize_worker.js',
+});
+
+/**
+ * Create one module Worker per role. Browser-only (needs `Worker`). Workers are
+ * long-lived so weights / tet-grid state can stay resident across runs.
+ *
+ * Each `new Worker(new URL('./x.js', import.meta.url), { type: 'module' })` is
+ * written out literally: Vite discovers and bundles worker modules by static
+ * analysis of exactly that shape, so a table-driven loop would work in dev and
+ * silently break the production build.
+ */
+/**
+ * Resolved module URLs of the five workers, explicit for a host that mounts
+ * the producer (Wake answer 4: worker module URLs must be visible and must
+ * survive the built artifact). Literal `new URL('./x', import.meta.url)`
+ * expressions so every bundler emits the chunks.
+ */
+function productRouteWorkerModuleUrls() {
+  return Object.freeze({
+    preprocessWorker: new URL("data:text/javascript;base64,LyoqDQogKiBwcmVwcm9jZXNzX3dvcmtlci5qcyDigJQgV2ViIFdvcmtlciB0aGF0IHJ1bnMgdGhlIGV4cGVuc2l2ZSBpbWFnZS1wcmVwcm9jZXNzDQogKiBtYXRoIChmb3JlZ3JvdW5kIGZyYW1pbmcsIGJpY3ViaWMgcmVzaXplLCBibGVuZCBhbmQgbm9ybWFsaXplKSBvZmYgdGhlIG1haW4gdGhyZWFkLg0KICoNCiAqIFJlY2VpdmVzIHJhdyBmbG9hdDMyIFJHQkEgc291cmNlIHBpeGVscyAodHJhbnNmZXJyZWQsIHplcm8tY29weSkgKyBwYXJhbXMsDQogKiByZXR1cm5zIHRoZSBDSFcgdGVuc29yIGFuZCBzaGFyZWQgZnJhbWVkIFJHQkEgcGl4ZWxzICh0cmFuc2ZlcnJlZCBiYWNrKS4gVGhlIG1haW4gdGhyZWFkIHN0YXlzDQogKiByZXNwb25zaXZlIGR1cmluZyB0aGUgfjcwMG1zIHRoYXQgdGhpcyB3b3JrIHdvdWxkIG90aGVyd2lzZSBibG9jayBpdC4NCiAqDQogKiBVc2VzIHRoZSBzYW1lIGNvbmRpdGlvbl9pbWFnZSBtYXRoIGFzIHRoZSBtYWluLXRocmVhZCBwYXRoLCBzbyBvdXRwdXQgaXMNCiAqIGJ5dGUtaWRlbnRpY2FsLg0KICovDQppbXBvcnQgeyBwcmVwYXJlQ29uZGl0aW9uSW1hZ2UgfSBmcm9tICcuL2NvbmRpdGlvbl9pbWFnZS5qcyc7DQoNCnNlbGYub25tZXNzYWdlID0gKGUpID0+IHsNCiAgY29uc3QgeyBzcmNCdWZmZXIsIHNyY1csIHNyY0gsIHNpemUsIGJnLCBpbWFnZU1lYW4sIGltYWdlU3RkLCBpZCB9ID0gZS5kYXRhOw0KICB0cnkgew0KICAgIGNvbnN0IHNyY0Zsb2F0ID0gbmV3IEZsb2F0MzJBcnJheShzcmNCdWZmZXIpOw0KICAgIGNvbnN0IHsgY2h3LCByZ2JhIH0gPSBwcmVwYXJlQ29uZGl0aW9uSW1hZ2Uoc3JjRmxvYXQsIHNyY1csIHNyY0gsIHNpemUsIGJnLCBpbWFnZU1lYW4sIGltYWdlU3RkKTsNCiAgICBzZWxmLnBvc3RNZXNzYWdlKHsgaWQsIG9rOiB0cnVlLCBjaHdCdWZmZXI6IGNody5idWZmZXIsIHJnYmFCdWZmZXI6IHJnYmEuYnVmZmVyIH0sIFtjaHcuYnVmZmVyLCByZ2JhLmJ1ZmZlcl0pOw0KICB9IGNhdGNoIChlcnIpIHsNCiAgICBzZWxmLnBvc3RNZXNzYWdlKHsgaWQsIG9rOiBmYWxzZSwgZXJyb3I6IFN0cmluZyhlcnI/LnN0YWNrIHx8IGVycikgfSk7DQogIH0NCn07DQo=", import.meta.url).href,
+    clipPrepWorker: new URL("data:text/javascript;base64,LyoqDQogKiBjbGlwX3ByZXBfd29ya2VyLmpzIOKAlCBXZWIgV29ya2VyIHJ1bm5pbmcgdGhlIENMSVAgQ1BVIHByZXAgKGFscGhhLWJsZW5kLA0KICogNTEy4oaSMjI0IHJlc2l6ZSArIG5vcm1hbGl6ZSwgMzLDlzMyIHBhdGNoIGVtYmVkZGluZykgb2ZmIHRoZSBtYWluIHRocmVhZC4NCiAqDQogKiBQcm90b2NvbCAocmVxdWVzdC9yZXNwb25zZSBieSBpZCwgZHJpdmVuIHRocm91Z2ggd29ya2VyX2NhbGwuanMpOg0KICogICB7IHR5cGU6ICdpbml0JywgaWQsIGNvbnYxVywgY2xhc3NFbWIsIHBvc0VtYiB9ICAgQXJyYXlCdWZmZXJzIChjb3BpZWQgaW4NCiAqICAgICAgIGZvciB0aGUgY2FsbGVyJ3MgY3VycmVudCB3ZWlnaHQgaWRlbnRpdHkpICDihpIgeyBpZCwgb2s6IHRydWUsIGluaXRpYWxpemVkOiB0cnVlIH0NCiAqICAgeyB0eXBlOiAncmVzZXQnLCBpZCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgIHJlbGVhc2VzIGNvcGllZCB0ZW5zb3JzDQogKiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIOKGkiB7IGlkLCBvazogdHJ1ZSwgcmVzZXQ6IHRydWUgfQ0KICogICB7IGlkLCByZ2JhLCB3aWR0aCwgaGVpZ2h0IH0gICAgICAgICAgICAgICAgICAgICByZ2JhIEFycmF5QnVmZmVyICh0cmFuc2ZlcnJlZCkNCiAqICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIOKGkiB7IGlkLCBvazogdHJ1ZSwgZW1iZWRkaW5ncyB9ICAodHJhbnNmZXJyZWQpDQogKiBVc2VzIHRoZSBTQU1FIGNsaXBfcHJlcF9jb3JlIG1hdGggYXMgdGhlIG1haW4tdGhyZWFkIHBhdGgsIHNvIHRoZQ0KICogWzUwLCA3NjhdIGVtYmVkZGluZ3MgYXJlIGJ5dGUtaWRlbnRpY2FsLg0KICovDQppbXBvcnQgeyBwcmVwYXJlQ2xpcEVtYmVkZGluZ3MsIHZhbGlkYXRlQ2xpcFByZXBXZWlnaHRzIH0gZnJvbSAnLi9jbGlwX3ByZXBfY29yZS5qcyc7DQoNCmxldCBwcmVwV2VpZ2h0cyA9IG51bGw7DQoNCnNlbGYub25tZXNzYWdlID0gKGUpID0+IHsNCiAgY29uc3QgZCA9IGUuZGF0YTsNCiAgaWYgKGQ/LnR5cGUgPT09ICdpbml0Jykgew0KICAgIHRyeSB7DQogICAgICAvLyBSZXZva2Ugb2xkIGNvcGllZCB0ZW5zb3JzIGJlZm9yZSB2YWxpZGF0aW5nIGEgcmVwbGFjZW1lbnQuIEEgZmFpbGVkDQogICAgICAvLyByZXBsYWNlbWVudCBtdXN0IG5vdCBsZWF2ZSBhIGNhbGxlciBiZWxpZXZpbmcgaXQgY2FuIHN0aWxsIHVzZSBvbGQNCiAgICAgIC8vIHByZXBhcmF0aW9uIHdlaWdodHMuDQogICAgICBwcmVwV2VpZ2h0cyA9IG51bGw7DQogICAgICBwcmVwV2VpZ2h0cyA9IHZhbGlkYXRlQ2xpcFByZXBXZWlnaHRzKHsNCiAgICAgICAgY29udjFXOiBuZXcgRmxvYXQzMkFycmF5KGQuY29udjFXKSwNCiAgICAgICAgY2xhc3NFbWI6IG5ldyBGbG9hdDMyQXJyYXkoZC5jbGFzc0VtYiksDQogICAgICAgIHBvc0VtYjogbmV3IEZsb2F0MzJBcnJheShkLnBvc0VtYiksDQogICAgICB9KTsNCiAgICAgIHNlbGYucG9zdE1lc3NhZ2UoeyBpZDogZC5pZCwgb2s6IHRydWUsIGluaXRpYWxpemVkOiB0cnVlIH0pOw0KICAgIH0gY2F0Y2ggKGVycikgew0KICAgICAgc2VsZi5wb3N0TWVzc2FnZSh7IGlkOiBkLmlkLCBvazogZmFsc2UsIGVycm9yOiBTdHJpbmcoZXJyPy5zdGFjayB8fCBlcnIpIH0pOw0KICAgIH0NCiAgICByZXR1cm47DQogIH0NCiAgaWYgKGQ/LnR5cGUgPT09ICdyZXNldCcpIHsNCiAgICBwcmVwV2VpZ2h0cyA9IG51bGw7DQogICAgc2VsZi5wb3N0TWVzc2FnZSh7IGlkOiBkLmlkLCBvazogdHJ1ZSwgcmVzZXQ6IHRydWUgfSk7DQogICAgcmV0dXJuOw0KICB9DQogIHRyeSB7DQogICAgaWYgKCFwcmVwV2VpZ2h0cykgdGhyb3cgbmV3IEVycm9yKCdjbGlwIHByZXAgd29ya2VyIHVzZWQgYmVmb3JlIGluaXQnKTsNCiAgICBjb25zdCBlbWJlZGRpbmdzID0gcHJlcGFyZUNsaXBFbWJlZGRpbmdzKG5ldyBVaW50OENsYW1wZWRBcnJheShkLnJnYmEpLCBkLndpZHRoLCBkLmhlaWdodCwgcHJlcFdlaWdodHMpOw0KICAgIHNlbGYucG9zdE1lc3NhZ2UoeyBpZDogZC5pZCwgb2s6IHRydWUsIGVtYmVkZGluZ3M6IGVtYmVkZGluZ3MuYnVmZmVyIH0sIFtlbWJlZGRpbmdzLmJ1ZmZlcl0pOw0KICB9IGNhdGNoIChlcnIpIHsNCiAgICBzZWxmLnBvc3RNZXNzYWdlKHsgaWQ6IGQuaWQsIG9rOiBmYWxzZSwgZXJyb3I6IFN0cmluZyhlcnI/LnN0YWNrIHx8IGVycikgfSk7DQogIH0NCn07DQo=", import.meta.url).href,
+    marchingTetWorker: new URL("data:text/javascript;base64,LyoqDQogKiBtYXJjaGluZ190ZXRfd29ya2VyLmpzIOKAlCBXZWIgV29ya2VyIHJ1bm5pbmcgbWFyY2hpbmcgdGV0cmFoZWRyYSBvZmYgdGhlIG1haW4NCiAqIHRocmVhZC4gVGhlIHRldCBncmlkICg1MzUsODgyIHZlcnRpY2VzIC8gMi45N00gdGV0cywgfjQ3TUIgb2YgaW5kaWNlcykgaXMNCiAqIGxvYWRlZCBPTkNFIGJ5IHRoZSB3b3JrZXIgYXQgc3RhcnR1cCBhbmQgc3RheXMgcmVzaWRlbnQsIHNvIGEgcnVuIG9ubHkgc2hpcHMNCiAqIHRoZSBwZXItcnVuIFNERiAoMk1CKSBhbmQgdmVydGV4IG9mZnNldHMgKDYuNE1CKSBpbiBhbmQgdGhlIG1lc2ggb3V0Lg0KICoNCiAqIFByb3RvY29sIChyZXF1ZXN0L3Jlc3BvbnNlIGJ5IGlkLCBkcml2ZW4gdGhyb3VnaCB3b3JrZXJfY2FsbC5qcyk6DQogKiAgIHsgaWQsIHNkZiwgdmVydGV4T2Zmc2V0c3xudWxsLCBiYm94OiBbbG8sIGhpXSwgcmVzb2x1dGlvbiB9DQogKiAgICAgc2RmIC8gdmVydGV4T2Zmc2V0czogQXJyYXlCdWZmZXJzICh0cmFuc2ZlcnJlZCkNCiAqICAg4oaSIHsgaWQsIG9rOiB0cnVlLCB2ZXJ0aWNlcywgZmFjZXMsIG51bVZlcnRpY2VzLCBudW1GYWNlcyB9ICAodHJhbnNmZXJyZWQpDQogKiBVc2VzIHRoZSBTQU1FIG1hcmNoaW5nX3RldCBtYXRoIGFuZCB0aGUgc2FtZSBzY2FsZVRlbnNvciBncmlkIHNjYWxpbmcgYXMgdGhlDQogKiBtYWluLXRocmVhZCBwYXRoLCBzbyB0aGUgbWVzaCBpcyBieXRlLWlkZW50aWNhbC4NCiAqLw0KaW1wb3J0IHsgbG9hZFRldERhdGEsIG1hcmNoaW5nVGV0cmFoZWRyYSwgc2NhbGVUZW5zb3IgfSBmcm9tICcuL21hcmNoaW5nX3RldC5qcyc7DQoNCi8vIFN0YXJ0IGxvYWRpbmcgdGhlIGdyaWQgaW1tZWRpYXRlbHk7IHJlcXVlc3RzIGF3YWl0IGl0LiBBIGxvYWQgZmFpbHVyZSBpcw0KLy8gcmVwb3J0ZWQgb24gZXZlcnkgcmVxdWVzdCByYXRoZXIgdGhhbiBzd2FsbG93ZWQuDQpjb25zdCB0ZXRSZWFkeSA9IGxvYWRUZXREYXRhKCk7DQoNCnNlbGYub25tZXNzYWdlID0gYXN5bmMgKGUpID0+IHsNCiAgY29uc3QgeyBpZCwgc2RmLCB2ZXJ0ZXhPZmZzZXRzLCBiYm94LCByZXNvbHV0aW9uIH0gPSBlLmRhdGE7DQogIHRyeSB7DQogICAgY29uc3QgdGV0ID0gYXdhaXQgdGV0UmVhZHk7DQogICAgaWYgKCFBcnJheS5pc0FycmF5KGJib3gpIHx8IGJib3gubGVuZ3RoICE9PSAyIHx8ICFiYm94LmV2ZXJ5KE51bWJlci5pc0Zpbml0ZSkpIHsNCiAgICAgIHRocm93IG5ldyBFcnJvcignbWFyY2hpbmcgdGV0IHJlcXVlc3QgcmVxdWlyZXMgYSBmaW5pdGUgW2xvLCBoaV0gYmJveCcpOw0KICAgIH0NCiAgICBjb25zdCBncmlkUG9zaXRpb25zID0gc2NhbGVUZW5zb3IodGV0LmdyaWRWZXJ0aWNlcywgWzAsIDFdLCBiYm94KTsNCiAgICBjb25zdCBzZGZBcnIgPSBuZXcgRmxvYXQzMkFycmF5KHNkZik7DQogICAgaWYgKHNkZkFyci5sZW5ndGggIT09IHRldC5udW1WZXJ0aWNlcykgew0KICAgICAgdGhyb3cgbmV3IEVycm9yKGBzZGYgbGVuZ3RoICR7c2RmQXJyLmxlbmd0aH0gIT0gdGV0IGdyaWQgdmVydGljZXMgJHt0ZXQubnVtVmVydGljZXN9YCk7DQogICAgfQ0KICAgIGNvbnN0IG9mZnNldHMgPSB2ZXJ0ZXhPZmZzZXRzID8gbmV3IEZsb2F0MzJBcnJheSh2ZXJ0ZXhPZmZzZXRzKSA6IG51bGw7DQogICAgaWYgKG9mZnNldHMgJiYgb2Zmc2V0cy5sZW5ndGggIT09IHRldC5udW1WZXJ0aWNlcyAqIDMpIHsNCiAgICAgIHRocm93IG5ldyBFcnJvcihgdmVydGV4T2Zmc2V0cyBsZW5ndGggJHtvZmZzZXRzLmxlbmd0aH0gIT0gJHt0ZXQubnVtVmVydGljZXMgKiAzfWApOw0KICAgIH0NCiAgICBjb25zdCBtZXNoID0gbWFyY2hpbmdUZXRyYWhlZHJhKGdyaWRQb3NpdGlvbnMsIHNkZkFyciwgdGV0LmluZGljZXMsIG9mZnNldHMsIHJlc29sdXRpb24pOw0KICAgIHNlbGYucG9zdE1lc3NhZ2Uoew0KICAgICAgaWQsIG9rOiB0cnVlLA0KICAgICAgdmVydGljZXM6IG1lc2gudmVydGljZXMuYnVmZmVyLA0KICAgICAgZmFjZXM6IG1lc2guZmFjZXMuYnVmZmVyLA0KICAgICAgbnVtVmVydGljZXM6IG1lc2gubnVtVmVydGljZXMsDQogICAgICBudW1GYWNlczogbWVzaC5udW1GYWNlcywNCiAgICB9LCBbbWVzaC52ZXJ0aWNlcy5idWZmZXIsIG1lc2guZmFjZXMuYnVmZmVyXSk7DQogIH0gY2F0Y2ggKGVycikgew0KICAgIHNlbGYucG9zdE1lc3NhZ2UoeyBpZCwgb2s6IGZhbHNlLCBlcnJvcjogU3RyaW5nKGVycj8uc3RhY2sgfHwgZXJyKSB9KTsNCiAgfQ0KfTsNCg==", import.meta.url).href,
+    uvUnwrapWorker: new URL("data:text/javascript;base64,LyoqDQogKiB1dl91bndyYXBfd29ya2VyLmpzIOKAlCBXZWIgV29ya2VyIHJ1bm5pbmcgdGhlIENQVSBVVi11bndyYXAgb2ZmIHRoZSBtYWluIHRocmVhZC4NCiAqDQogKiB1di11bndyYXAgaXMgdGhlIHNlY29uZC1sYXJnZXN0IENQVSBmb3JlZ3JvdW5kIGdhcCAofjIxNm1zKSBwcm9maWxpbmcgZm91bmQsDQogKiBhbmQgdW53cmFwVVYgaXMgYWxyZWFkeSBwdXJlICh0eXBlZCBhcnJheXMgaW4vb3V0LCBubyBET00vR1BVKSwgc28gd2UgaW1wb3J0IGl0DQogKiBkaXJlY3RseSBmcm9tIHRleHR1cmVfYmFrZXIuanMuIGdwdS5qcydzIEdQVUJ1ZmZlclVzYWdlIHJlZnMgYXJlIGluc2lkZQ0KICogZnVuY3Rpb25zIChub3QgbW9kdWxlIHRvcC1sZXZlbCksIHNvIGltcG9ydGluZyBoZXJlIGRvZXMgbm90IGNyYXNoIHRoZSB3b3JrZXI7DQogKiB3ZSBuZXZlciBjYWxsIHRoZSBHUFUgZnVuY3Rpb25zLg0KICoNCiAqIE91dHB1dCAobmV3VmVydGljZXMvbmV3Tm9ybWFscy9uZXdGYWNlcy91dnMvZmFjZUFzc2lnbm1lbnQpIGlzIGJ5dGUtaWRlbnRpY2FsDQogKiB0byB0aGUgbWFpbi10aHJlYWQgcGF0aCDigJQgc2FtZSB1bndyYXBVViBjb2RlLg0KICovDQppbXBvcnQgeyB1bndyYXBVViB9IGZyb20gJy4vdGV4dHVyZV9iYWtlci5qcyc7DQoNCnNlbGYub25tZXNzYWdlID0gKGUpID0+IHsNCiAgY29uc3QgeyB2ZXJ0aWNlcywgZmFjZXMsIG51bVZlcnRpY2VzLCBudW1GYWNlcywgaWQgfSA9IGUuZGF0YTsNCiAgdHJ5IHsNCiAgICBjb25zdCByID0gdW53cmFwVVYobmV3IEZsb2F0MzJBcnJheSh2ZXJ0aWNlcyksIG5ldyBVaW50MzJBcnJheShmYWNlcyksIG51bVZlcnRpY2VzLCBudW1GYWNlcyk7DQogICAgLy8gVHJhbnNmZXIgYWxsIG91dHB1dCBidWZmZXJzIGJhY2sgKHplcm8tY29weSkuDQogICAgY29uc3QgdHJhbnNmZXJzID0gWw0KICAgICAgci5uZXdWZXJ0aWNlcy5idWZmZXIsIHIubmV3Tm9ybWFscy5idWZmZXIsIHIubmV3RmFjZXMuYnVmZmVyLA0KICAgICAgci51dnMuYnVmZmVyLCByLmZhY2VBc3NpZ25tZW50LmJ1ZmZlciwNCiAgICBdOw0KICAgIHNlbGYucG9zdE1lc3NhZ2Uoew0KICAgICAgaWQsIG9rOiB0cnVlLA0KICAgICAgbmV3VmVydGljZXM6IHIubmV3VmVydGljZXMuYnVmZmVyLA0KICAgICAgbmV3Tm9ybWFsczogci5uZXdOb3JtYWxzLmJ1ZmZlciwNCiAgICAgIG5ld0ZhY2VzOiByLm5ld0ZhY2VzLmJ1ZmZlciwNCiAgICAgIHV2czogci51dnMuYnVmZmVyLA0KICAgICAgZmFjZUFzc2lnbm1lbnQ6IHIuZmFjZUFzc2lnbm1lbnQuYnVmZmVyLA0KICAgICAgbmV3TnVtVmVydGljZXM6IHIubmV3TnVtVmVydGljZXMsDQogICAgICBuZXdOdW1GYWNlczogci5uZXdOdW1GYWNlcywNCiAgICB9LCB0cmFuc2ZlcnMpOw0KICB9IGNhdGNoIChlcnIpIHsNCiAgICBzZWxmLnBvc3RNZXNzYWdlKHsgaWQsIG9rOiBmYWxzZSwgZXJyb3I6IFN0cmluZyhlcnI/LnN0YWNrIHx8IGVycikgfSk7DQogIH0NCn07DQo=", import.meta.url).href,
+    materializeWorker: new URL("data:text/javascript;base64,LyoqDQogKiBtYXRlcmlhbGl6ZV93b3JrZXIuanMg4oCUIFdlYiBXb3JrZXIgcnVubmluZyB0aGUgdGV4dHVyZSBtYXRlcmlhbGl6YXRpb24NCiAqIChhbGJlZG8gKyBub3JtYWwgKyBkaWxhdGlvbikgb2ZmIHRoZSBtYWluIHRocmVhZC4gQ3JhbmlhbCdzIGFzc2F5J3Mgfjc1Mm1zDQogKiBDUFUgdGFpbC4gVXNlcyB0aGUgU0FNRSBtYXRlcmlhbGl6ZV9jb3JlIG1hdGgsIHNvIG91dHB1dCBpcyBieXRlLWlkZW50aWNhbC4NCiAqDQogKiBSZWNlaXZlcyB0aGUgZGVjb2RlZCBmZWF0dXJlL25vcm1hbCBwYXlsb2FkcyArIFRCTi9tYXNrICh0cmFuc2ZlcnJlZCB6ZXJvLWNvcHkpDQogKiBhbmQgcmV0dXJucyB0aGUgYWxiZWRvICsgbm9ybWFsIFVpbnQ4QXJyYXlzICh0cmFuc2ZlcnJlZCBiYWNrKS4NCiAqLw0KaW1wb3J0IHsgbWF0ZXJpYWxpemVUZXh0dXJlcyB9IGZyb20gJy4vbWF0ZXJpYWxpemVfY29yZS5qcyc7DQoNCnNlbGYub25tZXNzYWdlID0gKGUpID0+IHsNCiAgY29uc3QgeyBmZWF0dXJlc0J1Ziwgbm9ybWFsc0J1Ziwgb2NjdXBpZWRCdWYsIHRibkJ1ZiwgbWFza0J1ZiwgcmVzb2x1dGlvbiwgbnVtT2NjdXBpZWQsIGlkIH0gPSBlLmRhdGE7DQogIHRyeSB7DQogICAgY29uc3QgeyBhbGJlZG8sIG5vcm1hbE1hcCB9ID0gbWF0ZXJpYWxpemVUZXh0dXJlcyh7DQogICAgICBmZWF0dXJlc0NQVTogbmV3IEZsb2F0MzJBcnJheShmZWF0dXJlc0J1ZiksDQogICAgICBub3JtYWxzQ1BVOiBuZXcgRmxvYXQzMkFycmF5KG5vcm1hbHNCdWYpLA0KICAgICAgb2NjdXBpZWRJbmRpY2VzOiBuZXcgVWludDMyQXJyYXkob2NjdXBpZWRCdWYpLA0KICAgICAgdGJuRGF0YTogbmV3IEZsb2F0MzJBcnJheSh0Ym5CdWYpLA0KICAgICAgbWFzazogbmV3IFVpbnQ4QXJyYXkobWFza0J1ZiksDQogICAgICByZXNvbHV0aW9uLA0KICAgICAgbnVtT2NjdXBpZWQsDQogICAgfSk7DQogICAgc2VsZi5wb3N0TWVzc2FnZSgNCiAgICAgIHsgaWQsIG9rOiB0cnVlLCBhbGJlZG86IGFsYmVkby5idWZmZXIsIG5vcm1hbE1hcDogbm9ybWFsTWFwLmJ1ZmZlciB9LA0KICAgICAgW2FsYmVkby5idWZmZXIsIG5vcm1hbE1hcC5idWZmZXJdLA0KICAgICk7DQogIH0gY2F0Y2ggKGVycikgew0KICAgIHNlbGYucG9zdE1lc3NhZ2UoeyBpZCwgb2s6IGZhbHNlLCBlcnJvcjogU3RyaW5nKGVycj8uc3RhY2sgfHwgZXJyKSB9KTsNCiAgfQ0KfTsNCg==", import.meta.url).href,
+  });
+}
+
+function createProductRouteWorkers() {
+  if (typeof Worker !== 'function') {
+    throw new Error('createProductRouteWorkers requires a browser Worker constructor');
+  }
+  const workers = {};
+  try {
+    workers.preprocessWorker = new Worker(new URL(/* @vite-ignore */ ""+new URL('assets/preprocess_worker-B4Oyc4Ud.js', import.meta.url).href+"", import.meta.url), { type: 'module', name: 'sf3d-preprocess' });
+    workers.clipPrepWorker = new Worker(new URL(/* @vite-ignore */ ""+new URL('assets/clip_prep_worker-CdISBjlR.js', import.meta.url).href+"", import.meta.url), { type: 'module', name: 'sf3d-clip-prep' });
+    workers.marchingTetWorker = new Worker(new URL(/* @vite-ignore */ ""+new URL('assets/marching_tet_worker-BKpiikFI.js', import.meta.url).href+"", import.meta.url), { type: 'module', name: 'sf3d-marching-tet' });
+    workers.uvUnwrapWorker = new Worker(new URL(/* @vite-ignore */ ""+new URL('assets/uv_unwrap_worker-CJ-dpAA6.js', import.meta.url).href+"", import.meta.url), { type: 'module', name: 'sf3d-uv-unwrap' });
+    workers.materializeWorker = new Worker(new URL(/* @vite-ignore */ ""+new URL('assets/materialize_worker-DNsiS8sK.js', import.meta.url).href+"", import.meta.url), { type: 'module', name: 'sf3d-materialize' });
+    return workers;
+  } catch (error) {
+    terminateProductRouteWorkers(workers);
+    throw error;
+  }
+}
+
+function terminateProductRouteWorkers(workers) {
+  for (const worker of Object.values(workers || {})) {
+    try { worker.terminate(); } catch { /* already gone */ }
+  }
+}
+
+/**
+ * Compose the options object runFullPipelineToGlb consumes. `workers` is the
+ * object from createProductRouteWorkers (or a subset for A/B arms); `overrides`
+ * is applied last so a harness can hold everything but one mechanism fixed.
+ *
+ * Fail-loud: unknown worker roles are rejected rather than silently ignored,
+ * because a misspelled role would fall back to the main-thread path and quietly
+ * reintroduce the foreground gap the worker exists to remove.
+ */
+function createProductRouteOptions({ workers = {}, overrides = {} } = {}) {
+  for (const role of Object.keys(workers)) {
+    if (!(role in PRODUCT_ROUTE_WORKER_ROLES)) {
+      throw new Error(`unknown product route worker role: ${role}`);
+    }
+  }
+  return Object.freeze({
+    ...PRODUCT_ROUTE_DEFAULTS,
+    ...workers,
+    ...overrides,
+  });
+}
+
+/**
+ * Names of the mechanisms an options object enables, for effective-config
+ * receipts (a witness must record what actually ran, not what was requested).
+ */
+function describeProductRouteOptions(options) {
+  return Object.freeze({
+    cooperativeDino: options.cooperativeDino === true && options.dinoSchedulingMode !== 'disabled',
+    cooperativeTwoStream: options.cooperativeTwoStream === true && options.twoStreamSchedulingMode !== 'disabled',
+    twoStreamDutyGranularity: options.cooperativeTwoStream === true ? options.twoStreamDutyGranularity ?? 'stage' : null,
+    cooperativePostProcessor: options.cooperativePostProcessor === true && options.postProcessorSchedulingMode !== 'disabled',
+    postProcessorDutyGranularity: options.cooperativePostProcessor === true ? options.postProcessorDutyGranularity ?? 'plane' : null,
+    postProcessorCompletionPolicy: options.cooperativePostProcessor === true ? options.postProcessorCompletionPolicy ?? 'strict-prefix' : null,
+    cooperativeBake: options.cooperativeBake === true && options.bakeSchedulingMode !== 'disabled',
+    bakeBatchTexels: options.cooperativeBake === true ? options.bakeBatchTexels ?? 16384 : null,
+    decoderArena: options.decoderArena === true && options.cooperativeBake === true,
+    workers: Object.freeze(Object.fromEntries(
+      Object.keys(PRODUCT_ROUTE_WORKER_ROLES).map(role => [role, Boolean(options[role])]),
+    )),
+  });
+}
+
+/**
+ * Producer lifecycle: one run at a time, and a dispose() that is safe to call
+ * at any time. A host tearing down while a run is outstanding must not leak
+ * the run (bridge run open, drain timer firing, second run refused forever) or
+ * release buffers the run is still using; the release is deferred until that
+ * run ends, and everything new is refused from the moment dispose is requested.
+ * Pure (no GPU), so the contract is testable in Node.
+ */
+function createProducerLifecycle({ release }) {
+  if (typeof release !== 'function') throw new Error('release must be a function');
+  const state = { activeRunId: null, disposed: false, releaseStarted: false, quarantined: false, quarantineReason: undefined };
+  let resolveCompletion;
+  let rejectCompletion;
+  const completion = new Promise((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  // A failed foreground finish may quarantine before a host asks to dispose.
+  // Preserve rejection for that later caller without emitting an unhandled one.
+  completion.catch(() => {});
+  const doRelease = () => {
+    if (state.releaseStarted) return completion;
+    state.releaseStarted = true;
+    Promise.resolve()
+      .then(() => release())
+      .then(
+        () => resolveCompletion(Object.freeze({ status: 'released' })),
+        error => rejectCompletion(error),
+      );
+    return completion;
+  };
+  return Object.freeze({
+    get activeRunId() { return state.activeRunId; },
+    get disposed() { return state.disposed; },
+    get quarantined() { return state.quarantined; },
+    beginRun(runId) {
+      if (state.quarantined) throw new Error('sf3d producer is quarantined after failed foreground finish', { cause: state.quarantineReason });
+      if (state.disposed) throw new Error('sf3d producer is disposed');
+      if (state.activeRunId != null) throw new Error(`sf3d producer already has an active run (${state.activeRunId})`);
+      state.activeRunId = runId;
+    },
+    /** 'release-started' when a deferred dispose begins at this run's end, else 'idle'. */
+    endRun(runId) {
+      if (state.activeRunId !== runId) throw new Error(`${runId} is not the active run (${state.activeRunId ?? 'none'})`);
+      state.activeRunId = null;
+      if (state.quarantined) return 'quarantined';
+      if (state.disposed) { doRelease(); return 'release-started'; }
+      return 'idle';
+    },
+    quarantine(runId, error) {
+      if (state.activeRunId !== runId) throw new Error(`${runId} is not the active run (${state.activeRunId ?? 'none'})`);
+      if (state.quarantined) return;
+      state.quarantined = true;
+      state.quarantineReason = error;
+      rejectCompletion(error);
+    },
+    assertAcceptingRequests() {
+      if (state.disposed) throw new Error('sf3d producer is disposed');
+    },
+    dispose() {
+      if (state.disposed) return Object.freeze({ status: 'already-disposed', completion });
+      state.disposed = true;
+      if (state.quarantined) return Object.freeze({ status: 'quarantined', completion });
+      if (state.activeRunId != null) {
+        return Object.freeze({ status: 'deferred-until-run-ends', runId: state.activeRunId, completion });
+      }
+      doRelease();
+      return Object.freeze({ status: 'releasing', completion });
+    },
+  });
+}
+
+/**
+ * Validate every fallible run input BEFORE acquiring lifecycle or bridge
+ * state, then acquire both and hand back one exactly-once release boundary.
+ * A rejected run therefore never leaves an active run behind (r2 HIGH,
+ * 2026-09-16: an empty run id or a bad route override used to wedge the
+ * producer after lifecycle.beginRun had already fired).
+ *
+ * buildOptions() must return the frozen route options WITHOUT the
+ * foreground service; it is attached here from the admitted service run.
+ */
+async function prepareProducerRun({ lifecycle, foreground, runId, buildOptions }) {
+  if (typeof runId !== 'string' || !runId.trim()) throw new Error('runId must be a non-empty string');
+  if (typeof buildOptions !== 'function') throw new Error('buildOptions must be a function');
+  const baseOptions = buildOptions();            // throws on unknown worker roles / bad overrides
+  lifecycle.beginRun(runId);                       // refuses when disposed or a run is active
+  let foregroundRun;
+  try {
+    foregroundRun = await foreground.beginRun(runId);
+  } catch (error) {
+    lifecycle.endRun(runId);
+    throw error;
+  }
+  const options = Object.freeze({
+    ...baseOptions,
+    foregroundOpportunities: foregroundRun.foregroundOpportunities,
+    withForeground: foregroundRun.withForeground,
+  });
+  let released = null;
+  return Object.freeze({
+    runId,
+    options,
+    foregroundRun,
+    /** Finish the bridge run and end the lifecycle run exactly once; returns the foreground report. */
+    async release() {
+      if (released) return released;
+      released = (async () => {
+        try {
+          return await foregroundRun.finish();
+        } catch (error) {
+          lifecycle.quarantine(runId, error);
+          throw error;
+        } finally {
+          lifecycle.endRun(runId);
+        }
+      })();
+      return released;
+    },
+  });
+}
+
+/**
+ * SF3D producer — the device/adapter-injected callable a Kaminos host composes
+ * into its own route (the kiln composition: the host owns the GPUDevice, SF3D
+ * runs on it, host frames are submitted through the kit's foreground-
+ * opportunity interlock before each SF3D GPU duty).
+ *
+ *   const producer = await createSf3dProducer({ device, adapter, weightsUrl });
+ *   const handle = producer.requestForegroundOpportunity({ requestId, run(ctx) { ... ctx.submit([cb]) } });
+ *   const { glb, receipt, foregroundOpportunityReport } = await producer.run(image, { runId });
+ *   producer.dispose();
+ *
+ * Without an injected device the producer requests its own (the standalone
+ * app path). The route is the product route (every proven foreground-liveness
+ * mechanism on by default: cooperative GPU duties, decoder arena, five CPU
+ * offload workers); routeOverrides adjust it per run.
+ *
+ * Honest boundaries: one run at a time per producer (the pipelines and decoder
+ * arena are not reentrant); `signal` is checked at run start only (no mid-run
+ * cancellation of SF3D GPU work); the route receipt's artifact hashes are
+ * 'not-computed' as in the app (the witness harness hashes the GLB).
+ * `dispose()` refuses new work synchronously and returns a stable completion
+ * promise. That completion settles only after admitted foreground work drains,
+ * then producer-created workers and producer-loaded weight buffers release; it
+ * never destroys an injected device or injected weights. Called during a run,
+ * teardown waits for the run's foreground finish boundary first.
+ * A failed run throws with `error.sf3dRun` = { runId, lastProgress,
+ * foregroundOpportunityReport, identity } so the host keeps the phase and the
+ * last trustworthy evidence. If both inference and foreground finish fail,
+ * the thrown AggregateError preserves both original errors in order.
+ * Failed foreground finish quarantines model execution and owned resources;
+ * an attached host may still request outside-run frames, but disposal refuses
+ * resource retirement until a separately proven settlement path exists.
+ */
+
+const SF3D_PRODUCER_SCHEMA = 'sf3d.producer.v0';
+const SF3D_PRODUCER_RUN_IDENTITY_SCHEMA = 'sf3d.producer-run-identity.v0';
+
+/** Resolve the weights URL the way loadWeights will fetch it (absolute when a document location exists). */
+function resolveWeightsUrl(weightsUrl, base = globalThis.location?.href ?? null) {
+  if (typeof weightsUrl !== 'string' || !weightsUrl) throw new Error('weightsUrl must be a non-empty string');
+  try { return new URL(weightsUrl, base ?? undefined).href; } catch { return weightsUrl; }
+}
+
+/** Release a loader-owned weight set, or a legacy component tree. Callers enforce ownership. */
+function releaseLoadedWeights(weights) {
+  // The loader owns both eager uploads and lazy resources hidden behind its
+  // accessors, including retained CPU bytes. Tree walking is only the legacy
+  // fallback; never combine it with disposal and double-destroy the buffers.
+  if (typeof weights?.dispose === 'function') return weights.dispose();
+  let released = 0;
+  const seen = new Set();
+  const visit = (value) => {
+    if (!value || typeof value !== 'object' || seen.has(value)) return;
+    seen.add(value);
+    // Raw CPU payloads are leaves, not containers of GPU resources.
+    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return;
+    if (typeof value.destroy === 'function') {
+      value.destroy();
+      released += 1;
+      return;
+    }
+    for (const child of Object.values(value)) visit(child);
+  };
+  visit(weights);
+  return released;
+}
+
+/** Drain foreground before retiring anything it may still reference. */
+async function releaseProducerResources({ foreground, retainedClipPrepWorker, routeWorkers, modelWeights, ownsWorkers, ownsWeights }) {
+  const errors = [];
+  const attempt = async operation => {
+    try { await operation(); } catch (error) { errors.push(error); }
+  };
+
+  // Rejection is not a settlement certificate. Keep all owned resources alive
+  // and let the host quarantine this producer instead of risking use-after-free.
+  if (foreground) await foreground.dispose();
+  if (retainedClipPrepWorker) {
+    await attempt(() => releaseClipPrepWorker(routeWorkers.clipPrepWorker, modelWeights));
+  }
+  if (ownsWorkers && routeWorkers) await attempt(() => terminateProductRouteWorkers(routeWorkers));
+  if (ownsWeights) await attempt(() => releaseLoadedWeights(modelWeights));
+
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, 'SF3D producer cleanup encountered multiple failures');
+}
+
+/** Run/clock identity bound to a producer run (Wake answer 5: run/clock identity + effective topology). */
+function buildRunIdentity({ runId, routeId, startedAtMs, finishedAtMs, deviceInjected, commit, kitVersion }) {
+  return Object.freeze({
+    schema: SF3D_PRODUCER_RUN_IDENTITY_SCHEMA,
+    runId,
+    routeId,
+    timeOrigin: globalThis.performance?.timeOrigin ?? null,
+    clock: 'performance.now',
+    startedAtMs,
+    finishedAtMs,
+    durationMs: finishedAtMs - startedAtMs,
+    deviceTopology: deviceInjected ? 'host-injected-device' : 'producer-owned-device',
+    producerCommit: commit,
+    kitVersion,
+  });
+}
+
+/** Internal run-settlement seam: the caller supplies the completed pipeline result/error. */
+async function finishProducerRunWithEvidence({
+  prepared, pipelineFailed, pipelineError, runId, lastProgress,
+  startedAtMs, deviceInjected, commit,
+}) {
+  let foregroundOpportunityReport = null;
+  let finishFailed = false;
+  let finishError;
+  try {
+    foregroundOpportunityReport = await prepared.release();
+  } catch (releaseError) {
+    finishFailed = true;
+    finishError = releaseError;
+  }
+  if (!pipelineFailed && !finishFailed) return foregroundOpportunityReport;
+  const reason = pipelineFailed && finishFailed
+    ? new AggregateError([pipelineError, finishError], 'SF3D inference and foreground finish both failed', { cause: pipelineError })
+    : pipelineFailed ? pipelineError : finishError;
+  const evidence = Object.freeze({
+    runId,
+    lastProgress,
+    foregroundOpportunityReport,
+    inferenceCompleted: !pipelineFailed,
+    identity: buildRunIdentity({ runId, routeId: SF3D_IMAGE_TO_MESH_ROUTE_ID, startedAtMs, finishedAtMs: performance.now(), deviceInjected, commit, kitVersion: WEBGPU_INFERENCE_KIT_VERSION }),
+  });
+  // JavaScript rejection reasons need not be Error objects (or extensible).
+  // Preserve the original as cause while keeping run identity inspectable.
+  let terminalError = reason instanceof Error ? reason : new Error('SF3D run failed with non-Error reason', { cause: reason });
+  if (!Object.isExtensible(terminalError)) terminalError = new Error(terminalError.message, { cause: terminalError });
+  terminalError.sf3dRun = evidence;
+  throw terminalError;
+}
+const SF3D_REQUIRED_RECEIPT_STAGES = Object.freeze([
+  'image-preprocess', 'dinov2-tokenizer', 'two-stream-backbone',
+  'triplane-decode', 'marching-tet', 'texture-bake', 'glb-export',
+]);
+const TEX_RESOLUTION = 1024;
+
+async function describeBackend(adapter, device) {
+  let info = adapter?.info ?? device.adapterInfo ?? null;
+  if (!info && adapter?.requestAdapterInfo) info = await adapter.requestAdapterInfo();
+  info = info || {};
+  const limits = adapter?.limits ?? device.limits;
+  const features = [...(adapter?.features ?? device.features ?? [])];
+  const identity = createWebGpuBackendIdentity({
+    adapterName: info.description || info.device || 'unknown',
+    browser: globalThis.navigator?.userAgent ?? 'unknown',
+    requestedFeatures: features,
+    effectiveFeatures: features,
+    limits: {
+      maxBufferSize: limits.maxBufferSize,
+      maxStorageBufferBindingSize: limits.maxStorageBufferBindingSize,
+      maxComputeInvocationsPerWorkgroup: limits.maxComputeInvocationsPerWorkgroup,
+    },
+    timestampQuery: features.includes('timestamp-query') ? 'available' : 'unavailable',
+  });
+  return { identity, info, limits, features };
+}
+
+function buildRouteReceipt({ backend, image, result, commit }) {
+  const profile = createStagedSubmitProfile({
+    route: SF3D_IMAGE_TO_MESH_ROUTE_ID,
+    timingSource: 'performance-now-wall-clock',
+    requiredStages: [...SF3D_REQUIRED_RECEIPT_STAGES],
+  });
+  const stageTimings = result.stageTimings || {};
+  for (const name of ['image-preprocess', 'dinov2-tokenizer', 'two-stream-backbone', 'triplane-decode', 'marching-tet']) {
+    addStagedSubmitStage(profile, { name, ms: stageTimings[name] || 0 });
+  }
+  const spanMs = (name) => {
+    const span = (result.stageSpans || []).find(s => s.name === name);
+    return span ? span.end - span.start : 0;
+  };
+  addStagedSubmitStage(profile, { name: 'texture-bake', ms: spanMs('texture-bake') });
+  addStagedSubmitStage(profile, { name: 'glb-export', ms: spanMs('glb-export') });
+
+  const width = image.naturalWidth || image.width;
+  const height = image.naturalHeight || image.height;
+  return createSf3dImageToMeshRouteReceipt({
+    input: { artifactId: `source-image:${width}x${height}`, sha256: 'not-computed', shape: [height, width, 4] },
+    outputs: {
+      meshGlb: { artifactId: `mesh-glb:${result.numVertices}v-${result.numFaces}f`, sha256: 'not-computed', shape: [result.glb.byteLength] },
+      albedoTexture: { artifactId: `albedo-texture:${TEX_RESOLUTION}`, sha256: 'not-computed', shape: [TEX_RESOLUTION, TEX_RESOLUTION, 4] },
+      normalMap: { artifactId: `normal-map:${TEX_RESOLUTION}`, sha256: 'not-computed', shape: [TEX_RESOLUTION, TEX_RESOLUTION, 4] },
+    },
+    backend: backend.identity,
+    model: { revision: 'v1.0.0-webgpu', weightsHash: 'not-computed' },
+    kernel: {
+      kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
+      profile: 'dinov2-two-stream-triplane-marching-tet-texture-bake',
+      commit,
+    },
+    profile,
+  });
+}
+
+async function createSf3dProducer({
+  device = null,
+  adapter = null,
+  weights = null,
+  weightsUrl = 'weights.bin',
+  workers = null,
+  onWeightsProgress = null,
+  memoryBudget = null,
+  expectedWeightBytes = undefined,
+  weightLoadingMode = 'whole-file',
+  expectedSourceETag = undefined,
+  commit = (typeof __COMMIT_HASH__ !== 'undefined' ? __COMMIT_HASH__ : 'dev'),
+} = {}) {
+  if (memoryBudget && !isLoaderMemoryBudget(memoryBudget)) throw new TypeError('authenticated loader budget required');
+  if (memoryBudget && weights != null)
+    throw new Error('injected weights are unaccounted by the loader budget');
+  if (memoryBudget && device != null) memoryBudget.assertDeviceAcquiredHere(device);
+  const gpu = await initGPU(device ? { device, adapter } : {});
+  const dev = gpu.device;
+  const retireBudgetDevice = () => { if (memoryBudget && !gpu.injected) { dev.destroy(); memoryBudget.restore(); } };
+  if (memoryBudget && !gpu.injected) {
+    try { memoryBudget.bindOwnedDevice(dev); }
+    catch (error) { dev.destroy(); throw error; }
+  }
+  const ownsWeights = weights == null;
+  let modelWeights, backend;
+  try {
+    backend = await describeBackend(gpu.adapter, dev);
+    modelWeights = weights ?? await loadWeights(dev, weightsUrl, onWeightsProgress || undefined, {memoryBudget, expectedWeightBytes, loadingMode:weightLoadingMode, expectedSourceETag});
+  }
+  catch (error) {
+    try { retireBudgetDevice(); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], 'SF3D budgeted loading and device cleanup failed', {cause:error}); }
+    throw error;
+  }
+  modelWeights._assertActive?.(dev);
+  // Explicit resource identity for a mounting host: where the weights came
+  // from and which worker module URLs must be reachable from the artifact.
+  const resources = Object.freeze({
+    weightsSource: ownsWeights ? 'loaded-by-producer' : 'injected-by-host',
+    weightsUrl: ownsWeights ? resolveWeightsUrl(weightsUrl) : null,
+    weightsSha256: 'not-computed',
+    workerModuleUrls: productRouteWorkerModuleUrls(),
+    workersSource: workers == null ? 'created-by-producer' : 'injected-by-host',
+  });
+  const ownsWorkers = workers == null;
+  let pipelines;
+  let routeWorkers;
+  let foreground;
+  let retainedClipPrepWorker = false;
+  try {
+    pipelines = initPipelines(dev);
+    routeWorkers = workers ?? createProductRouteWorkers();
+    if (routeWorkers?.clipPrepWorker) {
+      retainClipPrepWorker(routeWorkers.clipPrepWorker, modelWeights);
+      retainedClipPrepWorker = true;
+    }
+    foreground = createWebGpuForegroundService({ routeId: SF3D_IMAGE_TO_MESH_ROUTE_ID, device: dev, queue: dev.queue });
+  } catch (error) {
+    const failures = [error];
+    try {
+      await releaseProducerResources({
+        foreground, retainedClipPrepWorker, routeWorkers, modelWeights, ownsWorkers, ownsWeights,
+      });
+    } catch (cleanupError) {
+      failures.push(cleanupError);
+    }
+    try { retireBudgetDevice(); } catch (cleanupError) { failures.push(cleanupError); }
+    if (failures.length > 1) throw new AggregateError(failures, 'SF3D producer initialization and cleanup failed', {cause:error});
+    throw error;
+  }
+
+  let runSequence = 0;
+  // One run at a time; dispose() during a run defers the release until the
+  // run ends and refuses everything new meanwhile (producer_lifecycle.js).
+  const lifecycle = createProducerLifecycle({
+    // An injected worker is borrowed, but copied prep tensors sent into it are
+    // not. After a successful foreground drain, attempt independent owned
+    // cleanup even if reset fails. Failed drain quarantines all owned resources;
+    // never destroy injected weights/device.
+    async release() {
+      await releaseProducerResources({
+        foreground, retainedClipPrepWorker, routeWorkers, modelWeights, ownsWorkers, ownsWeights,
+      });
+      retireBudgetDevice();
+    },
+  });
+
+  return Object.freeze({
+    schema: SF3D_PRODUCER_SCHEMA,
+    routeId: SF3D_IMAGE_TO_MESH_ROUTE_ID,
+    kitVersion: WEBGPU_INFERENCE_KIT_VERSION,
+    device: dev,
+    adapter: gpu.adapter,
+    deviceInjected: gpu.injected,
+    weights: modelWeights,
+    pipelines,
+    workers: routeWorkers,
+    backend: backend.identity,
+    resources,
+    adapterInfo: backend.info,
+    adapterLimits: backend.limits,
+    adapterFeatures: Object.freeze([...backend.features]),
+    get activeRunId() { return lifecycle.activeRunId; },
+    get disposed() { return lifecycle.disposed; },
+    get quarantined() { return lifecycle.quarantined; },
+
+    /** Host (kiln) frames: kit-shaped { requestId, run(ctx), metadata } → { requestId, completion, cancel }. */
+    requestForegroundOpportunity(request) {
+      lifecycle.assertAcceptingRequests();
+      return foreground.request(request);
+    },
+    foregroundSnapshot() { return foreground.snapshot(); },
+
+    async run(image, { runId = null, onProgress = null, routeOverrides = {}, signal = null } = {}) {
+      if (image == null) throw new Error('sf3d run requires an image (HTMLImageElement/ImageBitmap-like)');
+      if (signal?.aborted) throw new Error('sf3d run aborted before start');
+      runSequence += 1;
+      const id = runId ?? `sf3d-run-${runSequence}`;
+      // Every fallible input is validated before any state is acquired, and
+      // everything after acquisition sits under one exactly-once release
+      // boundary (producer_lifecycle.js prepareProducerRun).
+      const prepared = await prepareProducerRun({
+        lifecycle, foreground, runId: id,
+        buildOptions: () => createProductRouteOptions({ workers: routeWorkers, overrides: routeOverrides }),
+      });
+      const { options } = prepared;
+      let result;
+      let foregroundOpportunityReport = null;
+      let lastProgress = null;
+      const startedAtMs = performance.now();
+      const progress = (message) => { lastProgress = String(message); if (onProgress) onProgress(message); };
+      try {
+        result = await runFullPipelineToGlb(dev, pipelines, modelWeights, image, options, progress);
+      } catch (error) {
+        await finishProducerRunWithEvidence({ prepared, pipelineFailed: true, pipelineError: error,
+          runId: id, lastProgress, startedAtMs, deviceInjected: gpu.injected, commit });
+      }
+      foregroundOpportunityReport = await finishProducerRunWithEvidence({ prepared, pipelineFailed: false,
+        runId: id, lastProgress, startedAtMs, deviceInjected: gpu.injected, commit });
+      const finishedAtMs = performance.now();
+      const receipt = buildRouteReceipt({ backend, image, result, commit });
+      const receiptValidation = validateRouteReceipt(receipt);
+      return Object.freeze({
+        schema: 'sf3d.producer-run-result.v0',
+        runId: id,
+        identity: buildRunIdentity({ runId: id, routeId: SF3D_IMAGE_TO_MESH_ROUTE_ID, startedAtMs, finishedAtMs, deviceInjected: gpu.injected, commit, kitVersion: WEBGPU_INFERENCE_KIT_VERSION }),
+        resources,
+        glb: result.glb,
+        receipt,
+        receiptValidation,
+        routeOptions: describeProductRouteOptions(options),
+        offloads: result.offloads,
+        cooperativeReports: result.cooperativeReports,
+        stageSpans: result.stageSpans,
+        stageTimings: result.stageTimings,
+        totalMs: result.totalMs,
+        foregroundOpportunityReport,
+        numVertices: result.numVertices,
+        numFaces: result.numFaces,
+        vertices: result.vertices,
+        faces: result.faces,
+        roughness: result.roughness,
+        metallic: result.metallic,
+        sdf: result.sdf,
+        isosurfaceThreshold: result.isosurfaceThreshold,
+        arenaSnapshot: result.arenaSnapshot,
+        dinoPayload: result.dinoPayload,
+      });
+    },
+
+    /**
+     * Safe at any time. With no run active: releases producer-created workers
+     * and weight buffers now. During a run: refuses new runs/requests at once
+     * and releases when the run ends (the run's own finish and receipts still
+     * happen). Never destroys an injected device or injected weights.
+     * Returns a synchronous status plus one stable `completion` promise. The
+     * promise resolves with { status: 'released' } only after foreground drain
+     * and producer-owned resource release have both finished.
+     */
+    dispose() {
+      return lifecycle.dispose();
+    },
+  });
+}
+
+export { RESIDENT_ARTIFACT_CONFIG, SF3D_PRODUCER_RUN_IDENTITY_SCHEMA, SF3D_PRODUCER_SCHEMA, SF3D_REQUIRED_RECEIPT_STAGES, TriplaneDecoder, TwoStreamBackbone, buildRunIdentity, createLoaderMemoryBudget, createSf3dProducer, createWebGpuForegroundService, describeResidentDecoderDemand, disposeResidentArtifact, disposeResidentDecoder, disposeResidentDecoderQueries, disposeResidentMarchingTetrahedra, disposeResidentMaterials, disposeResidentPostProcessor, disposeResidentTwoStream, finishProducerRunWithEvidence, hostTexturePlan, preprocessConditionImage, preprocessImage, releaseLoadedWeights, releaseProducerResources, resolveWeightsUrl, runResidentArtifact, runResidentDecoder, runResidentDecoderQueries, runResidentDino, runResidentMarchingTetrahedra, runResidentMaterials, runResidentPostProcessor, runResidentTwoStream, selectDecoderHeads, selectDinoPhase, selectPostProcessorPhase, selectResidentClipPhase };
+//# sourceMappingURL=sf3d-producer.js.map

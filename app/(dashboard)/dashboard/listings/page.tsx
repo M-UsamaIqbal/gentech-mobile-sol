@@ -12,7 +12,10 @@ import { SellerStatusFilter } from "@/features/seller/components/seller-status-f
 import { SellerListingCard } from "@/features/seller/components/seller-listing-card";
 import { buttonVariants } from "@/components/ui/button";
 
-export const metadata: Metadata = { title: "My Listings" };
+export const metadata: Metadata = { 
+  title: "My Listings",
+  robots: { index: false, follow: false },
+};
 
 /** Narrows a raw `?status=` value to a known listing status, else undefined (= All). */
 function parseStatus(value: string | string[] | undefined): ListingStatus | undefined {

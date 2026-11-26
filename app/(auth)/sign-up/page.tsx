@@ -4,7 +4,10 @@ import { getEnabledSocialProviders } from "@/features/auth/server/enabled-provid
 import { AuthCard } from "@/features/auth/components/auth-card";
 import { SignUpForm } from "@/features/auth/components/sign-up-form";
 
-export const metadata: Metadata = { title: "Create account" };
+export const metadata: Metadata = { 
+  title: "Create account",
+  robots: { index: false, follow: false },
+};
 
 export default function SignUpPage() {
   const providers = getEnabledSocialProviders();

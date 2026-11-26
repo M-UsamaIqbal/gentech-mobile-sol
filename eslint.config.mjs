@@ -14,6 +14,8 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     // Generated Prisma client — never lint generated code.
     "lib/generated/**",
+    // Vendored SF3D producer build; version and licence status are pinned in NOTICE.md.
+    "public/sf3d/**",
   ]),
 ]);
 

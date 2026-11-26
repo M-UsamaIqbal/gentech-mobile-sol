@@ -7,6 +7,9 @@
  * vendor is active, so providers can be added/removed purely via env + the script loader.
  */
 
+import { collectAttribution } from "@/features/analytics/lib/attribution";
+import { META_STANDARD_EVENTS, type AnalyticsEvent } from "@/features/analytics/lib/event-names";
+
 type Props = Record<string, unknown>;
 
 interface MixpanelLike {
@@ -25,14 +28,30 @@ declare global {
   }
 }
 
+function attributionContext(url?: string): Props {
+  return {
+    ...collectAttribution(
+      url ?? `${window.location.pathname}${window.location.search}`,
+      document.referrer,
+      document.documentElement.lang || undefined,
+    ),
+  };
+}
+
+function withAttribution(props: Props): Props {
+  return { ...attributionContext(), ...props };
+}
+
 /** Tracks a custom event across all loaded providers. */
 export function track(event: string, props?: Props): void {
   if (typeof window === "undefined") return;
-  const payload = props ?? {};
+  const payload = withAttribution(props ?? {});
+  const metaEvent = META_STANDARD_EVENTS[event as AnalyticsEvent];
 
   window.dataLayer?.push({ event, ...payload });
   window.gtag?.("event", event, payload);
-  window.fbq?.("trackCustom", event, payload);
+  if (metaEvent) window.fbq?.("track", metaEvent, payload);
+  else window.fbq?.("trackCustom", event, payload);
   window.mixpanel?.track(event, payload);
 }
 
@@ -40,10 +59,11 @@ export function track(event: string, props?: Props): void {
 export function pageview(url: string): void {
   if (typeof window === "undefined") return;
 
-  window.dataLayer?.push({ event: "page_view", page_path: url });
-  window.gtag?.("event", "page_view", { page_path: url });
+  const payload = attributionContext(url);
+  window.dataLayer?.push({ event: "page_view", ...payload });
+  window.gtag?.("event", "page_view", payload);
   window.fbq?.("track", "PageView");
-  window.mixpanel?.track("page_view", { page: url });
+  window.mixpanel?.track("page_view", payload);
 }
 
 /** Associates subsequent events with a known user. */
@@ -59,5 +79,6 @@ export function identify(userId: string, traits?: Props): void {
 /** Clears user association (e.g. on sign-out). */
 export function resetAnalytics(): void {
   if (typeof window === "undefined") return;
+  window.gtag?.("set", { user_id: null });
   window.mixpanel?.reset();
 }

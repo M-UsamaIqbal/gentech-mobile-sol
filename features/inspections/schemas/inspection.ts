@@ -2,6 +2,8 @@ import { z } from "zod";
 
 import {
   INSPECTION_ITEM_RESULTS,
+  INSPECTION_KINDS,
+  INSPECTION_KIND_VALUES,
   INSPECTION_VERDICTS,
   type InspectionItemResult,
   type InspectionVerdict,
@@ -43,8 +45,9 @@ export const requestInspectionSchema = z.object({
     .trim()
     .min(7, "Enter a valid phone number")
     .max(20),
-  city: z.string().min(1, "Select a city"),
-  area: z.string().trim().max(120).optional(),
+  countryId: z.string().min(1, "Select a country"),
+  cityId: z.string().min(1, "Select a city"),
+  areaId: z.string().optional().or(z.literal("")),
   address: z.string().trim().max(300).optional(),
   /** ISO date/datetime string for the buyer's preferred slot. */
   preferredAt: z.string().trim().max(40).optional().or(z.literal("")),
@@ -54,7 +57,7 @@ export const requestInspectionSchema = z.object({
 export type RequestInspectionInput = z.infer<typeof requestInspectionSchema>;
 
 /**
- * Standalone booking (PakWheels-style): the buyer describes the phone they want
+ * Standalone booking (PakWheels-style): the buyer describes the device they want
  * inspected instead of picking an existing listing. `listingId` is optional so the
  * same flow can also be pre-filled from a listing.
  */
@@ -63,13 +66,15 @@ export const bookInspectionSchema = z.object({
   deviceInfo: z
     .string()
     .trim()
-    .min(2, "Tell us which phone to inspect")
+    .min(2, "Tell us which device to inspect")
     .max(120),
+  inspectionKind: z.enum(INSPECTION_KIND_VALUES).default(INSPECTION_KINDS.PHONE),
   listingId: z.string().optional(),
   contactName: z.string().trim().min(2, "Enter your name").max(80),
   contactPhone: z.string().trim().min(7, "Enter a valid phone number").max(20),
-  city: z.string().min(1, "Select a city"),
-  area: z.string().trim().max(120).optional(),
+  countryId: z.string().min(1, "Select a country"),
+  cityId: z.string().min(1, "Select a city"),
+  areaId: z.string().optional().or(z.literal("")),
   address: z.string().trim().max(300).optional(),
   preferredAt: z.string().trim().max(40).optional().or(z.literal("")),
   notes: z.string().trim().max(1000).optional(),
@@ -103,10 +108,26 @@ export const submitReportSchema = z.object({
   requestId: z.string().min(1),
   verdict: z.enum(VERDICT_VALUES),
   summary: z.string().trim().max(2000).optional(),
-  imei: z.string().trim().max(40).optional(),
+  imei: z
+    .string()
+    .trim()
+    .max(40)
+    .optional()
+    .refine((value) => !value || /^\d{15}$/.test(value), "IMEI must be exactly 15 digits"),
   ptaApproved: z.boolean().optional(),
   batteryHealth: z.number().int().min(0).max(100).optional(),
-  items: z.array(reportItemSchema).min(1, "Add at least one checklist item"),
+  items: z
+    .array(reportItemSchema)
+    .min(1, "Add at least one checklist item")
+    .max(100, "Too many checklist items")
+    // Ungraded (N/A) lines are excluded from the score, so a report needs at
+    // least one real result. Otherwise every item could be skipped and an
+    // unearned grade recorded.
+    .refine(
+      (items) =>
+        items.some((item) => item.result !== INSPECTION_ITEM_RESULTS.NOT_APPLICABLE),
+      "Grade at least one checklist item",
+    ),
   photos: z.array(uploadedImageSchema).max(20).optional(),
 });
 

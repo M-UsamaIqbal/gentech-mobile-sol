@@ -9,7 +9,10 @@ import {
 } from "@/features/admin/services/admin.service";
 import { CategoryManager } from "@/features/admin/components/category-manager";
 
-export const metadata: Metadata = { title: "Admin — Categories" };
+export const metadata: Metadata = { 
+  title: "Admin — Categories",
+  robots: { index: false, follow: false },
+};
 
 export default async function AdminCategoriesPage() {
   const admin = await requireAdmin();

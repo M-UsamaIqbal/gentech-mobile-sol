@@ -6,6 +6,57 @@ const LABELS: Record<string, string> = {
   color: "Color",
   batteryHealth: "Battery Health",
   ptaApproved: "PTA Approved",
+  ptaStatus: "PTA Status",
+  cpidStatus: "CPID Status",
+  model: "Model",
+  variant: "Variant",
+  networkType: "Network Type",
+  carrier: "Carrier",
+  isUnlocked: "Unlocked",
+  modelNumber: "Model Number",
+  region: "Region",
+  warranty: "Warranty",
+  warrantyExpiry: "Warranty Expiry",
+  hasOriginalBox: "Original Box",
+  hasCharger: "Charger",
+  hasHeadphones: "Headphones",
+  repairHistory: "Repair History",
+  processor: "Processor / Chipset",
+  operatingSystem: "Operating System",
+  screenSize: "Screen Size",
+  connectivity: "Connectivity",
+  accessoryType: "Accessory Type",
+  compatibility: "Compatibility",
+};
+
+const PTA_STATUS_LABELS: Record<string, string> = {
+  PTA_APPROVED: "PTA Approved",
+  NON_PTA: "Non-PTA",
+  CPID: "CPID",
+  FACTORY_UNLOCKED: "Factory Unlocked",
+  CARRIER_LOCKED: "Carrier Locked",
+  UNKNOWN: "Unknown",
+  VERIFICATION_PENDING: "Verification Pending",
+};
+
+const CPID_STATUS_LABELS: Record<string, string> = {
+  CPID_APPROVED: "CPID Approved",
+  NON_CPID: "Non-CPID",
+  UNKNOWN: "Unknown",
+};
+
+const NETWORK_TYPE_LABELS: Record<string, string> = {
+  SINGLE_SIM: "Single SIM",
+  DUAL_SIM: "Dual SIM",
+  ESIM: "eSIM",
+  HYBRID: "Hybrid",
+};
+
+const WARRANTY_LABELS: Record<string, string> = {
+  NO_WARRANTY: "No Warranty",
+  MANUFACTURER: "Manufacturer Warranty",
+  SELLER: "Seller Warranty",
+  THIRD_PARTY: "Third-Party Warranty",
 };
 
 function toTitle(key: string): string {
@@ -27,6 +78,11 @@ export function formatAttributes(attributes: unknown): AttributePair[] {
     let value: string;
     if (key === "ptaApproved") value = raw ? "Yes" : "No";
     else if (key === "batteryHealth") value = `${raw}%`;
+    else if (key === "ptaStatus") value = PTA_STATUS_LABELS[raw as string] ?? String(raw);
+    else if (key === "cpidStatus") value = CPID_STATUS_LABELS[raw as string] ?? String(raw);
+    else if (key === "networkType") value = NETWORK_TYPE_LABELS[raw as string] ?? String(raw);
+    else if (key === "warranty") value = WARRANTY_LABELS[raw as string] ?? String(raw);
+    else if (key === "isUnlocked" || key === "hasOriginalBox" || key === "hasCharger" || key === "hasHeadphones") value = raw ? "Yes" : "No";
     else value = String(raw);
 
     pairs.push({ label: LABELS[key] ?? toTitle(key), value });

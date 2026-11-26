@@ -1,5 +1,8 @@
 import "server-only";
 
+import { unstable_cache } from "next/cache";
+
+import { CATALOG_REVALIDATE_SECONDS, CACHE_TAGS } from "@/lib/cache";
 import { NOTIFICATION_TYPES, ROUTES } from "@/lib/constants";
 import { dispatchNotification } from "@/features/notifications/services/notification.service";
 import {
@@ -10,13 +13,16 @@ import {
   createReport,
   createRequest,
   getPublishedReportForListing,
+  getReportWithFullImei,
   getRequestById,
   listActivePlans,
   listInspectorQueue,
   listRequestsForRequester,
   scheduleRequest,
   setReportPublished,
+  type InspectionReportOutcome,
 } from "@/features/inspections/repositories/inspection.repository";
+import { logImeiAccess } from "@/features/audit";
 import type {
   InspectionPlanDto,
   InspectionReportDto,
@@ -34,12 +40,21 @@ function warn(scope: string, error: unknown): void {
 
 /** Active packages for the request form + pricing page. Empty on any failure. */
 export async function getInspectionPlans(): Promise<InspectionPlanDto[]> {
-  try {
-    return await listActivePlans();
-  } catch (error) {
-    warn("could not load plans", error);
-    return [];
-  }
+  return unstable_cache(
+    async () => {
+      try {
+        return await listActivePlans();
+      } catch (error) {
+        warn("could not load plans", error);
+        return [];
+      }
+    },
+    ["inspection-plans"],
+    {
+      revalidate: CATALOG_REVALIDATE_SECONDS,
+      tags: [CACHE_TAGS.catalog],
+    },
+  )();
 }
 
 /** A buyer's own inspection requests. Empty on any failure. */
@@ -105,7 +120,7 @@ export async function requestInspection(
   return createRequest(input, requesterId);
 }
 
-/** Standalone booking — buyer describes the phone. Returns the new request id. */
+/** Standalone booking — buyer describes the device. Returns the new request id. */
 export async function bookInspection(
   input: BookInspectionInput,
   requesterId: string,
@@ -142,7 +157,7 @@ export async function scheduleInspection(
       userId: request.requester.id,
       type: NOTIFICATION_TYPES.INSPECTION_SCHEDULED,
       title: "Your inspection is scheduled",
-      body: `We'll inspect ${request.listing?.title ?? "the phone"} on ${scheduledAt.toLocaleString("en-PK")}.`,
+      body: `We'll inspect ${request.listing?.title ?? "the device"} on ${scheduledAt.toLocaleString("en-PK")}.`,
       url: ROUTES.inspections,
       email: true,
     }).catch((error) => warn("schedule notification failed", error));
@@ -154,9 +169,9 @@ export async function scheduleInspection(
 export async function submitInspectionReport(
   input: SubmitReportInput,
   inspectorId: string,
-): Promise<boolean> {
+): Promise<InspectionReportOutcome> {
   const result = await createReport(input, inspectorId);
-  if (!result) return false;
+  if (!result.ok) return result;
 
   await dispatchNotification({
     userId: result.requesterId,
@@ -167,7 +182,7 @@ export async function submitInspectionReport(
     email: true,
   }).catch((error) => warn("completion notification failed", error));
 
-  return true;
+  return result;
 }
 
 /** Buyer publishes/unpublishes their report onto the listing. */
@@ -177,4 +192,34 @@ export async function toggleReportPublished(
   isPublished: boolean,
 ): Promise<boolean> {
   return setReportPublished(reportId, requesterId, isPublished);
+}
+
+/**
+ * Gets a report with full IMEI for authorized users only.
+ * Authorization must be enforced by the caller (requester, assigned inspector, or admin).
+ * Logs the sensitive data access for security monitoring.
+ */
+export async function getReportWithFullImeiAuthorized(
+  reportId: string,
+  actorId: string,
+  ipAddress?: string,
+  userAgent?: string,
+): Promise<InspectionReportDto | null> {
+  try {
+    const report = await getReportWithFullImei(reportId);
+    if (report && report.imei) {
+      // Log the sensitive IMEI access
+      await logImeiAccess({
+        actorId,
+        dataType: "IMEI",
+        resourceId: reportId,
+        ipAddress,
+        userAgent,
+      }).catch((error) => warn("failed to log IMEI access", error));
+    }
+    return report;
+  } catch (error) {
+    warn("could not load report with full IMEI", error);
+    return null;
+  }
 }

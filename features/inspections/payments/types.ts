@@ -1,6 +1,6 @@
 import type { PaymentMethod } from "@/lib/constants";
 
-/** What the caller hands the gateway to start a checkout. */
+/** Provider-neutral details for gateways that support a checkout session. */
 export interface CheckoutRequest {
   /** Our inspection request id — used as the merchant order reference. */
   requestId: string;
@@ -30,16 +30,39 @@ export interface VerifiedPayment {
   status: PaymentOutcome;
 }
 
-/**
- * A payment gateway behind a stable interface. Swap the sandbox for a real
- * aggregator (PayFast/Safepay) without touching the service/UI. Every provider
- * covers JazzCash, Easypaisa and cards through the aggregator's hosted checkout.
- */
+export type PaymentVerificationStatus = "PAID" | "FAILED" | "PENDING";
+
+export type PayFastPaymentDetails =
+  | {
+      method: "card";
+      mobileNumber: string;
+      cardNumber: string;
+      expiryMonth: string;
+      expiryYear: string;
+      cvv: string;
+    }
+  | {
+      method: "jazzcash" | "easypaisa";
+      mobileNumber: string;
+      accountNumber: string;
+      cnicNumber: string;
+      accountTitle?: string;
+    };
+
+export interface PayFastChallenge {
+  continuation: string;
+  transactionId: string;
+  otpRequired: boolean;
+  threeDsHtml?: string;
+  threeDsNonce?: string;
+}
+
+/** Common interface for provider flows that support checkout-session verification. */
 export interface PaymentProvider {
   readonly id: string;
   /** True when real credentials are present; false → sandbox/no-op. */
   isConfigured(): boolean;
   createCheckout(input: CheckoutRequest): Promise<CheckoutSession>;
-  /** Verify a return/webhook payload and resolve the final status. */
+  /** Verify a provider return payload and resolve the final status. */
   verify(params: Record<string, string>): Promise<VerifiedPayment>;
 }

@@ -1,5 +1,5 @@
 -- CreateEnum
-CREATE TYPE "PtaStatus" AS ENUM ('PTA', 'NON_PTA', 'PATCHED', 'JV');
+CREATE TYPE "QuotePtaStatus" AS ENUM ('PTA', 'NON_PTA', 'PATCHED', 'JV');
 
 -- CreateEnum
 CREATE TYPE "QuoteStatus" AS ENUM ('ACTIVE', 'EXPIRED', 'ACCEPTED', 'INSPECTED', 'PAID');
@@ -8,18 +8,18 @@ CREATE TYPE "QuoteStatus" AS ENUM ('ACTIVE', 'EXPIRED', 'ACCEPTED', 'INSPECTED',
 CREATE TYPE "QuoteInspectionResult" AS ENUM ('MATCH', 'MISMATCH');
 
 -- CreateTable
-CREATE TABLE "phone_model" (
+CREATE TABLE "quote_price_book" (
     "id" TEXT NOT NULL,
     "brand" TEXT NOT NULL,
     "model" TEXT NOT NULL,
     "storage" TEXT NOT NULL,
-    "ptaStatus" "PtaStatus" NOT NULL,
+    "ptaStatus" "QuotePtaStatus" NOT NULL,
     "basePricePkr" DECIMAL(12,2) NOT NULL,
     "isActive" BOOLEAN NOT NULL DEFAULT true,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
-    CONSTRAINT "phone_model_pkey" PRIMARY KEY ("id")
+    CONSTRAINT "quote_price_book_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -55,7 +55,7 @@ CREATE TABLE "quote" (
     "brand" TEXT NOT NULL,
     "model" TEXT NOT NULL,
     "storage" TEXT NOT NULL,
-    "ptaStatus" "PtaStatus" NOT NULL,
+    "ptaStatus" "QuotePtaStatus" NOT NULL,
     "basePricePkr" DECIMAL(12,2) NOT NULL,
     "answers" JSONB NOT NULL,
     "photoUrls" JSONB NOT NULL,
@@ -83,13 +83,13 @@ CREATE TABLE "quote" (
 );
 
 -- CreateIndex
-CREATE INDEX "phone_model_brand_model_idx" ON "phone_model"("brand", "model");
+CREATE INDEX "quote_price_book_brand_model_idx" ON "quote_price_book"("brand", "model");
 
 -- CreateIndex
-CREATE INDEX "phone_model_isActive_idx" ON "phone_model"("isActive");
+CREATE INDEX "quote_price_book_isActive_idx" ON "quote_price_book"("isActive");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "phone_model_brand_model_storage_ptaStatus_key" ON "phone_model"("brand", "model", "storage", "ptaStatus");
+CREATE UNIQUE INDEX "quote_price_book_brand_model_storage_ptaStatus_key" ON "quote_price_book"("brand", "model", "storage", "ptaStatus");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "deduction_rule_key_key" ON "deduction_rule"("key");
@@ -110,4 +110,4 @@ CREATE INDEX "quote_createdAt_idx" ON "quote"("createdAt");
 ALTER TABLE "quote" ADD CONSTRAINT "quote_userId_fkey" FOREIGN KEY ("userId") REFERENCES "user"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "quote" ADD CONSTRAINT "quote_modelId_fkey" FOREIGN KEY ("modelId") REFERENCES "phone_model"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "quote" ADD CONSTRAINT "quote_modelId_fkey" FOREIGN KEY ("modelId") REFERENCES "quote_price_book"("id") ON DELETE SET NULL ON UPDATE CASCADE;

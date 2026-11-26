@@ -18,10 +18,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import type { AdminUserRow as AdminUserRowData } from "@/features/admin/types";
-import {
-  setUserBannedAction,
-  setUserRoleAction,
-} from "@/features/admin/actions/admin.actions";
+import { setUserBannedAction, setUserRoleAction } from "@/features/admin/actions/admin.actions";
 
 function initials(name: string): string {
   return (
@@ -53,14 +50,14 @@ export function AdminUserRow({ user, selfId }: { user: AdminUserRowData; selfId:
   }
 
   return (
-    <div className="flex items-center gap-3 p-3">
+    <div className="flex items-start gap-3 p-3 transition-colors hover:bg-white/[0.02] sm:items-center sm:px-4">
       <Avatar className="size-9 shrink-0">
         <AvatarFallback>{initials(user.name)}</AvatarFallback>
       </Avatar>
 
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="truncate font-medium">{user.name}</span>
+          <span className="truncate text-sm font-semibold text-slate-100">{user.name}</span>
           {isAdmin ? (
             <Badge variant="default" className="gap-1">
               <ShieldCheck className="size-3" />
@@ -74,8 +71,8 @@ export function AdminUserRow({ user, selfId }: { user: AdminUserRowData; selfId:
             </Badge>
           ) : null}
         </div>
-        <p className="text-muted-foreground truncate text-xs">{user.email}</p>
-        <p className="text-muted-foreground text-xs">
+        <p className="truncate text-xs text-slate-400">{user.email}</p>
+        <p className="text-xs text-slate-500">
           {user.listingCount} listings · joined {formatRelativeTime(user.createdAt)}
         </p>
       </div>
@@ -101,7 +98,9 @@ export function AdminUserRow({ user, selfId }: { user: AdminUserRowData; selfId:
         <DropdownMenuContent align="end">
           {isAdmin ? (
             <DropdownMenuItem
+              disabled={pending || isSelf}
               onClick={() =>
+                window.confirm(`Remove administrator access from ${user.name}?`) &&
                 run(
                   () => setUserRoleAction({ userId: user.id, role: USER_ROLES.USER }),
                   "Role updated to User",
@@ -113,7 +112,9 @@ export function AdminUserRow({ user, selfId }: { user: AdminUserRowData; selfId:
             </DropdownMenuItem>
           ) : (
             <DropdownMenuItem
+              disabled={pending}
               onClick={() =>
+                window.confirm(`Grant administrator access to ${user.name}?`) &&
                 run(
                   () => setUserRoleAction({ userId: user.id, role: USER_ROLES.ADMIN }),
                   "Promoted to Admin",
@@ -129,11 +130,9 @@ export function AdminUserRow({ user, selfId }: { user: AdminUserRowData; selfId:
 
           {user.banned ? (
             <DropdownMenuItem
+              disabled={pending}
               onClick={() =>
-                run(
-                  () => setUserBannedAction({ userId: user.id, banned: false }),
-                  "User unbanned",
-                )
+                run(() => setUserBannedAction({ userId: user.id, banned: false }), "User unbanned")
               }
             >
               <UserCheck className="size-4" />
@@ -142,8 +141,9 @@ export function AdminUserRow({ user, selfId }: { user: AdminUserRowData; selfId:
           ) : (
             <DropdownMenuItem
               variant="destructive"
-              disabled={isSelf}
+              disabled={isSelf || pending}
               onClick={() =>
+                window.confirm(`Ban ${user.name} from the marketplace?`) &&
                 run(() => setUserBannedAction({ userId: user.id, banned: true }), "User banned")
               }
             >

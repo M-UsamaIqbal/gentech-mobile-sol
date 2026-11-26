@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import type { Metadata } from "next";
 
 import { getCategoriesWithCounts } from "@/features/marketplace/services/category.service";

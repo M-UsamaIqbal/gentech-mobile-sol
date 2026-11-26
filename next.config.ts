@@ -1,8 +1,11 @@
 import type { NextConfig } from "next";
+import createNextIntlPlugin from "next-intl/plugin";
 
 // OpenNext dev shim: makes Cloudflare bindings available when running `next dev`.
 // Harmless no-op in production builds.
 import { initOpenNextCloudflareForDev } from "@opennextjs/cloudflare";
+
+const withNextIntl = createNextIntlPlugin("./i18n.ts")
 
 const nextConfig: NextConfig = {
   images: {
@@ -18,7 +21,9 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default nextConfig;
+export default withNextIntl(nextConfig);
 
 // Must be called after the config is defined; enables `getCloudflareContext()` in dev.
-void initOpenNextCloudflareForDev();
+if (process.env.NODE_ENV === "development") {
+  void initOpenNextCloudflareForDev();
+}

@@ -3,6 +3,7 @@ import "server-only";
 import { prisma } from "@/lib/prisma";
 import { Prisma } from "@/lib/generated/prisma/client";
 import {
+  INSPECTION_KINDS,
   INSPECTION_PAYMENT_STATUSES,
   INSPECTION_STATUSES,
   type InspectionItemResult,
@@ -12,12 +13,23 @@ import {
   type PaymentMethod,
 } from "@/lib/constants";
 import { slugify } from "@/utils/slug";
+import { addHistoryEvent } from "@/features/phone-history/services/phone-history.service";
 import type {
   InspectionPlanDto,
   InspectionReportDto,
   InspectionRequestDto,
 } from "@/features/inspections/types";
 import { computeOverallScore, scoreToGrade } from "@/features/inspections/lib/grade";
+import {
+  CLAIMABLE_STATUSES,
+  SCHEDULABLE_STATUSES,
+  canSubmitInspectionReport,
+} from "@/features/inspections/lib/inspection-state";
+import { maskReportImei } from "@/features/inspections/lib/imei";
+import {
+  inspectionKindForCategory,
+  resolveInspectionKind,
+} from "@/features/inspections/lib/inspection-kind";
 import type {
   BookInspectionInput,
   InspectionPlanInput,
@@ -81,6 +93,7 @@ const requestSelect = {
   paymentMethod: true,
   paidAt: true,
   deviceInfo: true,
+  inspectionKind: true,
   contactName: true,
   contactPhone: true,
   city: true,
@@ -101,6 +114,7 @@ const requestSelect = {
       slug: true,
       price: true,
       currency: true,
+      category: { select: { slug: true } },
       images: {
         where: { isPrimary: true },
         take: 1,
@@ -140,14 +154,14 @@ function toPlanDto(row: PlanRow): InspectionPlanDto {
   };
 }
 
-function toReportDto(row: ReportRow): InspectionReportDto {
+function toReportDto(row: ReportRow, includeFullImei: boolean = false): InspectionReportDto {
   return {
     id: row.id,
     overallScore: row.overallScore,
     grade: row.grade,
     verdict: row.verdict as InspectionVerdict,
     summary: row.summary,
-    imei: row.imei,
+    imei: includeFullImei ? row.imei : maskReportImei(row.imei),
     ptaApproved: row.ptaApproved,
     batteryHealth: row.batteryHealth,
     isPublished: row.isPublished,
@@ -190,6 +204,7 @@ function toRequestDto(row: RequestRow): InspectionRequestDto {
     paymentMethod: (row.paymentMethod as PaymentMethod | null) ?? null,
     paidAt: row.paidAt ? row.paidAt.toISOString() : null,
     deviceInfo: row.deviceInfo,
+    inspectionKind: resolveInspectionKind(row.inspectionKind, row.listing?.category.slug),
     contactName: row.contactName,
     contactPhone: row.contactPhone,
     city: row.city,
@@ -202,7 +217,7 @@ function toRequestDto(row: RequestRow): InspectionRequestDto {
     cancelReason: row.cancelReason,
     requester: { id: row.requester.id, name: row.requester.name },
     inspector: row.inspector ? { id: row.inspector.id, name: row.inspector.name } : null,
-    report: row.report ? toReportDto(row.report) : null,
+    report: row.report ? toReportDto(row.report, false) : null,
     createdAt: row.createdAt.toISOString(),
   };
 }
@@ -281,15 +296,50 @@ export async function setPlanActive(id: string, isActive: boolean): Promise<void
 // Requests
 // ---------------------------------------------------------------------------
 
+async function resolveRequestLocation(input: {
+  countryId: string;
+  cityId: string;
+  areaId?: string;
+}) {
+  const city = await prisma.city.findFirst({
+    where: {
+      id: input.cityId,
+      countryId: input.countryId,
+      isActive: true,
+      country: { isActive: true },
+    },
+    select: {
+      id: true,
+      name: true,
+      areas: {
+        where: { id: input.areaId || undefined, isActive: true },
+        select: { id: true, name: true },
+        take: 1,
+      },
+    },
+  });
+  if (!city) throw new Error("Choose an active city in the selected country.");
+  const area = input.areaId ? city.areas[0] : undefined;
+  if (input.areaId && !area) throw new Error("Choose an active area in the selected city.");
+  return { city, area };
+}
+
 /** Creates a request, snapshotting the plan's name + price onto it. Returns the id. */
 export async function createRequest(
   input: RequestInspectionInput,
   requesterId: string,
 ): Promise<string> {
-  const plan = await prisma.inspectionPlan.findUnique({
-    where: { id: input.planId },
-    select: { id: true, name: true, price: true, currency: true, isActive: true },
-  });
+  const { city, area } = await resolveRequestLocation(input);
+  const [plan, listing] = await Promise.all([
+    prisma.inspectionPlan.findUnique({
+      where: { id: input.planId },
+      select: { id: true, name: true, price: true, currency: true, isActive: true },
+    }),
+    prisma.listing.findUnique({
+      where: { id: input.listingId },
+      select: { category: { select: { slug: true } } },
+    }),
+  ]);
   if (!plan || !plan.isActive) {
     throw new Error("Selected inspection package is unavailable.");
   }
@@ -300,6 +350,7 @@ export async function createRequest(
     data: {
       status: INSPECTION_STATUSES.REQUESTED,
       listingId: input.listingId,
+      inspectionKind: inspectionKindForCategory(listing?.category.slug),
       requesterId,
       planId: plan.id,
       planName: plan.name,
@@ -307,8 +358,10 @@ export async function createRequest(
       currency: plan.currency,
       contactName: input.contactName,
       contactPhone: input.contactPhone,
-      city: input.city,
-      area: input.area,
+      city: city.name,
+      cityId: city.id,
+      area: area?.name,
+      areaId: area?.id,
       address: input.address,
       notes: input.notes,
       preferredAt: preferredAt && !Number.isNaN(preferredAt.getTime()) ? preferredAt : null,
@@ -319,21 +372,35 @@ export async function createRequest(
 }
 
 /**
- * Standalone booking: the buyer describes the phone (`deviceInfo`) rather than
- * selecting a listing. Snapshots the plan fee. Returns the new request id.
+ * Standalone booking: the buyer describes the device (`deviceInfo`) and selects
+ * its family rather than picking a listing. Snapshots the plan fee. Returns the id.
  */
 export async function createBooking(
   input: BookInspectionInput,
   requesterId: string,
 ): Promise<string> {
-  const plan = await prisma.inspectionPlan.findUnique({
-    where: { id: input.planId },
-    select: { id: true, name: true, price: true, currency: true, isActive: true },
-  });
+  const { city, area } = await resolveRequestLocation(input);
+  const [plan, listing] = await Promise.all([
+    prisma.inspectionPlan.findUnique({
+      where: { id: input.planId },
+      select: { id: true, name: true, price: true, currency: true, isActive: true },
+    }),
+    input.listingId
+      ? prisma.listing.findUnique({
+          where: { id: input.listingId },
+          select: { category: { select: { slug: true } } },
+        })
+      : Promise.resolve(null),
+  ]);
   if (!plan || !plan.isActive) {
     throw new Error("Selected inspection package is unavailable.");
   }
 
+  // Listing-backed bookings always use the listing's category, even if a client
+  // sends a conflicting family. Only standalone bookings honour the selector.
+  const kind = input.listingId
+    ? inspectionKindForCategory(listing?.category.slug)
+    : (input.inspectionKind ?? INSPECTION_KINDS.PHONE);
   const preferredAt = input.preferredAt ? new Date(input.preferredAt) : null;
 
   const created = await prisma.inspectionRequest.create({
@@ -341,6 +408,7 @@ export async function createBooking(
       status: INSPECTION_STATUSES.REQUESTED,
       listingId: input.listingId ?? null,
       deviceInfo: input.deviceInfo,
+      inspectionKind: kind,
       requesterId,
       planId: plan.id,
       planName: plan.name,
@@ -348,8 +416,10 @@ export async function createBooking(
       currency: plan.currency,
       contactName: input.contactName,
       contactPhone: input.contactPhone,
-      city: input.city,
-      area: input.area,
+      city: city.name,
+      cityId: city.id,
+      area: area?.name,
+      areaId: area?.id,
       address: input.address,
       notes: input.notes,
       preferredAt: preferredAt && !Number.isNaN(preferredAt.getTime()) ? preferredAt : null,
@@ -372,6 +442,7 @@ export async function listRequestsForRequester(
     where: { requesterId },
     orderBy: { createdAt: "desc" },
     select: requestSelect,
+    take: 100,
   });
   return rows.map(toRequestDto);
 }
@@ -412,30 +483,42 @@ export async function listInspectorQueue(
     where,
     orderBy: [{ status: "asc" }, { createdAt: "desc" }],
     select: requestSelect,
+    take: 100,
   });
   return rows.map(toRequestDto);
 }
 
-/** Assigns the request to an inspector (only if currently unassigned). Returns success. */
+/** Assigns the request to an inspector (only if unassigned and still open). */
 export async function assignInspector(
   requestId: string,
   inspectorId: string,
 ): Promise<boolean> {
   const result = await prisma.inspectionRequest.updateMany({
-    where: { id: requestId, inspectorId: null },
+    where: {
+      id: requestId,
+      inspectorId: null,
+      status: { in: [...CLAIMABLE_STATUSES] },
+    },
     data: { inspectorId },
   });
   return result.count > 0;
 }
 
-/** Sets the scheduled slot + moves to SCHEDULED. Scoped to the assigned inspector. */
+/**
+ * Sets the scheduled slot + moves to SCHEDULED. Scoped to the assigned inspector
+ * and to non-terminal states, so a completed/cancelled request cannot regress.
+ */
 export async function scheduleRequest(
   requestId: string,
   inspectorId: string,
   scheduledAt: Date,
 ): Promise<boolean> {
   const result = await prisma.inspectionRequest.updateMany({
-    where: { id: requestId, inspectorId },
+    where: {
+      id: requestId,
+      inspectorId,
+      status: { in: [...SCHEDULABLE_STATUSES] },
+    },
     data: { status: INSPECTION_STATUSES.SCHEDULED, scheduledAt },
   });
   return result.count > 0;
@@ -485,9 +568,12 @@ export async function getPayableRequest(
 ): Promise<{
   id: string;
   feeAmount: number;
+  feeAmountDecimal: string;
   currency: string;
   contactName: string | null;
   contactPhone: string | null;
+  paymentStatus: (typeof INSPECTION_PAYMENT_STATUSES)[keyof typeof INSPECTION_PAYMENT_STATUSES];
+  paymentRef: string | null;
 } | null> {
   const row = await prisma.inspectionRequest.findFirst({
     where: {
@@ -502,19 +588,24 @@ export async function getPayableRequest(
       currency: true,
       contactName: true,
       contactPhone: true,
+      paymentStatus: true,
+      paymentRef: true,
     },
   });
   if (!row) return null;
   return {
     id: row.id,
     feeAmount: Number(row.feeAmount),
+    feeAmountDecimal: row.feeAmount.toFixed(2),
     currency: row.currency,
     contactName: row.contactName,
     contactPhone: row.contactPhone,
+    paymentStatus: row.paymentStatus,
+    paymentRef: row.paymentRef,
   };
 }
 
-/** Records the chosen method + gateway reference when a checkout is started. */
+/** Stores only the provider transaction id while awaiting customer authentication. */
 export async function recordPaymentIntent(
   id: string,
   requesterId: string,
@@ -522,8 +613,22 @@ export async function recordPaymentIntent(
   method: PaymentMethod,
 ): Promise<boolean> {
   const result = await prisma.inspectionRequest.updateMany({
-    where: { id, requesterId, paymentStatus: { not: INSPECTION_PAYMENT_STATUSES.PAID } },
-    data: { paymentRef: reference, paymentMethod: method },
+    where: {
+      id,
+      requesterId,
+      paymentStatus: {
+        in: [
+          INSPECTION_PAYMENT_STATUSES.UNPAID,
+          INSPECTION_PAYMENT_STATUSES.FAILED,
+          INSPECTION_PAYMENT_STATUSES.AWAITING_CUSTOMER,
+        ],
+      },
+    },
+    data: {
+      paymentRef: reference,
+      paymentMethod: method,
+      paymentStatus: INSPECTION_PAYMENT_STATUSES.AWAITING_CUSTOMER,
+    },
   });
   return result.count > 0;
 }
@@ -532,10 +637,21 @@ export async function recordPaymentIntent(
 export async function markRequestPaid(
   id: string,
   requesterId: string,
+  reference: string,
   method?: PaymentMethod,
 ): Promise<boolean> {
   const result = await prisma.inspectionRequest.updateMany({
-    where: { id, requesterId, paymentStatus: { not: INSPECTION_PAYMENT_STATUSES.PAID } },
+    where: {
+      id,
+      requesterId,
+      paymentRef: reference,
+      paymentStatus: {
+        notIn: [
+          INSPECTION_PAYMENT_STATUSES.PAID,
+          INSPECTION_PAYMENT_STATUSES.REFUNDED,
+        ],
+      },
+    },
     data: {
       paymentStatus: INSPECTION_PAYMENT_STATUSES.PAID,
       paidAt: new Date(),
@@ -549,10 +665,57 @@ export async function markRequestPaid(
 export async function markRequestPaymentFailed(
   id: string,
   requesterId: string,
+  reference: string,
 ): Promise<boolean> {
   const result = await prisma.inspectionRequest.updateMany({
-    where: { id, requesterId, paymentStatus: INSPECTION_PAYMENT_STATUSES.UNPAID },
+    where: {
+      id,
+      requesterId,
+      paymentRef: reference,
+      paymentStatus: {
+        in: [
+          INSPECTION_PAYMENT_STATUSES.PENDING,
+          INSPECTION_PAYMENT_STATUSES.PROCESSING,
+        ],
+      },
+    },
     data: { paymentStatus: INSPECTION_PAYMENT_STATUSES.FAILED },
+  });
+  return result.count > 0;
+}
+
+/** Keeps an accepted PayFast attempt eligible for provider status checks. */
+export async function markRequestPaymentPending(
+  id: string,
+  requesterId: string,
+  reference: string,
+): Promise<boolean> {
+  const result = await prisma.inspectionRequest.updateMany({
+    where: {
+      id,
+      requesterId,
+      paymentRef: reference,
+      paymentStatus: INSPECTION_PAYMENT_STATUSES.PROCESSING,
+    },
+    data: { paymentStatus: INSPECTION_PAYMENT_STATUSES.PENDING },
+  });
+  return result.count > 0;
+}
+
+/** Allows a single request to submit the tokenized payment to PayFast. */
+export async function claimPaymentProcessing(
+  id: string,
+  requesterId: string,
+  reference: string,
+): Promise<boolean> {
+  const result = await prisma.inspectionRequest.updateMany({
+    where: {
+      id,
+      requesterId,
+      paymentRef: reference,
+      paymentStatus: INSPECTION_PAYMENT_STATUSES.AWAITING_CUSTOMER,
+    },
+    data: { paymentStatus: INSPECTION_PAYMENT_STATUSES.PROCESSING },
   });
   return result.count > 0;
 }
@@ -561,34 +724,86 @@ export async function markRequestPaymentFailed(
 // Reports
 // ---------------------------------------------------------------------------
 
+/** Why a graded report could not be created; mapped to a user message by the action. */
+export type InspectionReportOutcome =
+  | { ok: true; requesterId: string; listingId: string | null }
+  | {
+      ok: false;
+      reason: "NOT_ASSIGNED" | "ALREADY_REPORTED" | "NOT_REPORTABLE" | "UNPAID";
+    };
+
 /**
  * Creates the report for a request, computes its score/grade, and flips the request
- * to COMPLETED — all in one transaction. Scoped to the assigned inspector. Returns
- * the requester id (for notification) or null if the request wasn't theirs to report.
+ * to COMPLETED — all in one transaction. Scoped to the assigned inspector, refuses
+ * terminal requests, and requires the fee to be paid before the report is released.
  */
 export async function createReport(
   input: SubmitReportInput,
   inspectorId: string,
-): Promise<{ requesterId: string; listingId: string | null } | null> {
+): Promise<InspectionReportOutcome> {
   const request = await prisma.inspectionRequest.findUnique({
     where: { id: input.requestId },
-    select: { id: true, inspectorId: true, requesterId: true, listingId: true, report: { select: { id: true } } },
+    select: {
+      id: true,
+      inspectorId: true,
+      requesterId: true,
+      listingId: true,
+      inspectionKind: true,
+      status: true,
+      paymentStatus: true,
+      listing: { select: { category: { select: { slug: true } } } },
+      report: { select: { id: true } },
+    },
   });
-  if (!request || request.inspectorId !== inspectorId || request.report) return null;
+  if (!request || request.inspectorId !== inspectorId) {
+    return { ok: false, reason: "NOT_ASSIGNED" };
+  }
+  if (request.report) return { ok: false, reason: "ALREADY_REPORTED" };
+  if (
+    !canSubmitInspectionReport({
+      status: request.status as InspectionStatus,
+      paymentStatus: request.paymentStatus as InspectionPaymentStatus,
+    })
+  ) {
+    return {
+      ok: false,
+      reason:
+        request.paymentStatus === INSPECTION_PAYMENT_STATUSES.PAID
+          ? "NOT_REPORTABLE"
+          : "UNPAID",
+    };
+  }
 
+  const kind = resolveInspectionKind(request.inspectionKind, request.listing?.category.slug);
+  const isPhoneInspection = kind === INSPECTION_KINDS.PHONE;
   const overallScore = computeOverallScore(input.items);
   const grade = scoreToGrade(overallScore);
 
-  await prisma.$transaction([
-    prisma.inspectionReport.create({
+  // Claim completion inside the transaction so a concurrent cancellation or a
+  // double submission can never write a report against a stale state.
+  const completed = await prisma.$transaction(async (tx) => {
+    const claimed = await tx.inspectionRequest.updateMany({
+      where: {
+        id: input.requestId,
+        inspectorId,
+        status: { in: [...SCHEDULABLE_STATUSES] },
+        paymentStatus: INSPECTION_PAYMENT_STATUSES.PAID,
+      },
+      data: { status: INSPECTION_STATUSES.COMPLETED, completedAt: new Date() },
+    });
+    if (claimed.count === 0) return false;
+
+    await tx.inspectionReport.create({
       data: {
         requestId: input.requestId,
         overallScore,
         grade,
         verdict: input.verdict,
         summary: input.summary,
-        imei: input.imei,
-        ptaApproved: input.ptaApproved,
+        // Laptop reports never carry phone-only identity signals, even if a
+        // client sends them. Server-side normalisation keeps published data clean.
+        imei: isPhoneInspection ? input.imei : null,
+        ptaApproved: isPhoneInspection ? input.ptaApproved : null,
         batteryHealth: input.batteryHealth,
         items: {
           create: input.items.map((item, index) => ({
@@ -610,14 +825,33 @@ export async function createReport(
           })),
         },
       },
-    }),
-    prisma.inspectionRequest.update({
-      where: { id: input.requestId },
-      data: { status: INSPECTION_STATUSES.COMPLETED, completedAt: new Date() },
-    }),
-  ]);
+    });
+    return true;
+  });
 
-  return { requesterId: request.requesterId, listingId: request.listingId };
+  if (!completed) return { ok: false, reason: "ALREADY_REPORTED" };
+
+  // Phone history tracks device identity only; laptop inspections must not pollute it.
+  if (isPhoneInspection && request.listingId) {
+    await addHistoryEvent({
+      listingId: request.listingId,
+      eventType: "INSPECTION",
+      title: "Inspection Completed",
+      description: `Overall score: ${overallScore}/100 (${grade})`,
+      status: grade === "A" || grade === "B" ? "PASS" : grade === "C" ? "WARNING" : "FAIL",
+      source: "inspection",
+      sourceId: input.requestId,
+      metadata: {
+        overallScore,
+        grade,
+        verdict: input.verdict,
+        ptaApproved: input.ptaApproved,
+        batteryHealth: input.batteryHealth,
+      },
+    }).catch((error) => console.warn("[inspection] failed to create history event:", error));
+  }
+
+  return { ok: true, requesterId: request.requesterId, listingId: request.listingId };
 }
 
 /** Publishes/unpublishes a report so it shows on the listing. Requester-scoped. */
@@ -642,5 +876,19 @@ export async function getPublishedReportForListing(
     orderBy: { publishedAt: "desc" },
     select: reportSelect,
   });
-  return row ? toReportDto(row) : null;
+  return row ? toReportDto(row, false) : null;
+}
+
+/**
+ * Gets a report with full IMEI for authorized users (requester, assigned inspector, or admin).
+ * This should be called from the service layer after authorization checks.
+ */
+export async function getReportWithFullImei(
+  reportId: string,
+): Promise<InspectionReportDto | null> {
+  const row = await prisma.inspectionReport.findUnique({
+    where: { id: reportId },
+    select: reportSelect,
+  });
+  return row ? toReportDto(row, true) : null;
 }

@@ -2,6 +2,8 @@ import {
   BatteryCharging,
   Cable,
   Headphones,
+  Keyboard,
+  Laptop,
   Phone,
   Shield,
   Smartphone,
@@ -20,6 +22,8 @@ const ICONS: Record<string, LucideIcon> = {
   "battery-charging": BatteryCharging,
   shield: Shield,
   phone: Phone,
+  laptop: Laptop,
+  keyboard: Keyboard,
 };
 
 export function CategoryIcon({ name, className }: { name?: string; className?: string }) {

@@ -72,7 +72,7 @@ export function NotificationBell({
       >
         <Bell className="size-5" />
         {count > 0 ? (
-          <span className="bg-primary text-primary-foreground absolute -top-0.5 -right-0.5 grid min-w-4 place-items-center rounded-full px-1 text-[10px] font-medium">
+          <span className="bg-primary text-primary-foreground absolute -top-0.5 -right-0.5 grid min-w-4 place-items-center rounded-full px-1 text-xs font-medium">
             {count > 9 ? "9+" : count}
           </span>
         ) : null}
@@ -112,7 +112,7 @@ export function NotificationBell({
                 {item.body ? (
                   <span className="text-muted-foreground block truncate text-xs">{item.body}</span>
                 ) : null}
-                <span className="text-muted-foreground block text-[10px]">
+                <span className="text-muted-foreground block text-xs">
                   {formatRelativeTime(item.createdAt)}
                 </span>
               </span>

@@ -1,6 +1,5 @@
 "use client";
 
-import * as React from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useForm } from "react-hook-form";
@@ -41,12 +40,6 @@ export function SignInForm({ providers }: { providers: EnabledSocialProviders })
     });
 
     if (error) {
-      // 403 = email not verified — guide the user to verification.
-      if (error.status === 403) {
-        toast.error("Please verify your email before signing in.");
-        router.push(`${ROUTES.verifyEmail}?email=${encodeURIComponent(values.email)}`);
-        return;
-      }
       toast.error(error.message ?? "Invalid email or password.");
       return;
     }
@@ -116,8 +109,7 @@ export function SignInForm({ providers }: { providers: EnabledSocialProviders })
       </Form>
 
       <p className="text-muted-foreground text-center text-sm">
-        New to {""}
-        <span className="font-medium">the marketplace?</span>{" "}
+        New to <span className="font-medium">the marketplace?</span>{" "}
         <Link
           href={ROUTES.signUp}
           className="text-foreground font-medium underline-offset-4 hover:underline"

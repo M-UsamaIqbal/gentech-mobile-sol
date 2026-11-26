@@ -22,6 +22,12 @@ enum Role {
   ADMIN
 }
 
+// Region enum for multi-tenant data isolation (Bahrain / Pakistan).
+enum Region {
+  BAHRAIN
+  PAKISTAN
+}
+
 // ---------------------------------------------------------------------------
 // Better Auth core models (field names must match Better Auth's expectations).
 // ---------------------------------------------------------------------------
@@ -37,6 +43,11 @@ model User {
 
   // Application fields
   role      Role      @default(USER)
+  region    Region    @default(PAKISTAN)
+  // Independent localization preferences. Null means "not explicitly saved";
+  // detection then continues with cookies, browser hint, and country default.
+  preferredLocale  String?
+  preferredCountry String?
   banned    Boolean   @default(false)
   banReason String?
   deletedAt DateTime?
@@ -47,25 +58,44 @@ model User {
   profile  Profile?
 
   // Relations — marketplace
-  listings              Listing[]
-  favorites             Favorite[]
-  savedSearches         SavedSearch[]
-  sentMessages          Message[]      @relation("MessageSender")
-  buyerConversations    Conversation[] @relation("ConversationBuyer")
-  sellerConversations   Conversation[] @relation("ConversationSeller")
-  reviewsAuthored       Review[]       @relation("ReviewAuthor")
-  reviewsReceived       Review[]       @relation("ReviewTarget")
-  reportsFiled          Report[]       @relation("ReportReporter")
-  reportsAgainst        Report[]       @relation("ReportTargetUser")
-  notifications         Notification[]
+  listings            Listing[]
+  favorites           Favorite[]
+  savedSearches       SavedSearch[]
+  sentMessages        Message[]      @relation("MessageSender")
+  buyerConversations  Conversation[] @relation("ConversationBuyer")
+  sellerConversations Conversation[] @relation("ConversationSeller")
+  reviewsAuthored     Review[]       @relation("ReviewAuthor")
+  reviewsReceived     Review[]       @relation("ReviewTarget")
+  reportsFiled        Report[]       @relation("ReportReporter")
+  reportsAgainst      Report[]       @relation("ReportTargetUser")
+  notifications       Notification[]
 
   // Relations — inspections
   inspectionRequests  InspectionRequest[] @relation("InspectionRequester")
   inspectionsAssigned InspectionRequest[] @relation("InspectionInspector")
-  phoneVerifications  PhoneVerification[]
 
-  // Relations — sell-your-phone quotes
-  quotes Quote[]
+  // Relations — audit
+  auditLogs AuditLog[]
+
+  // Relations — dealer
+  dealerUsers DealerUser[]
+
+  // Relations — phone intelligence
+  phoneModelReviews PhoneModelReview[]
+  sellerVerifications SellerVerification[]
+  phoneComparisons  PhoneComparison[]
+  verifiedImeis     ImeiVerification[] @relation("ImeiVerificationUser")
+
+  // Relations — dealer leads
+  dealerLeads DealerLead[] @relation("DealerLeads")
+
+  // Relations — cart & orders
+  cartItems CartItem[]
+  orders    Order[] @relation("CustomerOrders")
+
+  // Relations — phone verification & buy-back quotes
+  phoneVerifications PhoneVerification[]
+  quotes             Quote[]
 
   @@index([role])
   @@map("user")
@@ -133,12 +163,13 @@ model Profile {
   phone      String?
   coverImage String?
   // Location (denormalised; PostGIS geometry added in the discovery phase)
-  city       String?
-  address    String?
-  latitude   Float?
-  longitude  Float?
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  city         String?
+  address      String?
+  latitude     Float?
+  longitude    Float?
+  region       Region   @default(PAKISTAN)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
   @@map("profile")
 }
@@ -159,7 +190,9 @@ enum ListingCondition {
 /// Lifecycle state machine for a listing.
 enum ListingStatus {
   DRAFT
+  PENDING_APPROVAL
   ACTIVE
+  REJECTED
   SOLD
   EXPIRED
   REMOVED
@@ -175,6 +208,8 @@ model Category {
   image       String?
   position    Int     @default(0)
   isActive    Boolean @default(true)
+  /// Country/region this category is available in. NULL means available in all countries.
+  region      Region? @default(PAKISTAN)
 
   parentId String?
   parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
@@ -187,6 +222,7 @@ model Category {
 
   @@index([parentId])
   @@index([isActive])
+  @@index([region])
   @@map("category")
 }
 
@@ -199,7 +235,8 @@ model Brand {
   position Int     @default(0)
   isActive Boolean @default(true)
 
-  listings Listing[]
+  listings    Listing[]
+  phoneModels PhoneModel[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -208,18 +245,21 @@ model Brand {
 }
 
 model Listing {
-  id          String  @id @default(cuid())
+  id          String @id @default(cuid())
   title       String
-  slug        String  @unique
+  slug        String @unique
   description String
 
   // Pricing — ALWAYS Decimal, never Float.
-  price      Decimal @db.Decimal(12, 2)
+  price      Decimal @db.Decimal(12, 3)
   currency   String  @default("PKR")
   negotiable Boolean @default(false)
 
   condition ListingCondition
   status    ListingStatus    @default(ACTIVE)
+
+  // Region isolation — which market this listing belongs to
+  region      Region    @default(PAKISTAN)
 
   /// Category-specific structured attributes (storage, ram, color, batteryHealth,
   /// ptaApproved, ...). Validated by a per-category Zod schema at the app layer.
@@ -235,12 +275,16 @@ model Listing {
   // Location (denormalised; PostGIS geometry added in the discovery phase)
   city      String?
   area      String?
+  cityId    String?
+  cityRef   City?   @relation(fields: [cityId], references: [id], onDelete: SetNull)
+  areaId    String?
+  areaRef   Area?   @relation(fields: [areaId], references: [id], onDelete: SetNull)
   latitude  Float?
   longitude Float?
 
   // Engagement metrics
-  views         Int     @default(0)
-  isFeatured    Boolean @default(false)
+  views         Int       @default(0)
+  isFeatured    Boolean   @default(false)
   featuredUntil DateTime?
 
   // Relations
@@ -253,12 +297,27 @@ model Listing {
   brandId String?
   brand   Brand?  @relation(fields: [brandId], references: [id], onDelete: SetNull)
 
-  images        ListingImage[]
-  favorites     Favorite[]
-  conversations Conversation[]
-  reports       Report[]
-  reviews       Review[]
-  inspections   InspectionRequest[]
+  dealerId String?
+  dealer   Dealer? @relation(fields: [dealerId], references: [id], onDelete: SetNull)
+
+  images          ListingImage[]
+  model3d         ListingModel?
+  favorites       Favorite[]
+  conversations   Conversation[]
+  reports         Report[]
+  reviews         Review[]
+  inspections     InspectionRequest[]
+  dealerInventory DealerInventory[]
+  history         PhoneHistory[]
+  dealerLeads     DealerLead[]
+  promotions      ListingPromotion[]  @relation("ListingPromotions")
+  cartItems       CartItem[]
+  orderItems      OrderItem[]
+
+  // Approval workflow
+  rejectionReason String?
+  reviewedAt      DateTime?
+  reviewedById    String?
 
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
@@ -267,11 +326,19 @@ model Listing {
   deletedAt DateTime?
 
   @@index([status, createdAt])
+  @@index([region, status, createdAt])
+  @@index([region, isFeatured, createdAt])
+  @@index([status, price])
+  @@index([status, views])
   @@index([categoryId, status])
   @@index([brandId])
   @@index([sellerId])
   @@index([isFeatured, status])
   @@index([city])
+  @@index([region, city])
+  @@index([region, area])
+  @@index([cityId])
+  @@index([areaId])
   @@index([searchVector], type: Gin)
   @@map("listing")
 }
@@ -295,6 +362,40 @@ model ListingImage {
   @@map("listing_image")
 }
 
+/**
+ * Optional 3D asset for a listing. Ordinary photographs remain the source of
+ * truth. A model is either genuinely supplied by the seller or generated in the
+ * seller's browser from one of their uploaded photos, and its provenance is
+ * always stored with the asset.
+ */
+model ListingModel {
+  id        String @id @default(cuid())
+  url       String
+  publicId  String
+  format    String // GLB | GLTF
+  sizeBytes Int
+  /// Supporting assets for GLTF: [{ uri, url, publicId }]
+  assets    Json?
+
+  /// UPLOADED | GENERATED — never inferred from a buyer-facing URL.
+  sourceType        String @default("UPLOADED")
+  /// GENERATING | READY | FAILED — terminal state persisted with the asset.
+  processingStatus  String @default("READY")
+  sourceImageUrl    String?
+  sourceImagePublicId String?
+  generator         String?
+  generatorVersion  String?
+  generationReceipt Json?
+
+  listingId String  @unique
+  listing   Listing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("listing_model")
+}
+
 // ---------------------------------------------------------------------------
 // Engagement: favorites + saved searches.
 // ---------------------------------------------------------------------------
@@ -311,16 +412,18 @@ model Favorite {
   createdAt DateTime @default(now())
 
   @@unique([userId, listingId])
+  @@index([userId, createdAt])
   @@index([listingId])
   @@map("favorite")
 }
 
 model SavedSearch {
-  id      String  @id @default(cuid())
-  name    String?
+  id            String  @id @default(cuid())
+  name          String?
   /// The query string + structured filters (category, price range, condition, ...).
-  query   String?
-  filters Json?
+  query         String?
+  filters       Json?
+  alertsEnabled Boolean @default(true)
 
   userId String
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -383,7 +486,7 @@ model Message {
 // ---------------------------------------------------------------------------
 
 model Review {
-  id      String @id @default(cuid())
+  id      String  @id @default(cuid())
   rating  Int // 1..5, enforced at the application layer
   comment String?
 
@@ -453,6 +556,7 @@ enum NotificationType {
   LISTING_EXPIRED
   NEW_REVIEW
   PRICE_DROP
+  SAVED_SEARCH_MATCH
   SYSTEM
   INSPECTION_REQUESTED
   INSPECTION_SCHEDULED
@@ -474,6 +578,7 @@ model Notification {
   createdAt DateTime  @default(now())
 
   @@index([userId, readAt])
+  @@index([userId, type, createdAt])
   @@map("notification")
 }
 
@@ -497,6 +602,9 @@ enum InspectionStatus {
 /// Payment state of the inspection fee.
 enum InspectionPaymentStatus {
   UNPAID
+  AWAITING_CUSTOMER
+  PENDING
+  PROCESSING
   PAID
   REFUNDED
   FAILED
@@ -524,7 +632,7 @@ model InspectionPlan {
   slug        String  @unique
   description String?
   /// Fee — ALWAYS Decimal, never Float.
-  price       Decimal @db.Decimal(12, 2)
+  price       Decimal @db.Decimal(12, 3)
   currency    String  @default("PKR")
   /// How many checkpoints this tier covers (for marketing copy).
   checkpoints Int     @default(0)
@@ -562,7 +670,7 @@ model InspectionRequest {
   planId    String?
   plan      InspectionPlan? @relation(fields: [planId], references: [id], onDelete: SetNull)
   planName  String?
-  feeAmount Decimal         @db.Decimal(12, 2)
+  feeAmount Decimal         @db.Decimal(12, 3)
   currency  String          @default("PKR")
 
   paymentStatus InspectionPaymentStatus @default(UNPAID)
@@ -572,15 +680,22 @@ model InspectionRequest {
   paymentMethod String?
   paidAt        DateTime?
 
-  // Free-text phone being inspected when the request isn't tied to a listing
-  // (e.g. a buyer booking an inspection for a phone found off-platform).
+  // Free-text device being inspected when the request isn't tied to a listing
+  // (e.g. a buyer booking an inspection for a device found off-platform).
   deviceInfo String?
+
+  /// Checklist family: PHONE | LAPTOP. NULL means a legacy phone request.
+  inspectionKind String?
 
   // Where the inspection happens + how to reach the requester
   contactName  String?
   contactPhone String?
   city         String?
   area         String?
+  cityId       String?
+  cityRef      City?   @relation(fields: [cityId], references: [id], onDelete: SetNull)
+  areaId       String?
+  areaRef      Area?   @relation(fields: [areaId], references: [id], onDelete: SetNull)
   address      String?
   latitude     Float?
   longitude    Float?
@@ -599,8 +714,12 @@ model InspectionRequest {
   updatedAt DateTime @updatedAt
 
   @@index([requesterId, status])
+  @@index([requesterId, createdAt])
   @@index([inspectorId, status])
+  @@index([inspectorId, status, createdAt])
   @@index([listingId])
+  @@index([cityId])
+  @@index([areaId])
   @@index([status, scheduledAt])
   @@map("inspection_request")
 }
@@ -634,6 +753,7 @@ model InspectionReport {
   updatedAt DateTime @updatedAt
 
   @@index([verdict])
+  @@index([isPublished])
   @@map("inspection_report")
 }
 
@@ -674,6 +794,892 @@ model InspectionPhoto {
   @@map("inspection_photo")
 }
 
+// ---------------------------------------------------------------------------
+// Admin-controlled application settings
+// ---------------------------------------------------------------------------
+
+/// Key/value application settings managed from the admin panel.
+model AppSetting {
+  key       String   @id
+  value     Json
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+
+  @@map("app_setting")
+}
+
+// ---------------------------------------------------------------------------
+// Audit logging for sensitive operations
+// ---------------------------------------------------------------------------
+
+/// Audit trail for sensitive admin and user actions
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String
+  actor      User     @relation(fields: [actorId], references: [id], onDelete: Cascade)
+  action     String
+  resource   String
+  resourceId String?
+  timestamp  DateTime @default(now())
+  before     Json?
+  after      Json?
+  metadata   Json?
+  ipAddress  String?
+  userAgent  String?
+
+  @@index([actorId])
+  @@index([action])
+  @@index([resource, resourceId])
+  @@index([timestamp])
+  @@map("audit_log")
+}
+
+// ---------------------------------------------------------------------------
+// Dealer system for professional sellers
+// ---------------------------------------------------------------------------
+
+/// Dealer subscription plans
+enum DealerPlan {
+  BASIC
+  PREMIUM
+  ENTERPRISE
+}
+
+/// Dealer status
+enum DealerStatus {
+  ACTIVE
+  SUSPENDED
+  PENDING
+  REJECTED
+}
+
+/// Professional mobile phone dealer/store
+model Dealer {
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  description String?
+  logo        String?
+  coverImage  String?
+
+  // Business information
+  businessName String?
+  businessType String?
+  taxNumber    String?
+
+  // Contact information
+  phone   String?
+  email   String?
+  website String?
+
+  // Location
+  city      String?
+  address   String?
+  latitude  Float?
+  longitude Float?
+  region    Region @default(PAKISTAN)
+
+  // Dealer status and subscription
+  status        DealerStatus @default(PENDING)
+  plan          DealerPlan   @default(BASIC)
+  planExpiresAt DateTime?
+  featuredUntil DateTime?
+
+  // Verification
+  isVerified Boolean   @default(false)
+  verifiedAt DateTime?
+  reviewNote String?
+
+  // Stats (denormalized for performance)
+  listingCount Int    @default(0)
+  soldCount    Int    @default(0)
+  rating       Float?
+  reviewCount  Int    @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  users     DealerUser[]
+  branches  DealerBranch[]
+  inventory DealerInventory[]
+  listings  Listing[]
+  leads     DealerLead[]
+
+  @@index([status])
+  @@index([plan])
+  @@index([isVerified])
+  @@index([city])
+  @@map("dealer")
+}
+
+/// User association with a dealer (owner, staff, etc.)
+model DealerUser {
+  id       String   @id @default(cuid())
+  dealerId String
+  dealer   Dealer   @relation(fields: [dealerId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role     String   @default("staff") // owner, manager, staff
+  isActive Boolean  @default(true)
+  joinedAt DateTime @default(now())
+
+  @@unique([dealerId, userId])
+  @@index([userId])
+  @@index([dealerId])
+  @@map("dealer_user")
+}
+
+/// Dealer branch/location
+model DealerBranch {
+  id        String   @id @default(cuid())
+  dealerId  String
+  dealer    Dealer   @relation(fields: [dealerId], references: [id], onDelete: Cascade)
+  name      String
+  address   String
+  city      String
+  phone     String?
+  email     String?
+  latitude  Float?
+  longitude Float?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([dealerId])
+  @@index([city])
+  @@map("dealer_branch")
+}
+
+/// Dealer inventory management
+model DealerInventory {
+  id        String   @id @default(cuid())
+  dealerId  String
+  dealer    Dealer   @relation(fields: [dealerId], references: [id], onDelete: Cascade)
+  listingId String?  @unique
+  listing   Listing? @relation(fields: [listingId], references: [id], onDelete: SetNull)
+
+  // Inventory-specific fields
+  sku        String?   @unique
+  stockCount Int       @default(1)
+  location   String? // branch ID or storage location
+  costPrice  Decimal?  @db.Decimal(12, 3)
+  acquiredAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([dealerId])
+  @@index([listingId])
+  @@index([sku])
+  @@map("dealer_inventory")
+}
+
+/// Lead status for dealer conversations
+enum DealerLeadStatus {
+  NEW
+  CONTACTED
+  NEGOTIATING
+  SOLD
+  LOST
+  CLOSED
+}
+
+/// Lead tracking for dealer-buyer conversations
+model DealerLead {
+  id             String           @id @default(cuid())
+  dealerId       String
+  dealer         Dealer           @relation(fields: [dealerId], references: [id], onDelete: Cascade)
+  buyerId        String
+  buyer          User             @relation("DealerLeads", fields: [buyerId], references: [id], onDelete: Cascade)
+  listingId      String?
+  listing        Listing?         @relation(fields: [listingId], references: [id], onDelete: SetNull)
+  conversationId String?
+  status         DealerLeadStatus @default(NEW)
+  metadata       Json?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@unique([buyerId, conversationId])
+  @@index([dealerId])
+  @@index([buyerId])
+  @@index([listingId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("dealer_lead")
+}
+
+// ---------------------------------------------------------------------------
+// Phone Intelligence Platform
+// ---------------------------------------------------------------------------
+
+/// Phone model with official specifications
+model PhoneModel {
+  id      String @id @default(cuid())
+  name    String
+  slug    String @unique
+  brandId String
+  brand   Brand  @relation(fields: [brandId], references: [id], onDelete: Cascade)
+
+  // Official specifications
+  modelNumber String?
+  releaseDate DateTime?
+  launchPrice Decimal?  @db.Decimal(12, 3)
+
+  // Display
+  displaySize       String? // e.g., "6.7 inches"
+  displayResolution String? // e.g., "2796x1290"
+  displayType       String? // e.g., "OLED", "LCD"
+  refreshRate       String? // e.g., "120Hz"
+
+  // Processor
+  processor String?
+  cpuCores  Int?
+  gpu       String?
+
+  // Memory
+  ramOptions     String[] // e.g., ["8GB", "12GB", "16GB"]
+  storageOptions String[] // e.g., ["128GB", "256GB", "512GB", "1TB"]
+
+  // Camera
+  mainCamera     String?
+  selfieCamera   String?
+  cameraFeatures String[]
+
+  // Battery
+  batteryCapacity String? // e.g., "5000mAh"
+  batteryType     String? // e.g., "Li-Ion"
+  chargingSpeed   String? // e.g., "30W"
+
+  // Connectivity
+  networkSupport String[] // e.g., ["5G", "4G", "3G"]
+  simType        String? // e.g., "Dual SIM", "eSIM"
+  wifi           String?
+  bluetooth      String?
+  nfc            Boolean?
+
+  // Dimensions
+  weight     String? // e.g., "221g"
+  dimensions String? // e.g., "158.5 x 75.8 x 8.1 mm"
+
+  // Software
+  os        String?
+  osVersion String?
+
+  // Features
+  features String[]
+  colors   String[]
+
+  // SEO & Discovery
+  isActive     Boolean @default(true)
+  isUpcoming   Boolean @default(false)
+  launchStatus String? // e.g., "ANNOUNCED", "LAUNCHED", "DISCONTINUED"
+
+  // Metadata
+  imageUrl    String?
+  description String?
+  position    Int     @default(0)
+
+  // Relations
+  reviews     PhoneModelReview[]
+  valuations  PhoneValuation[]
+  comparisons PhoneComparison[]  @relation("PhoneComparisonPhones")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([brandId])
+  @@index([isActive])
+  @@index([isActive, brandId, position])
+  @@index([isUpcoming])
+  @@index([slug])
+  @@map("phone_model")
+}
+
+/// Phone model reviews and ratings
+model PhoneModelReview {
+  id      String     @id @default(cuid())
+  modelId String
+  model   PhoneModel @relation(fields: [modelId], references: [id], onDelete: Cascade)
+  userId  String
+  user    User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  rating  Int // 1-5 stars
+  title   String
+  content String
+  pros    String[]
+  cons    String[]
+
+  // Moderation
+  isApproved Boolean   @default(false)
+  approvedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([modelId])
+  @@index([userId])
+  @@index([isApproved])
+  @@map("phone_model_review")
+}
+
+/// Phone comparison sessions
+model PhoneComparison {
+  id     String  @id @default(cuid())
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // Comparison data
+  phoneIds   String[] // Array of PhoneModel IDs being compared
+  phoneSpecs Json // Cached comparison data
+
+  // Metadata
+  isAnonymous Boolean @default(false)
+  sessionId   String? // For anonymous comparisons
+
+  // Relations
+  phones PhoneModel[] @relation("PhoneComparisonPhones")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([sessionId])
+  @@map("phone_comparison")
+}
+
+/// Phone valuation records
+model PhoneValuation {
+  id      String     @id @default(cuid())
+  modelId String
+  model   PhoneModel @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  // Valuation parameters
+  storage       String?
+  ram           String?
+  condition     String?
+  batteryHealth Int?
+
+  // Valuation result
+  estimatedPriceMin Decimal @db.Decimal(12, 3)
+  estimatedPriceMax Decimal @db.Decimal(12, 3)
+  estimatedPriceAvg Decimal @db.Decimal(12, 3)
+
+  // Market data
+  marketData  Json? // Listing prices used for calculation
+  sampleCount Int? // Number of listings analyzed
+
+  // Metadata
+  isPreview Boolean @default(false) // True if pre-listing estimate
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([modelId])
+  @@index([storage, ram, condition])
+  @@map("phone_valuation")
+}
+
+/// IMEI verification records
+model ImeiVerification {
+  id   String @id @default(cuid())
+  imei String @unique
+
+  // Verification result
+  ptaStatus     String? // "APPROVED", "REJECTED", "PENDING", "UNKNOWN"
+  cpidStatus    String? // "APPROVED", "REJECTED", "UNKNOWN"
+  isStolen      Boolean @default(false)
+  isBlacklisted Boolean @default(false)
+
+  // Device info (from verification)
+  deviceModel String?
+  deviceBrand String?
+  deviceColor String?
+
+  // Verification metadata
+  verifiedAt         DateTime?
+  verifiedBy         String? // User ID or system
+  verificationSource String? // "PTA", "CPID", "MANUAL", "BAHRAIN_QA"
+  isSimulated        Boolean @default(false)
+  region             Region  @default(PAKISTAN)
+
+  // Metadata
+  ipAddress String?
+  userAgent String?
+
+  // Relations
+  user User? @relation("ImeiVerificationUser", fields: [verifiedBy], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([imei])
+  @@index([verifiedBy, createdAt])
+  @@index([ptaStatus])
+  @@index([cpidStatus])
+  @@index([isStolen])
+  @@index([isBlacklisted])
+  @@index([isSimulated])
+  @@map("imei_verification")
+}
+
+// ---------------------------------------------------------------------------
+// Promotion System for Monetization
+// ---------------------------------------------------------------------------
+
+/// Promotion placement types
+enum PromotionPlacement {
+  FEATURED
+  BOOSTED
+  TOP_SEARCH
+  CATEGORY_FEATURED
+  HOMEPAGE_FEATURED
+}
+
+/// Promotion status
+enum PromotionStatus {
+  ACTIVE
+  PAUSED
+  EXPIRED
+  CANCELLED
+}
+
+/// Promotion plan definition (admin-managed)
+model PromotionPlan {
+  id           String             @id @default(cuid())
+  name         String
+  slug         String             @unique
+  description  String?
+  placement    PromotionPlacement
+  price        Decimal            @db.Decimal(12, 3)
+  currency     String             @default("PKR")
+  durationDays Int
+  isActive     Boolean            @default(true)
+  maxSlots     Int? // Maximum concurrent promotions for this plan
+  metadata     Json?
+  /// Country/region this promotion plan is available in.
+  region       Region             @default(PAKISTAN)
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  // Relations
+  promotions ListingPromotion[]
+
+  @@index([placement])
+  @@index([isActive])
+  @@index([region])
+  @@map("promotion_plan")
+}
+
+/// Active promotion on a listing
+model ListingPromotion {
+  id        String             @id @default(cuid())
+  listingId String
+  listing   Listing            @relation("ListingPromotions", fields: [listingId], references: [id], onDelete: Cascade)
+  planId    String
+  plan      PromotionPlan      @relation(fields: [planId], references: [id], onDelete: Cascade)
+  status    PromotionStatus    @default(ACTIVE)
+  startedAt DateTime           @default(now())
+  expiresAt DateTime
+  metadata  Json?
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+  payments  PromotionPayment[]
+
+  @@index([listingId])
+  @@index([planId])
+  @@index([status])
+  @@index([expiresAt])
+  @@map("listing_promotion")
+}
+
+/// Payment record for promotions
+model PromotionPayment {
+  id            String           @id @default(cuid())
+  promotionId   String
+  promotion     ListingPromotion @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  amount        Decimal          @db.Decimal(12, 3)
+  currency      String           @default("PKR")
+  method        String // Payment method (jazzcash, easypaisa, etc.)
+  status        String // PENDING, COMPLETED, FAILED, REFUNDED
+  transactionId String?
+  metadata      Json?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  @@index([promotionId])
+  @@index([status])
+  @@map("promotion_payment")
+}
+
+// ---------------------------------------------------------------------------
+// Phone History Foundation
+// ---------------------------------------------------------------------------
+
+/// Event types for phone history tracking
+enum PhoneHistoryEventType {
+  INSPECTION
+  VERIFICATION
+  WARRANTY_CLAIM
+  REPAIR
+  BATTERY_REPLACEMENT
+  SCREEN_REPLACEMENT
+  OTHER_REPAIR
+  STATUS_CHANGE
+}
+
+/// Phone history event for tracking device lifecycle
+model PhoneHistory {
+  id        String   @id @default(cuid())
+  listingId String?
+  listing   Listing? @relation(fields: [listingId], references: [id], onDelete: SetNull)
+
+  // Event details
+  eventType   PhoneHistoryEventType
+  title       String
+  description String?
+
+  // Status/Result
+  status   String? // PASS, FAIL, PENDING, APPROVED, REJECTED, etc.
+  metadata Json? // Additional event-specific data
+
+  // Source information
+  source   String? // Source of the event (e.g., "inspection", "user_report", "admin")
+  sourceId String? // ID of the source record (e.g., inspectionId)
+
+  // Timestamps
+  occurredAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  @@index([listingId])
+  @@index([listingId, occurredAt])
+  @@index([eventType])
+  @@index([occurredAt])
+  @@index([source, sourceId])
+  @@map("phone_history")
+}
+
+// ---------------------------------------------------------------------------
+// Shipping & Delivery
+// ---------------------------------------------------------------------------
+
+/// Shipping method available in a country.
+model ShippingMethod {
+  id            String  @id @default(cuid())
+  name          String
+  description   String?
+  /// Country/region this shipping method is available in.
+  region        Region  @default(PAKISTAN)
+  /// Base price for this shipping method.
+  price         Decimal @db.Decimal(12, 3)
+  currency      String  @default("PKR")
+  /// Estimated delivery days.
+  estimatedDays Int     @default(3)
+  isActive      Boolean @default(true)
+  position      Int     @default(0)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([region, isActive])
+  @@map("shipping_method")
+}
+
+/// Delivery zone within a country (governorate/province/city).
+model DeliveryZone {
+  id           String  @id @default(cuid())
+  name         String
+  /// Country/region this zone belongs to.
+  region       Region  @default(PAKISTAN)
+  /// City or area name.
+  city         String?
+  /// Additional delivery charge for this zone.
+  surcharge    Decimal @db.Decimal(12, 3) @default(0)
+  /// Whether cash on delivery is available in this zone.
+  codAvailable Boolean @default(true)
+  isActive     Boolean @default(true)
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([region, isActive])
+  @@map("delivery_zone")
+}
+
+// ---------------------------------------------------------------------------
+// Seller Verification
+// ---------------------------------------------------------------------------
+
+/// Seller verification record.
+model SellerVerification {
+  id         String   @id @default(cuid())
+  sellerId   String
+  seller     User     @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  /// Country/region for this verification.
+  region     Region   @default(PAKISTAN)
+  /// Verification status.
+  status     String   @default("PENDING") // PENDING, APPROVED, REJECTED
+  /// Verification documents (JSON array of URLs).
+  documents  Json?
+  /// Admin notes.
+  notes      String?
+  /// Reviewed by admin.
+  reviewedBy String?
+  reviewedAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([sellerId])
+  @@index([region, status])
+  @@index([sellerId, region, createdAt])
+  @@map("seller_verification")
+}
+
+// ---------------------------------------------------------------------------
+// Cart
+// ---------------------------------------------------------------------------
+
+/// Cart item for a user's shopping cart.
+model CartItem {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  listingId String
+  listing   Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  quantity  Int      @default(1)
+  /// Price snapshot at time of adding to cart.
+  price     Decimal  @db.Decimal(12, 3)
+  currency  String   @default("PKR")
+  /// Country/region for this cart item.
+  region    Region   @default(PAKISTAN)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, listingId])
+  @@index([userId])
+  @@map("cart_item")
+}
+
+// ---------------------------------------------------------------------------
+// Orders
+// ---------------------------------------------------------------------------
+
+/// Order status.
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+/// Order record — permanently stores transaction details.
+model Order {
+  id              String      @id @default(cuid())
+  orderNumber     String      @unique
+  customerId      String
+  customer        User        @relation("CustomerOrders", fields: [customerId], references: [id], onDelete: Cascade)
+  /// Country/region for this order.
+  region          Region      @default(PAKISTAN)
+  /// Currency for this order.
+  currency        String      @default("PKR")
+  /// Order status.
+  status          OrderStatus @default(PENDING)
+  /// Subtotal (sum of item prices).
+  subtotal        Decimal     @db.Decimal(12, 3)
+  /// Shipping charges.
+  shipping        Decimal     @db.Decimal(12, 3) @default(0)
+  /// Tax rate applied.
+  taxRate         Decimal     @db.Decimal(5, 4) @default(0)
+  /// Tax amount.
+  taxAmount       Decimal     @db.Decimal(12, 3) @default(0)
+  /// Tax name (VAT, etc.).
+  taxName         String?
+  /// Discount amount.
+  discount        Decimal     @db.Decimal(12, 3) @default(0)
+  /// Final total.
+  total           Decimal     @db.Decimal(12, 3)
+  /// Shipping method name.
+  shippingMethod  String?
+  /// Estimated delivery days.
+  estimatedDays   Int?
+  /// Delivery address (JSON).
+  deliveryAddress Json?
+  /// Payment method.
+  paymentMethod   String?
+  /// Payment status.
+  paymentStatus   String      @default("UNPAID")
+  /// Payment reference.
+  paymentRef      String?
+  /// Paid at.
+  paidAt          DateTime?
+  /// Order notes.
+  notes           String?
+  /// Items in this order.
+  items           OrderItem[]
+  /// Payments for this order.
+  payments        Payment[]
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@index([customerId])
+  @@index([customerId, createdAt])
+  @@index([region])
+  @@index([region, status, createdAt])
+  @@index([status])
+  @@index([createdAt])
+  @@map("order")
+}
+
+/// Order line item — permanently stores product details at time of purchase.
+model OrderItem {
+  id          String   @id @default(cuid())
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  listingId   String?
+  listing     Listing? @relation(fields: [listingId], references: [id], onDelete: SetNull)
+  /// Product title at time of purchase.
+  title       String
+  /// Product price at time of purchase.
+  unitPrice   Decimal  @db.Decimal(12, 3)
+  /// Currency at time of purchase.
+  currency    String   @default("PKR")
+  quantity    Int      @default(1)
+  /// Line total.
+  lineTotal   Decimal  @db.Decimal(12, 3)
+
+  createdAt   DateTime @default(now())
+
+  @@index([orderId])
+  @@index([listingId])
+  @@map("order_item")
+}
+
+// ---------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------
+
+/// Payment status.
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+/// Payment record for an order.
+model Payment {
+  id                    String        @id @default(cuid())
+  orderId               String
+  order                 Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  /// Payment provider used.
+  provider              String
+  /// Country for this payment.
+  country               String
+  /// Currency for this payment.
+  currency              String
+  /// Amount.
+  amount                Decimal       @db.Decimal(12, 3)
+  /// Payment status.
+  status                PaymentStatus @default(PENDING)
+  /// Provider's transaction reference.
+  providerReference     String?
+  /// Provider's transaction ID.
+  providerTransactionId String?
+  /// Idempotency key to prevent duplicate payments.
+  idempotencyKey        String?       @unique
+  /// Failure reason.
+  failureReason         String?
+  /// Verified at.
+  verifiedAt            DateTime?
+  /// Refunded at.
+  refundedAt            DateTime?
+  /// Refund amount.
+  refundAmount           Decimal?      @db.Decimal(12, 3)
+  /// Refund reason.
+  refundReason          String?
+  /// Metadata.
+  metadata              Json?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  @@index([orderId])
+  @@index([orderId, createdAt])
+  @@index([provider])
+  @@index([status])
+  @@index([country])
+  @@map("payment")
+}
+
+// ---------------------------------------------------------------------------
+// Location Taxonomy (Country -> City -> Area)
+// ---------------------------------------------------------------------------
+
+/// Countries available in marketplace and inspection location selectors.
+model Country {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  slug      String   @unique
+  code      String   @unique
+  position  Int      @default(0)
+  isActive  Boolean  @default(true)
+  cities    City[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, position])
+  @@map("country")
+}
+
+/// Managed cities for classifieds and dealer filtering
+model City {
+  id          String              @id @default(cuid())
+  name        String              @unique
+  slug        String              @unique
+  province    String?
+  countryId   String
+  country     Country             @relation(fields: [countryId], references: [id], onDelete: Restrict)
+  popular     Boolean             @default(false)
+  position    Int                 @default(0)
+  isActive    Boolean             @default(true)
+  areas       Area[]
+  listings    Listing[]
+  inspections InspectionRequest[]
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  @@index([countryId, isActive, position])
+  @@index([popular])
+  @@map("city")
+}
+
+/// Neighbourhoods and sectors within a city
+model Area {
+  id          String              @id @default(cuid())
+  name        String
+  slug        String
+  cityId      String
+  city        City                @relation(fields: [cityId], references: [id], onDelete: Cascade)
+  listings    Listing[]
+  inspections InspectionRequest[]
+  position    Int                 @default(0)
+  isActive    Boolean             @default(true)
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  @@unique([cityId, slug])
+  @@index([cityId, isActive])
+  @@map("area")
+}
+
+// ---------------------------------------------------------------------------
+// Phone verification & Sell Your Phone buy-back quotes
+// ---------------------------------------------------------------------------
+
 /// Short-lived phone OTP used to confirm a buyer's WhatsApp/SMS number before
 /// they can book an inspection. One live row per (user, phone) — upserted on
 /// each resend. The code is stored hashed; verification is valid for a short
@@ -702,18 +1708,8 @@ model PhoneVerification {
   @@map("phone_verification")
 }
 
-// ---------------------------------------------------------------------------
-// Sell Your Phone — instant AI-graded buy-back quotes.
-//
-// A seller answers a guided questionnaire, uploads 5 fixed photos, a vision LLM
-// grades the device, and we produce a priced, time-boxed quote they can accept.
-// Catalog prices (PhoneModel), deductions (DeductionRule) and grade multipliers
-// (QuoteSetting) are all admin-editable; issued quotes snapshot their inputs so
-// later admin edits never change a quote already given.
-// ---------------------------------------------------------------------------
-
 /// PTA import/tax status of a device — a primary price driver in Pakistan.
-enum PtaStatus {
+enum QuotePtaStatus {
   PTA
   NON_PTA
   PATCHED
@@ -739,14 +1735,14 @@ enum QuoteInspectionResult {
 
 /// Admin-editable price book: one row per (brand, model, storage, PTA status).
 /// `basePricePkr` is the grade-A reference price before deductions.
-model PhoneModel {
-  id           String    @id @default(cuid())
+model QuotePriceBook {
+  id           String          @id @default(cuid())
   brand        String
   model        String
   storage      String
-  ptaStatus    PtaStatus
-  basePricePkr Decimal   @db.Decimal(12, 2)
-  isActive     Boolean   @default(true)
+  ptaStatus    QuotePtaStatus
+  basePricePkr Decimal         @db.Decimal(12, 2)
+  isActive     Boolean         @default(true)
 
   quotes Quote[]
 
@@ -756,7 +1752,7 @@ model PhoneModel {
   @@unique([brand, model, storage, ptaStatus])
   @@index([brand, model])
   @@index([isActive])
-  @@map("phone_model")
+  @@map("quote_price_book")
 }
 
 /// Admin-editable deduction. Exactly one of `amountPkr` / `percent` is set; the
@@ -799,13 +1795,13 @@ model Quote {
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Reference to the price-book row + a snapshot of it (edits must not mutate issued quotes).
-  modelId     String?
-  phoneModel  PhoneModel? @relation(fields: [modelId], references: [id], onDelete: SetNull)
-  brand       String
-  model       String
-  storage     String
-  ptaStatus   PtaStatus
-  basePricePkr Decimal    @db.Decimal(12, 2)
+  modelId        String?
+  quotePriceBook QuotePriceBook? @relation(fields: [modelId], references: [id], onDelete: SetNull)
+  brand          String
+  model          String
+  storage        String
+  ptaStatus      QuotePtaStatus
+  basePricePkr   Decimal         @db.Decimal(12, 2)
 
   /// Raw questionnaire answers (keys mirror features/quotes/schemas).
   answers Json

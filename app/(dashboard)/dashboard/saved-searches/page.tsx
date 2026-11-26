@@ -10,7 +10,10 @@ import { getSavedSearches } from "@/features/saved-searches/services/saved-searc
 import { SavedSearchList } from "@/features/saved-searches/components/saved-search-list";
 import { buttonVariants } from "@/components/ui/button";
 
-export const metadata: Metadata = { title: "Saved Searches" };
+export const metadata: Metadata = { 
+  title: "Saved Searches",
+  robots: { index: false, follow: false },
+};
 
 export default async function SavedSearchesPage() {
   const user = await getCurrentUser();

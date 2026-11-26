@@ -3,12 +3,15 @@
 import * as React from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Loader2, Search, Trash2 } from "lucide-react";
+import { Bell, BellOff, Loader2, Search, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { ROUTES } from "@/lib/constants";
 import { Button, buttonVariants } from "@/components/ui/button";
-import { deleteSavedSearchAction } from "@/features/saved-searches/actions/saved-search.actions";
+import {
+  deleteSavedSearchAction,
+  setSavedSearchAlertsAction,
+} from "@/features/saved-searches/actions/saved-search.actions";
 import type { SavedSearchItem } from "@/features/saved-searches/repositories/saved-search.repository";
 
 /** Renders a user's saved searches with re-run + delete actions. */
@@ -25,6 +28,7 @@ export function SavedSearchList({ items }: { items: SavedSearchItem[] }) {
 function SavedSearchRow({ item }: { item: SavedSearchItem }) {
   const router = useRouter();
   const [pending, setPending] = React.useState(false);
+  const [alertsPending, setAlertsPending] = React.useState(false);
 
   const href = item.query ? `${ROUTES.marketplace}?${item.query}` : ROUTES.marketplace;
   // Fixed locale keeps the server- and client-rendered label identical (no hydration drift).
@@ -46,6 +50,19 @@ function SavedSearchRow({ item }: { item: SavedSearchItem }) {
     router.refresh();
   }
 
+  async function toggleAlerts() {
+    setAlertsPending(true);
+    const enabled = !item.alertsEnabled;
+    const result = await setSavedSearchAlertsAction({ id: item.id, enabled });
+    setAlertsPending(false);
+    if (!result.ok) {
+      toast.error(result.error ?? "Could not update alert settings.");
+      return;
+    }
+    toast.success(enabled ? "Alerts enabled" : "Alerts paused");
+    router.refresh();
+  }
+
   return (
     <li className="flex items-center gap-3 p-4">
       <div className="min-w-0 flex-1">
@@ -56,6 +73,25 @@ function SavedSearchRow({ item }: { item: SavedSearchItem }) {
         <Search className="size-4" />
         <span className="hidden sm:inline">View results</span>
       </Link>
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={toggleAlerts}
+        disabled={alertsPending}
+        aria-label={`${item.alertsEnabled ? "Pause" : "Enable"} alerts for ${item.name}`}
+        title={
+          item.alertsEnabled ? "Pause email and in-app alerts" : "Enable email and in-app alerts"
+        }
+      >
+        {alertsPending ? (
+          <Loader2 className="size-4 animate-spin" />
+        ) : item.alertsEnabled ? (
+          <Bell className="text-primary size-4" />
+        ) : (
+          <BellOff className="text-muted-foreground size-4" />
+        )}
+        <span className="hidden sm:inline">{item.alertsEnabled ? "Alerts on" : "Alerts off"}</span>
+      </Button>
       <Button
         variant="ghost"
         size="sm"

@@ -3,13 +3,17 @@ import "server-only";
 import type { ListingStatus, ReportStatus } from "@/lib/constants";
 import type {
   AdminCategoryRow,
+  ConversionFunnel,
   AdminListingRow,
   AdminReportRow,
   AdminUserRow,
   Paginated,
   PlatformStats,
+  RegionAnalytics,
 } from "@/features/admin/types";
 import {
+  getConversionFunnel as loadConversionFunnel,
+  getRegionAnalytics as loadRegionAnalytics,
   getPlatformStats,
   listCategories,
   listCategoryOptions,
@@ -22,9 +26,14 @@ const EMPTY_STATS: PlatformStats = {
   totalUsers: 0,
   newUsers7d: 0,
   totalListings: 0,
+  pendingListings: 0,
   activeListings: 0,
+  rejectedListings: 0,
   soldListings: 0,
   openReports: 0,
+  totalBrands: 0,
+  totalModels: 0,
+  totalDealers: 0,
 };
 
 function emptyPage<T>(page: number): Paginated<T> {
@@ -37,6 +46,24 @@ export async function getStats(): Promise<PlatformStats> {
   } catch (error) {
     console.warn("[admin] stats unavailable.", error instanceof Error ? error.message : error);
     return EMPTY_STATS;
+  }
+}
+
+export async function getRegionAnalyticsData(): Promise<RegionAnalytics> {
+  try {
+    return await loadRegionAnalytics();
+  } catch (error) {
+    console.warn("[admin] region analytics unavailable.", error instanceof Error ? error.message : error);
+    return { regions: [], generatedAt: new Date().toISOString() };
+  }
+}
+
+export async function getConversionFunnelData(): Promise<ConversionFunnel> {
+  try {
+    return await loadConversionFunnel();
+  } catch (error) {
+    console.warn("[admin] conversion funnel unavailable.", error instanceof Error ? error.message : error);
+    return { metrics: [], generatedAt: new Date().toISOString() };
   }
 }
 
@@ -55,6 +82,7 @@ export async function getUsers(params: {
 export async function getListings(params: {
   q?: string;
   status?: ListingStatus;
+  region?: "BAHRAIN" | "PAKISTAN" | "ALL";
   page: number;
 }): Promise<Paginated<AdminListingRow>> {
   try {

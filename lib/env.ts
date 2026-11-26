@@ -26,9 +26,7 @@ export const env = createEnv({
     // --- Better Auth ---
     BETTER_AUTH_SECRET: z.string().min(1, "BETTER_AUTH_SECRET is required"),
     BETTER_AUTH_URL: z.url().optional(),
-    // DEV-ONLY escape hatch: set to "true" to skip the email-verification gate when no
-    // email provider is configured. Ignored in production (see lib/auth.ts).
-    AUTH_SKIP_EMAIL_VERIFICATION: z.string().optional(),
+    APP_URL: z.url().optional(),
 
     // --- Social OAuth (optional until configured) ---
     GOOGLE_CLIENT_ID: z.string().min(1).optional(),
@@ -45,12 +43,37 @@ export const env = createEnv({
     CLOUDINARY_API_KEY: z.string().min(1).optional(),
     CLOUDINARY_API_SECRET: z.string().min(1).optional(),
 
-    // --- Payment aggregator (PayFast/Safepay — JazzCash + Easypaisa + cards) ---
+    // --- PayFast direct API (JazzCash + Easypaisa + cards) ---
     // Optional: when unset the app uses the built-in SANDBOX provider (no real
     // charges) so the whole payment flow is clickable in development.
     PAYFAST_MERCHANT_ID: z.string().min(1).optional(),
     PAYFAST_SECURED_KEY: z.string().min(1).optional(),
     PAYFAST_API_BASE: z.url().optional(),
+    PAYFAST_MERCHANT_CATEGORY_CODE: z.string().min(1).optional(),
+    PAYFAST_CARD_ACCOUNT_TYPE: z.string().min(1).optional(),
+    PAYFAST_JAZZCASH_BANK_CODE: z.string().min(1).optional(),
+    PAYFAST_JAZZCASH_ACCOUNT_TYPE: z.string().min(1).optional(),
+    PAYFAST_EASYPAISA_BANK_CODE: z.string().min(1).optional(),
+    PAYFAST_EASYPAISA_ACCOUNT_TYPE: z.string().min(1).optional(),
+    PAYFAST_MODE: z.enum(["disabled", "sandbox", "live"]).default("disabled"),
+    PAYFAST_LIVE_ENABLED: z.enum(["true", "false"]).default("false"),
+    // Test-only: allows the built-in simulated gateway in a production build
+    // (preview/staging) when PayFast credentials are not configured. Never enable
+    // this on a public production deployment — it marks inspections paid without
+    // a real charge. Real PayFast credentials always take precedence.
+    PAYMENTS_TEST_MODE: z.enum(["true", "false"]).default("false"),
+
+    // --- PTA / CPID device verification ---
+    // Test-only: allows simulated PTA/CPID results in a production build. Results
+    // are stored and displayed as simulated; never enable on public production.
+    // A real provider adapter must be registered before accurate checks exist.
+    DEVICE_VERIFICATION_TEST_MODE: z.enum(["true", "false"]).default("false"),
+
+    // --- Firebase Cloud Messaging (optional; server-side service account) ---
+    // Never expose service-account credentials with a NEXT_PUBLIC_ prefix.
+    FCM_PROJECT_ID: z.string().min(1).optional(),
+    FCM_CLIENT_EMAIL: z.string().min(1).optional(),
+    FCM_PRIVATE_KEY: z.string().min(1).optional(),
 
     // --- Vision LLM for "Sell Your Phone" AI grading ---
     // Optional: when unset, grading falls back to a deterministic DEV grader so the
@@ -77,9 +100,13 @@ export const env = createEnv({
   },
 
   client: {
-    NEXT_PUBLIC_APP_URL: z.url().default("http://localhost:3000"),
     NEXT_PUBLIC_APP_NAME: z.string().min(1).default("GenTech"),
     NEXT_PUBLIC_GOOGLE_MAPS_API_KEY: z.string().min(1).optional(),
+
+    // --- Region (optional; defaults to PAKISTAN per-user) ---
+    // Set at runtime via user profile; not a global app config.
+    // Only exposed to client if explicitly needed for UI locale/etc.
+    NEXT_PUBLIC_REGION: z.string().min(1).optional(),
 
     // --- Analytics (optional; each provider loads only when its id is set) ---
     NEXT_PUBLIC_GTM_ID: z.string().min(1).optional(),
@@ -94,8 +121,8 @@ export const env = createEnv({
    */
   experimental__runtimeEnv: {
     NEXT_PUBLIC_GOOGLE_MAPS_API_KEY: process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY,
-    NEXT_PUBLIC_APP_URL: process.env.NEXT_PUBLIC_APP_URL,
     NEXT_PUBLIC_APP_NAME: process.env.NEXT_PUBLIC_APP_NAME,
+    NEXT_PUBLIC_REGION: process.env.NEXT_PUBLIC_REGION,
     NEXT_PUBLIC_GTM_ID: process.env.NEXT_PUBLIC_GTM_ID,
     NEXT_PUBLIC_GA4_ID: process.env.NEXT_PUBLIC_GA4_ID,
     NEXT_PUBLIC_META_PIXEL_ID: process.env.NEXT_PUBLIC_META_PIXEL_ID,

@@ -10,3 +10,5 @@ allowBuilds:
   "@prisma/engines": true
   esbuild: true
   workerd: true
+  '@parcel/watcher': true
+  '@swc/core': true

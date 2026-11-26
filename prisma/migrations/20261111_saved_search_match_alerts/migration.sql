@@ -1,0 +1,4 @@
+ALTER TYPE "NotificationType" ADD VALUE IF NOT EXISTS 'SAVED_SEARCH_MATCH';
+
+ALTER TABLE "saved_search"
+ADD COLUMN "alertsEnabled" BOOLEAN NOT NULL DEFAULT true;

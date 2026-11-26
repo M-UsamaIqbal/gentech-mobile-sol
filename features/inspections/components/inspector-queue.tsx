@@ -12,6 +12,10 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InspectionStatusBadge } from "@/features/inspections/components/inspection-status-badge";
 import {
+  canSubmitInspectionReport,
+  isInspectionFeePaid,
+} from "@/features/inspections/lib/inspection-state";
+import {
   claimInspectionAction,
   scheduleInspectionAction,
 } from "@/features/inspections/actions/inspector.actions";
@@ -54,13 +58,19 @@ function QueueItem({
   const mine = request.inspector?.id === inspectorId;
   const unassigned = !request.inspector;
   const hasReport = Boolean(request.report);
+  const isPaid = isInspectionFeePaid(request.paymentStatus);
   const canSchedule =
     mine &&
     (request.status === INSPECTION_STATUSES.REQUESTED ||
       request.status === INSPECTION_STATUSES.PAYMENT_PENDING ||
       request.status === INSPECTION_STATUSES.SCHEDULED);
-  const canReport =
-    mine && !hasReport && request.status !== INSPECTION_STATUSES.CANCELLED;
+  const canReport = mine && !hasReport && canSubmitInspectionReport(request);
+  const awaitingPayment =
+    mine &&
+    !hasReport &&
+    !isPaid &&
+    request.status !== INSPECTION_STATUSES.CANCELLED &&
+    request.status !== INSPECTION_STATUSES.EXPIRED;
 
   async function claim() {
     setPending(true);
@@ -163,6 +173,11 @@ function QueueItem({
             >
               View report
             </Button>
+          ) : null}
+          {awaitingPayment ? (
+            <p className="text-muted-foreground max-w-44 text-right text-xs">
+              Waiting for the buyer to pay before the report can be released.
+            </p>
           ) : null}
         </div>
       </div>

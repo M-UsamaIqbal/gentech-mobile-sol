@@ -6,7 +6,10 @@ import { getCurrentUser } from "@/lib/session";
 import { getMyInspections } from "@/features/inspections/services/inspection.service";
 import { MyInspectionsList } from "@/features/inspections/components/my-inspections-list";
 
-export const metadata: Metadata = { title: "My Inspections" };
+export const metadata: Metadata = { 
+  title: "My Inspections",
+  robots: { index: false, follow: false },
+};
 
 export default async function MyInspectionsPage() {
   const user = await getCurrentUser();

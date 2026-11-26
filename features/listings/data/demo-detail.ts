@@ -1,5 +1,6 @@
 import { LISTING_CONDITION_LABELS } from "@/lib/constants";
-import { DEMO_LISTINGS } from "@/features/marketplace/data/fixtures";
+import { getDemoListings } from "@/features/marketplace/data/fixtures";
+import type { Region } from "@/lib/generated/prisma/enums";
 import type { AttributePair, ListingCardData, ListingDetail } from "@/types/marketplace";
 
 /** Best-effort spec extraction from a demo title (e.g. "12GB/256GB"). */
@@ -18,9 +19,10 @@ function parseSpecs(title: string): AttributePair[] {
   return pairs;
 }
 
-function toDemoDetail(card: ListingCardData): ListingDetail {
+function toDemoDetail(card: ListingCardData, region?: Region): ListingDetail {
   const conditionLabel = LISTING_CONDITION_LABELS[card.condition];
-  const ptaApproved = /pta/i.test(card.title);
+  const isPakistan = region !== "BAHRAIN";
+  const ptaApproved = isPakistan && /pta/i.test(card.title);
 
   const attributes: AttributePair[] = [];
   if (card.brand) attributes.push({ label: "Brand", value: card.brand });
@@ -36,7 +38,8 @@ function toDemoDetail(card: ListingCardData): ListingDetail {
       card.negotiable ? "Price is negotiable — serious buyers only. " : ""
     }Meet in a safe public place and inspect the device before purchase. Box and accessories included where applicable.`,
     price: card.price,
-    currency: card.currency ?? "PKR",
+    currency: card.currency ?? (isPakistan ? "PKR" : "BHD"),
+    region: card.region ?? (isPakistan ? "PAKISTAN" : "BAHRAIN"),
     condition: card.condition,
     negotiable: Boolean(card.negotiable),
     city: card.city,
@@ -46,7 +49,7 @@ function toDemoDetail(card: ListingCardData): ListingDetail {
     isFeatured: Boolean(card.isFeatured),
     views: card.views ?? 0,
     createdAt: card.createdAt,
-    images: [],
+    images: (card.imageUrls ?? (card.imageUrl ? [card.imageUrl] : [])).map((url) => ({ url })),
     attributes,
     seller: {
       name: "GenTech Seller",
@@ -58,17 +61,19 @@ function toDemoDetail(card: ListingCardData): ListingDetail {
   };
 }
 
-export function getDemoListingDetail(slug: string): ListingDetail | null {
-  const card = DEMO_LISTINGS.find((l) => l.slug === slug);
-  return card ? toDemoDetail(card) : null;
+export function getDemoListingDetail(slug: string, region?: Region): ListingDetail | null {
+  const card = getDemoListings(region).find((listing) => listing.slug === slug);
+  return card ? toDemoDetail(card, region) : null;
 }
 
 export function getDemoRelated(
   categorySlug: string | undefined,
   excludeId: string,
+  region?: Region,
   limit = 4,
 ): ListingCardData[] {
-  return DEMO_LISTINGS.filter(
-    (l) => l.id !== excludeId && (!categorySlug || l.categorySlug === categorySlug),
+  return getDemoListings(region).filter(
+    (listing) =>
+      listing.id !== excludeId && (!categorySlug || listing.categorySlug === categorySlug),
   ).slice(0, limit);
 }

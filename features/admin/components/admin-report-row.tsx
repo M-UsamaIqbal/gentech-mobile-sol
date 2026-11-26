@@ -38,6 +38,13 @@ export function AdminReportRow({ report }: { report: AdminReportRowData }) {
   const [pending, setPending] = React.useState(false);
 
   async function setStatus(status: ReportStatus) {
+    if (
+      status === REPORT_STATUSES.DISMISSED &&
+      !window.confirm("Dismiss this report? The reported content will remain unchanged.")
+    ) {
+      return;
+    }
+
     setPending(true);
     const result = await setReportStatusAction({ reportId: report.id, status });
     setPending(false);
@@ -50,10 +57,10 @@ export function AdminReportRow({ report }: { report: AdminReportRowData }) {
   }
 
   return (
-    <div className="flex items-start gap-3 p-3">
+    <div className="flex items-start gap-3 p-3 transition-colors hover:bg-white/[0.02] sm:px-4">
       <div className="min-w-0 flex-1">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="font-medium">
+          <span className="text-sm font-semibold text-slate-100">
             {REPORT_REASON_LABELS[report.reason] ?? report.reason}
           </span>
           <Badge variant="outline" className={cn(STATUS_CLASSES[report.status])}>
@@ -90,7 +97,7 @@ export function AdminReportRow({ report }: { report: AdminReportRowData }) {
               variant="ghost"
               size="icon"
               className="size-8 shrink-0"
-              aria-label="Report actions"
+              aria-label={`Actions for ${REPORT_REASON_LABELS[report.reason] ?? report.reason} report`}
               disabled={pending}
             />
           }
@@ -102,15 +109,15 @@ export function AdminReportRow({ report }: { report: AdminReportRowData }) {
           )}
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          <DropdownMenuItem onClick={() => setStatus(REPORT_STATUSES.REVIEWING)}>
+          <DropdownMenuItem disabled={pending} onClick={() => setStatus(REPORT_STATUSES.REVIEWING)}>
             <Eye className="size-4" />
             Mark reviewing
           </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => setStatus(REPORT_STATUSES.RESOLVED)}>
+          <DropdownMenuItem disabled={pending} onClick={() => setStatus(REPORT_STATUSES.RESOLVED)}>
             <Check className="size-4" />
             Resolve
           </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => setStatus(REPORT_STATUSES.DISMISSED)}>
+          <DropdownMenuItem disabled={pending} onClick={() => setStatus(REPORT_STATUSES.DISMISSED)}>
             <X className="size-4" />
             Dismiss
           </DropdownMenuItem>

@@ -4,7 +4,6 @@ import { createAuthClient } from "better-auth/react";
 import { inferAdditionalFields } from "better-auth/client/plugins";
 
 import type { auth } from "@/lib/auth";
-import { env } from "@/lib/env";
 
 /**
  * Browser-side auth client. `inferAdditionalFields<typeof auth>()` makes custom
@@ -12,7 +11,7 @@ import { env } from "@/lib/env";
  * the `auth` import is type-only and is erased at build time.
  */
 export const authClient = createAuthClient({
-  baseURL: env.NEXT_PUBLIC_APP_URL,
+  baseURL: typeof window === "undefined" ? undefined : window.location.origin,
   plugins: [inferAdditionalFields<typeof auth>()],
 });
 

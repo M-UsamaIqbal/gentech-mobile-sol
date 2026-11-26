@@ -1,16 +1,18 @@
 "use client";
 
 import * as React from "react";
-import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { useTranslations } from "next-intl";
 import { Layers, Loader2, Search, Smartphone, Tag } from "lucide-react";
 
 import { cn } from "@/lib/utils";
-import { PK_CITIES, ROUTES } from "@/lib/constants";
+import { LocalizedLink } from "@/components/localized-link";
+import { useLocalizedRouteInfo, withLocalizedPrefix } from "@/lib/localized-routing";
 import { trackSearch } from "@/features/analytics/lib/events";
 import { useDebouncedValue } from "@/hooks/use-debounced-value";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import type { LocationTree } from "@/features/locations/services/location.service";
 
 interface Suggestions {
   listings: Array<{ title: string; slug: string }>;
@@ -23,15 +25,19 @@ interface SearchBarProps {
   className?: string;
   withCity?: boolean;
   placeholder?: string;
+  locations?: LocationTree;
 }
 
 export function SearchBar({
   variant = "hero",
   className,
   withCity = variant === "hero",
-  placeholder = "Search iPhone, Samsung, Pixel…",
+  placeholder,
+  locations = [],
 }: SearchBarProps) {
   const router = useRouter();
+  const t = useTranslations("search");
+  const { country, prefix } = useLocalizedRouteInfo();
   const [query, setQuery] = React.useState("");
   const [city, setCity] = React.useState("");
   const [open, setOpen] = React.useState(false);
@@ -41,12 +47,20 @@ export function SearchBar({
   const debounced = useDebouncedValue(query, 200);
   const pending = query.trim().length >= 2 && query !== debounced;
 
-  // Fetch suggestions when the debounced query changes.
+  const relevantLocations = React.useMemo(
+    () =>
+      country
+        ? locations.filter((entry) => entry.code.toUpperCase() === country)
+        : locations,
+    [country, locations],
+  );
+
   React.useEffect(() => {
     const term = debounced.trim();
     if (term.length < 2) return;
     let active = true;
-    fetch(`/api/v1/search/suggest?q=${encodeURIComponent(term)}`)
+    const countryParam = country ? `&country=${country}` : "";
+    fetch(`/api/v1/search/suggest?q=${encodeURIComponent(term)}${countryParam}`)
       .then((r) => (r.ok ? (r.json() as Promise<Suggestions>) : null))
       .then((data) => {
         if (active && data) setResults(data);
@@ -55,9 +69,8 @@ export function SearchBar({
     return () => {
       active = false;
     };
-  }, [debounced]);
+  }, [country, debounced]);
 
-  // Close the dropdown on outside click.
   React.useEffect(() => {
     function onDocClick(e: MouseEvent) {
       if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
@@ -70,7 +83,7 @@ export function SearchBar({
 
   function navigate(href: string) {
     setOpen(false);
-    router.push(href);
+    router.push(withLocalizedPrefix(href, prefix));
   }
 
   function onSubmit(e: React.FormEvent) {
@@ -80,7 +93,7 @@ export function SearchBar({
     if (term) params.set("q", term);
     if (city) params.set("city", city);
     if (term) trackSearch(term, city || undefined);
-    navigate(`${ROUTES.marketplace}${params.toString() ? `?${params.toString()}` : ""}`);
+    navigate(`/marketplace${params.toString() ? `?${params.toString()}` : ""}`);
   }
 
   const hasResults =
@@ -94,16 +107,16 @@ export function SearchBar({
         onSubmit={onSubmit}
         className={cn(
           "flex w-full items-center gap-2",
-          variant === "hero" &&
-            "bg-card rounded-2xl border p-2 shadow-sm sm:gap-0 sm:rounded-full sm:p-1.5",
+          variant === "hero" && "bg-card rounded-xl border p-1.5 shadow-sm sm:gap-0",
+          variant === "compact" && "bg-card rounded-lg border p-1 shadow-sm",
           className,
         )}
       >
         <div className="relative flex-1">
           {pending ? (
-            <Loader2 className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 animate-spin" />
+            <Loader2 className="text-muted-foreground pointer-events-none absolute top-1/2 start-3 size-4 -translate-y-1/2 animate-spin" />
           ) : (
-            <Search className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2" />
+            <Search className="text-muted-foreground pointer-events-none absolute top-1/2 start-3 size-4 -translate-y-1/2" />
           )}
           <Input
             value={query}
@@ -112,13 +125,18 @@ export function SearchBar({
               setOpen(true);
             }}
             onFocus={() => setOpen(true)}
-            placeholder={placeholder}
-            aria-label="Search listings"
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setOpen(false);
+            }}
+            placeholder={placeholder ?? t("placeholder")}
+            aria-label={t("button")}
             autoComplete="off"
             className={cn(
-              "pl-9",
+              "ps-9",
               variant === "hero" &&
                 "h-11 border-0 bg-transparent shadow-none focus-visible:ring-0",
+              variant === "compact" &&
+                "h-9 border-0 bg-transparent shadow-none focus-visible:ring-0",
             )}
           />
         </div>
@@ -127,50 +145,63 @@ export function SearchBar({
           <select
             value={city}
             onChange={(e) => setCity(e.target.value)}
-            aria-label="Filter by city"
-            className="border-input bg-background h-11 rounded-md border px-3 text-sm sm:border-0 sm:bg-transparent"
+            aria-label={t("allCities")}
+            className={cn(
+              "border-input bg-background h-11 rounded-md border px-3 text-sm",
+              variant === "hero" && "sm:border-0 sm:bg-transparent",
+              variant === "compact" && "h-9 border-0 bg-transparent px-2",
+            )}
           >
-            <option value="">All cities</option>
-            {PK_CITIES.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
+            <option value="">{t("allCities")}</option>
+            {relevantLocations.flatMap((entry) =>
+              entry.cities.map((item) => (
+                <option key={item.id} value={item.name}>
+                  {item.name}
+                </option>
+              )),
+            )}
           </select>
         ) : null}
 
-        <Button type="submit" size={variant === "hero" ? "lg" : "default"} className="rounded-full">
+        <Button
+          type="submit"
+          size={variant === "hero" ? "lg" : "default"}
+          className={cn(
+            "shrink-0 rounded-lg bg-brand text-brand-foreground hover:bg-brand/90",
+            variant === "compact" && "h-9 px-3 text-sm",
+          )}
+        >
           <Search className="size-4 sm:hidden" />
-          <span className="hidden sm:inline">Search</span>
+          <span className="hidden sm:inline">{t("button")}</span>
         </Button>
       </form>
 
       {showDropdown && results ? (
-        <div className="bg-popover absolute top-full z-50 mt-2 w-full overflow-hidden rounded-xl border shadow-lg">
+        <div className="bg-popover absolute top-full z-50 mt-2 max-h-[min(60vh,22rem)] w-full overflow-y-auto overscroll-contain rounded-xl border border-brand/20 shadow-lg">
           {results.listings.length > 0 ? (
-            <Group label="Listings">
-              {results.listings.map((l) => (
+            <Group label={t("groupListings")}>
+              {results.listings.map((listing) => (
                 <button
-                  key={l.slug}
+                  key={listing.slug}
                   type="button"
-                  onClick={() => navigate(`/listings/${l.slug}`)}
-                  className="hover:bg-accent flex w-full items-center gap-2 px-3 py-2 text-left text-sm"
+                  onClick={() => navigate(`/listings/${listing.slug}`)}
+                  className="hover:bg-accent flex w-full items-center gap-2 px-3 py-2 text-start text-sm"
                 >
                   <Smartphone className="text-muted-foreground size-4 shrink-0" />
-                  <span className="truncate">{l.title}</span>
+                  <span className="truncate">{listing.title}</span>
                 </button>
               ))}
             </Group>
           ) : null}
 
           {results.categories.length > 0 ? (
-            <Group label="Categories">
-              {results.categories.map((c) => (
+            <Group label={t("groupCategories")}>
+              {results.categories.map((category) => (
                 <SuggestionLink
-                  key={c.slug}
-                  href={`${ROUTES.marketplace}?category=${c.slug}`}
+                  key={category.slug}
+                  href={`/marketplace?category=${category.slug}`}
                   icon={<Layers className="text-muted-foreground size-4 shrink-0" />}
-                  label={c.name}
+                  label={category.name}
                   onSelect={() => setOpen(false)}
                 />
               ))}
@@ -178,13 +209,13 @@ export function SearchBar({
           ) : null}
 
           {results.brands.length > 0 ? (
-            <Group label="Brands">
-              {results.brands.map((b) => (
+            <Group label={t("groupBrands")}>
+              {results.brands.map((brand) => (
                 <SuggestionLink
-                  key={b.slug}
-                  href={`${ROUTES.marketplace}?brand=${b.slug}`}
+                  key={brand.slug}
+                  href={`/marketplace?brand=${brand.slug}`}
                   icon={<Tag className="text-muted-foreground size-4 shrink-0" />}
-                  label={b.name}
+                  label={brand.name}
                   onSelect={() => setOpen(false)}
                 />
               ))}
@@ -217,13 +248,13 @@ function SuggestionLink({
   onSelect: () => void;
 }) {
   return (
-    <Link
+    <LocalizedLink
       href={href}
       onClick={onSelect}
       className="hover:bg-accent flex items-center gap-2 px-3 py-2 text-sm"
     >
       {icon}
       <span className="truncate">{label}</span>
-    </Link>
+    </LocalizedLink>
   );
 }

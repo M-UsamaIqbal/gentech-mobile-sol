@@ -34,18 +34,38 @@ export async function startConversationForListing(
 ): Promise<string> {
   const listing = await prisma.listing.findFirst({
     where: { id: listingId, deletedAt: null },
-    select: { id: true, sellerId: true },
+    select: { id: true, sellerId: true, dealerId: true },
   });
   if (!listing) throw new MessagingError("This listing is no longer available.");
   if (listing.sellerId === buyerId) {
     throw new MessagingError("You can't start a chat on your own listing.");
   }
 
-  return getOrCreateConversation({
+  const conversationId = await getOrCreateConversation({
     listingId: listing.id,
     buyerId,
     sellerId: listing.sellerId,
   });
+
+  // Create dealer lead if this is a dealer listing
+  if (listing.dealerId) {
+    await prisma.dealerLead.create({
+      data: {
+        dealerId: listing.dealerId,
+        buyerId,
+        listingId: listing.id,
+        conversationId,
+        status: "NEW",
+      },
+    }).catch((error) => {
+      // Ignore duplicate key errors (lead already exists)
+      if (error instanceof Error && !error.message.includes("unique constraint")) {
+        console.warn("[messaging] failed to create dealer lead:", error);
+      }
+    });
+  }
+
+  return conversationId;
 }
 
 /** A user's conversations. Returns an empty list if the database is unavailable. */

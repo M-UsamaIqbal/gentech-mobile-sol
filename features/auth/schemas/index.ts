@@ -23,6 +23,7 @@ export const signUpSchema = z
     email,
     password,
     confirmPassword: z.string(),
+    region: z.enum(["BAHRAIN", "PAKISTAN"]),
   })
   .refine((data) => data.password === data.confirmPassword, {
     message: "Passwords do not match.",

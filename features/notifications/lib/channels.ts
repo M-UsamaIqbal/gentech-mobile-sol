@@ -1,6 +1,7 @@
 import "server-only";
 
 import { APP } from "@/lib/constants";
+import { APP_URL } from "@/lib/app-url";
 import type { NotificationType } from "@/lib/constants";
 import { sendEmail } from "@/lib/email";
 
@@ -37,10 +38,10 @@ const emailChannel: NotificationChannel = {
   async deliver(payload) {
     if (!payload.email || !payload.recipientEmail) return;
     const link = !payload.url
-      ? APP.url
+      ? APP_URL
       : payload.url.startsWith("http")
         ? payload.url
-        : `${APP.url}${payload.url}`;
+        : `${APP_URL}${payload.url}`;
     const text = `${payload.body ?? payload.title}\n\nOpen ${APP.name}: ${link}`;
     try {
       await sendEmail({ to: payload.recipientEmail, subject: payload.title, text });

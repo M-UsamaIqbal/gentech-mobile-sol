@@ -96,7 +96,7 @@ export function InspectionReportView({ report }: { report: InspectionReportDto }
           <Fact label="PTA Approved" value={report.ptaApproved ? "Yes" : "No"} />
         ) : null}
         {report.batteryHealth !== null ? (
-          <Fact label="Battery Health" value={`${report.batteryHealth}%`} />
+          <Fact label="Battery" value={`${report.batteryHealth}%`} />
         ) : null}
       </div>
 

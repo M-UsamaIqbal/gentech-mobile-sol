@@ -12,13 +12,22 @@ import {
   type UserRole,
 } from "@/lib/constants";
 import { slugify } from "@/utils/slug";
+import {
+  buildConversionFunnel,
+  type ConversionFunnelRow,
+} from "@/features/admin/lib/conversion-funnel";
 import type {
   AdminCategoryRow,
+  ConversionFunnel,
   AdminListingRow,
   AdminReportRow,
   AdminUserRow,
+  MarketRegion,
   Paginated,
   PlatformStats,
+  RegionAnalytics,
+  RegionLocationCount,
+  RegionMetric,
 } from "@/features/admin/types";
 
 const PAGE_SIZE = PAGINATION.defaultPageSize;
@@ -40,7 +49,15 @@ function paginate<T>(items: T[], total: number, page: number): Paginated<T> {
 export async function getPlatformStats(): Promise<PlatformStats> {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-  const [totalUsers, newUsers7d, statusGroups, openReports] = await Promise.all([
+  const [
+    totalUsers,
+    newUsers7d,
+    statusGroups,
+    openReports,
+    totalBrands,
+    totalModels,
+    totalDealers,
+  ] = await Promise.all([
     prisma.user.count({ where: { deletedAt: null } }),
     prisma.user.count({ where: { deletedAt: null, createdAt: { gte: sevenDaysAgo } } }),
     prisma.listing.groupBy({
@@ -49,6 +66,9 @@ export async function getPlatformStats(): Promise<PlatformStats> {
       _count: { _all: true },
     }),
     prisma.report.count({ where: { status: REPORT_STATUSES.OPEN } }),
+    prisma.brand.count({ where: { isActive: true } }),
+    prisma.phoneModel.count({ where: { isActive: true } }),
+    prisma.dealer.count(),
   ]);
 
   const countByStatus = new Map<ListingStatus, number>(
@@ -60,19 +80,165 @@ export async function getPlatformStats(): Promise<PlatformStats> {
     totalUsers,
     newUsers7d,
     totalListings,
+    pendingListings: countByStatus.get(LISTING_STATUSES.PENDING_APPROVAL) ?? 0,
     activeListings: countByStatus.get(LISTING_STATUSES.ACTIVE) ?? 0,
+    rejectedListings: countByStatus.get(LISTING_STATUSES.REJECTED) ?? 0,
     soldListings: countByStatus.get(LISTING_STATUSES.SOLD) ?? 0,
     openReports,
+    totalBrands,
+    totalModels,
+    totalDealers,
   };
+}
+
+const REGION_CONFIG: ReadonlyArray<{
+  region: MarketRegion;
+  label: string;
+  flag: string;
+  currency: string;
+  countryCodes: readonly string[];
+}> = [
+  { region: "BAHRAIN", label: "Bahrain", flag: "🇧🇭", currency: "BHD", countryCodes: ["BH"] },
+  { region: "PAKISTAN", label: "Pakistan", flag: "🇵🇰", currency: "PKR", countryCodes: ["PK"] },
+];
+
+function toLocationCounts(
+  rows: Array<{ name: string | null; count: number }>,
+): RegionLocationCount[] {
+  return rows
+    .filter((row): row is { name: string; count: number } => Boolean(row.name))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5)
+    .map(({ name, count }) => ({ name, count }));
+}
+
+/**
+ * Region-scoped marketplace metrics. Each region keeps its own currency;
+ * BHD and PKR values are never converted or aggregated into one total.
+ */
+export async function getRegionAnalytics(): Promise<RegionAnalytics> {
+  const [
+    userGroups,
+    listingGroups,
+    activeListingGroups,
+    orderGroups,
+    paymentGroups,
+    cityGroups,
+    areaGroups,
+  ] = await Promise.all([
+    prisma.user.groupBy({
+      by: ["region"],
+      where: { deletedAt: null },
+      _count: { _all: true },
+    }),
+    prisma.listing.groupBy({
+      by: ["region"],
+      where: { deletedAt: null },
+      _count: { _all: true },
+    }),
+    prisma.listing.groupBy({
+      by: ["region"],
+      where: { deletedAt: null, status: LISTING_STATUSES.ACTIVE },
+      _count: { _all: true },
+    }),
+    prisma.order.groupBy({ by: ["region"], _count: { _all: true } }),
+    prisma.payment.groupBy({
+      by: ["country", "currency"],
+      where: { status: "SUCCEEDED" },
+      _count: { _all: true },
+      _sum: { amount: true },
+    }),
+    prisma.listing.groupBy({
+      by: ["region", "city"],
+      where: { deletedAt: null, city: { not: null } },
+      _count: { _all: true },
+    }),
+    prisma.listing.groupBy({
+      by: ["region", "area"],
+      where: { deletedAt: null, area: { not: null } },
+      _count: { _all: true },
+    }),
+  ]);
+
+  const regions: RegionMetric[] = REGION_CONFIG.map((config) => {
+    const users = userGroups.find((g) => g.region === config.region)?._count._all ?? 0;
+    const listings = listingGroups.find((g) => g.region === config.region)?._count._all ?? 0;
+    const activeListings =
+      activeListingGroups.find((g) => g.region === config.region)?._count._all ?? 0;
+    const orders = orderGroups.find((g) => g.region === config.region)?._count._all ?? 0;
+
+    const payments = paymentGroups.filter(
+      (g) =>
+        config.countryCodes.includes(g.country.toUpperCase()) && g.currency === config.currency,
+    );
+
+    return {
+      region: config.region,
+      label: config.label,
+      flag: config.flag,
+      currency: config.currency,
+      users,
+      listings,
+      activeListings,
+      orders,
+      paidPayments: payments.reduce((sum, g) => sum + g._count._all, 0),
+      paymentVolume: payments.reduce((sum, g) => sum + Number(g._sum.amount ?? 0), 0),
+      topCities: toLocationCounts(
+        cityGroups
+          .filter((g) => g.region === config.region)
+          .map((g) => ({ name: g.city, count: g._count._all })),
+      ),
+      topAreas: toLocationCounts(
+        areaGroups
+          .filter((g) => g.region === config.region)
+          .map((g) => ({ name: g.area, count: g._count._all })),
+      ),
+    };
+  });
+
+  return { regions, generatedAt: new Date().toISOString() };
+}
+
+/**
+ * Buyer conversion funnel from persisted state, never from client-side events.
+ * Views, favorites and chats are listing-scoped; orders are region-scoped.
+ */
+export async function getConversionFunnel(): Promise<ConversionFunnel> {
+  const scoped = await Promise.all(
+    REGION_CONFIG.map(async (config) => {
+      const listingWhere = { region: config.region, deletedAt: null } as const;
+      const [views, favorites, chats, orders, paidOrders] = await Promise.all([
+        prisma.listing.aggregate({ where: listingWhere, _sum: { views: true } }),
+        prisma.favorite.count({ where: { listing: listingWhere } }),
+        prisma.conversation.count({ where: { listing: listingWhere } }),
+        prisma.order.count({ where: { region: config.region } }),
+        prisma.order.count({ where: { region: config.region, paymentStatus: "PAID" } }),
+      ]);
+
+      return {
+        region: config.region,
+        label: config.label,
+        flag: config.flag,
+        views: views._sum.views ?? 0,
+        favorites,
+        chats,
+        orders,
+        paidOrders,
+      } satisfies ConversionFunnelRow;
+    }),
+  );
+
+  return { metrics: buildConversionFunnel(scoped), generatedAt: new Date().toISOString() };
 }
 
 // --------------------------------------------------------------------------
 // Users
 // --------------------------------------------------------------------------
 
-export async function listUsers(params: { q?: string; page: number }): Promise<
-  Paginated<AdminUserRow>
-> {
+export async function listUsers(params: {
+  q?: string;
+  page: number;
+}): Promise<Paginated<AdminUserRow>> {
   const where: Prisma.UserWhereInput = {
     deletedAt: null,
     ...(params.q
@@ -151,12 +317,14 @@ export async function isLastAdmin(userId: string): Promise<boolean> {
 export async function listListings(params: {
   q?: string;
   status?: ListingStatus;
+  region?: "BAHRAIN" | "PAKISTAN" | "ALL";
   page: number;
 }): Promise<Paginated<AdminListingRow>> {
   const where: Prisma.ListingWhereInput = {
     deletedAt: null,
     ...(params.status ? { status: params.status } : {}),
     ...(params.q ? { title: { contains: params.q, mode: "insensitive" } } : {}),
+    ...(params.region && params.region !== "ALL" ? { region: params.region } : {}),
   };
   const skip = (params.page - 1) * PAGE_SIZE;
 
@@ -173,6 +341,7 @@ export async function listListings(params: {
         price: true,
         currency: true,
         status: true,
+        region: true,
         city: true,
         views: true,
         createdAt: true,
@@ -189,6 +358,7 @@ export async function listListings(params: {
     price: Number(l.price),
     currency: l.currency,
     status: l.status,
+    region: l.region,
     city: l.city ?? "—",
     views: l.views,
     sellerName: l.seller.name,
@@ -200,14 +370,52 @@ export async function listListings(params: {
 export async function adminSetListingStatus(
   listingId: string,
   status: ListingStatus,
-): Promise<void> {
+): Promise<boolean> {
+  if (status === LISTING_STATUSES.ACTIVE) {
+    const result = await prisma.listing.updateMany({
+      where: { id: listingId, status: { not: LISTING_STATUSES.ACTIVE } },
+      data: { status },
+    });
+    return result.count > 0;
+  }
+
   await prisma.listing.update({ where: { id: listingId }, data: { status } });
+  return false;
 }
 
 export async function adminRemoveListing(listingId: string): Promise<void> {
   await prisma.listing.update({
     where: { id: listingId },
     data: { status: LISTING_STATUSES.REMOVED, deletedAt: new Date() },
+  });
+}
+
+export async function adminApproveListing(listingId: string, adminId: string): Promise<boolean> {
+  const result = await prisma.listing.updateMany({
+    where: { id: listingId, status: LISTING_STATUSES.PENDING_APPROVAL, deletedAt: null },
+    data: {
+      status: LISTING_STATUSES.ACTIVE,
+      reviewedAt: new Date(),
+      reviewedById: adminId,
+      rejectionReason: null,
+    },
+  });
+  return result.count > 0;
+}
+
+export async function adminRejectListing(
+  listingId: string,
+  adminId: string,
+  reason: string,
+): Promise<void> {
+  await prisma.listing.update({
+    where: { id: listingId },
+    data: {
+      status: LISTING_STATUSES.REJECTED,
+      reviewedAt: new Date(),
+      reviewedById: adminId,
+      rejectionReason: reason,
+    },
   });
 }
 
@@ -288,14 +496,15 @@ export async function listCategories(): Promise<AdminCategoryRow[]> {
 }
 
 /** Creates a category with a unique slug derived from its name. */
-export async function createCategory(input: {
-  name: string;
-  parentId?: string;
-}): Promise<void> {
+export async function createCategory(input: { name: string; parentId?: string }): Promise<void> {
   const base = slugify(input.name) || "category";
   // Ensure slug uniqueness without a random suffix (categories want clean URLs).
   let slug = base;
-  for (let i = 2; await prisma.category.findUnique({ where: { slug }, select: { id: true } }); i++) {
+  for (
+    let i = 2;
+    await prisma.category.findUnique({ where: { slug }, select: { id: true } });
+    i++
+  ) {
     slug = `${base}-${i}`;
   }
   await prisma.category.create({

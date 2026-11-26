@@ -12,7 +12,7 @@ export default async function AuthLayout({ children }: { children: React.ReactNo
   if (session) redirect(ROUTES.dashboard);
 
   return (
-    <main className="bg-muted/30 flex min-h-svh flex-col items-center justify-center px-4 py-10">
+    <main id="main-content" className="bg-muted/30 flex min-h-svh flex-col items-center justify-center px-4 py-10">
       <div className="w-full max-w-sm">
         <Link
           href={ROUTES.home}

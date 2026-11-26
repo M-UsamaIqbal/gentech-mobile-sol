@@ -7,7 +7,10 @@ import { getCurrentUser } from "@/lib/session";
 import { getNotifications } from "@/features/notifications/services/notification.service";
 import { NotificationList } from "@/features/notifications/components/notification-list";
 
-export const metadata: Metadata = { title: "Notifications" };
+export const metadata: Metadata = { 
+  title: "Notifications",
+  robots: { index: false, follow: false },
+};
 
 export default async function NotificationsPage() {
   const user = await getCurrentUser();

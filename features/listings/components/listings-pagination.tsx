@@ -1,13 +1,13 @@
 "use client";
 
 import Link from "next/link";
+import { useTranslations } from "next-intl";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { buttonVariants } from "@/components/ui/button";
 import { useListingHref } from "@/features/listings/hooks/use-listing-href";
 
-/** Builds a compact page-number window around the current page. */
 function pageWindow(current: number, total: number): number[] {
   const span = 1;
   const pages = new Set<number>([1, total, current]);
@@ -19,6 +19,7 @@ function pageWindow(current: number, total: number): number[] {
 
 export function ListingsPagination({ page, totalPages }: { page: number; totalPages: number }) {
   const buildHref = useListingHref();
+  const t = useTranslations("pagination");
   if (totalPages <= 1) return null;
 
   const pages = pageWindow(page, totalPages);
@@ -30,7 +31,7 @@ export function ListingsPagination({ page, totalPages }: { page: number; totalPa
     );
 
   return (
-    <nav className="mt-8 flex items-center justify-center gap-1.5" aria-label="Pagination">
+    <nav className="mt-8 flex items-center justify-center gap-1.5" aria-label={t("aria")}>
       <Link
         href={buildHref({ page: String(page - 1) }, { resetPage: false })}
         className={cn(
@@ -38,23 +39,23 @@ export function ListingsPagination({ page, totalPages }: { page: number; totalPa
           page <= 1 && "pointer-events-none opacity-50",
         )}
         aria-disabled={page <= 1}
-        aria-label="Previous page"
+        aria-label={t("previous")}
       >
-        <ChevronLeft className="size-4" />
+        <ChevronLeft className="size-4 rtl:rotate-180" />
       </Link>
 
-      {pages.map((p, i) => {
-        const prev = pages[i - 1];
-        const gap = prev !== undefined && p - prev > 1;
+      {pages.map((currentPage, index) => {
+        const previous = pages[index - 1];
+        const gap = previous !== undefined && currentPage - previous > 1;
         return (
-          <span key={p} className="flex items-center gap-1.5">
+          <span key={currentPage} className="flex items-center gap-1.5">
             {gap ? <span className="text-muted-foreground px-1">…</span> : null}
             <Link
-              href={buildHref({ page: String(p) }, { resetPage: false })}
-              className={linkCls(p === page)}
-              aria-current={p === page ? "page" : undefined}
+              href={buildHref({ page: String(currentPage) }, { resetPage: false })}
+              className={linkCls(currentPage === page)}
+              aria-current={currentPage === page ? "page" : undefined}
             >
-              {p}
+              {currentPage}
             </Link>
           </span>
         );
@@ -67,9 +68,9 @@ export function ListingsPagination({ page, totalPages }: { page: number; totalPa
           page >= totalPages && "pointer-events-none opacity-50",
         )}
         aria-disabled={page >= totalPages}
-        aria-label="Next page"
+        aria-label={t("next")}
       >
-        <ChevronRight className="size-4" />
+        <ChevronRight className="size-4 rtl:rotate-180" />
       </Link>
     </nav>
   );

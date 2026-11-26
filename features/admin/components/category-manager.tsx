@@ -35,7 +35,10 @@ export function CategoryManager({ categories, parentOptions }: CategoryManagerPr
       return;
     }
     setCreating(true);
-    const result = await createCategoryAction({ name: name.trim(), parentId: parentId || undefined });
+    const result = await createCategoryAction({
+      name: name.trim(),
+      parentId: parentId || undefined,
+    });
     setCreating(false);
     if (!result.ok) {
       toast.error(result.error ?? "Could not create category.");
@@ -49,7 +52,22 @@ export function CategoryManager({ categories, parentOptions }: CategoryManagerPr
 
   return (
     <div className="space-y-6">
-      <form onSubmit={create} className="bg-card flex flex-wrap items-end gap-3 rounded-xl border p-4">
+      <header>
+        <p className="text-xs font-semibold tracking-[0.16em] text-emerald-300 uppercase">
+          Marketplace catalog
+        </p>
+        <h1 className="mt-2 text-2xl font-bold tracking-tight text-white sm:text-3xl">
+          Categories
+        </h1>
+        <p className="mt-1 text-sm text-slate-400">
+          Organize the categories buyers use to browse marketplace listings.
+        </p>
+      </header>
+
+      <form
+        onSubmit={create}
+        className="bg-card flex flex-wrap items-end gap-3 rounded-xl border p-4"
+      >
         <div className="flex-1">
           <label htmlFor="cat-name" className="mb-1 block text-sm font-medium">
             New category

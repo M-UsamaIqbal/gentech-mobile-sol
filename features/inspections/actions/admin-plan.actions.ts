@@ -1,8 +1,9 @@
 "use server";
 
-import { revalidatePath } from "next/cache";
+import { revalidatePath, updateTag } from "next/cache";
 import { z } from "zod";
 
+import { CACHE_TAGS } from "@/lib/cache";
 import { ROUTES } from "@/lib/constants";
 import { requireAdmin } from "@/features/admin/lib/require-admin";
 import {
@@ -23,6 +24,7 @@ const GENERIC_ERROR = "Something went wrong. Please try again.";
 function revalidatePlans() {
   revalidatePath(ROUTES.adminInspections);
   revalidatePath(ROUTES.inspectionService);
+  updateTag(CACHE_TAGS.catalog);
 }
 
 /** Admin creates an inspection package. */

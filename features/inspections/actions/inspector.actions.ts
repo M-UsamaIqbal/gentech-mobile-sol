@@ -21,6 +21,13 @@ type ActionResult = { ok: boolean; error?: string };
 const FORBIDDEN = "Inspector access required.";
 const GENERIC_ERROR = "Something went wrong. Please try again.";
 
+const REPORT_ERRORS = {
+  NOT_ASSIGNED: "You can only report on requests assigned to you.",
+  ALREADY_REPORTED: "A report has already been submitted for this request.",
+  NOT_REPORTABLE: "This request was cancelled, expired, or is already closed.",
+  UNPAID: "The inspection fee has not been paid, so the report cannot be released.",
+} as const;
+
 function revalidateInspectorSurfaces() {
   revalidatePath(ROUTES.inspector);
 }
@@ -78,9 +85,9 @@ export async function submitReportAction(input: SubmitReportInput): Promise<Acti
   }
 
   try {
-    const ok = await submitInspectionReport(parsed.data, inspector.id);
-    if (!ok) {
-      return { ok: false, error: "You can only report on requests assigned to you." };
+    const result = await submitInspectionReport(parsed.data, inspector.id);
+    if (!result.ok) {
+      return { ok: false, error: REPORT_ERRORS[result.reason] };
     }
     revalidateInspectorSurfaces();
     return { ok: true };

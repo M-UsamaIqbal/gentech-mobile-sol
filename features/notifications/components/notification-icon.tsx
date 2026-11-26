@@ -1,5 +1,6 @@
 import {
   Bell,
+  Bookmark,
   Clock,
   MessageSquare,
   ShieldCheck,
@@ -17,6 +18,7 @@ const ICONS: Record<NotificationType, LucideIcon> = {
   [NOTIFICATION_TYPES.LISTING_EXPIRED]: Clock,
   [NOTIFICATION_TYPES.NEW_REVIEW]: Star,
   [NOTIFICATION_TYPES.PRICE_DROP]: TrendingDown,
+  [NOTIFICATION_TYPES.SAVED_SEARCH_MATCH]: Bookmark,
   [NOTIFICATION_TYPES.SYSTEM]: Bell,
   [NOTIFICATION_TYPES.INSPECTION_REQUESTED]: ShieldCheck,
   [NOTIFICATION_TYPES.INSPECTION_SCHEDULED]: ShieldCheck,

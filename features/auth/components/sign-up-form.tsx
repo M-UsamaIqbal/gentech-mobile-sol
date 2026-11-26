@@ -8,7 +8,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
-import { signUp } from "@/lib/auth-client";
+import { authClient, signUp } from "@/lib/auth-client";
 import { ROUTES } from "@/lib/constants";
 import { signUpSchema, type SignUpInput } from "@/features/auth/schemas";
 import { SocialButtons, type EnabledSocialProviders } from "./social-buttons";
@@ -29,7 +29,7 @@ export function SignUpForm({ providers }: { providers: EnabledSocialProviders })
   const router = useRouter();
   const form = useForm<SignUpInput>({
     resolver: zodResolver(signUpSchema),
-    defaultValues: { name: "", email: "", password: "", confirmPassword: "" },
+    defaultValues: { name: "", email: "", password: "", confirmPassword: "", region: "PAKISTAN" },
   });
 
   async function onSubmit(values: SignUpInput) {
@@ -37,6 +37,7 @@ export function SignUpForm({ providers }: { providers: EnabledSocialProviders })
       name: values.name,
       email: values.email,
       password: values.password,
+      region: values.region,
       callbackURL: ROUTES.dashboard,
     });
 
@@ -45,8 +46,18 @@ export function SignUpForm({ providers }: { providers: EnabledSocialProviders })
       return;
     }
 
-    toast.success("Account created — check your email to verify your address.");
-    router.push(`${ROUTES.verifyEmail}?email=${encodeURIComponent(values.email)}`);
+    // The first account is promoted to ADMIN by a post-create database hook,
+    // after the sign-up response is built. Refresh from the database so the
+    // session cookie cache carries the persisted role instead of USER.
+    try {
+      await authClient.getSession({ query: { disableCookieCache: true } });
+    } catch {
+      // Non-fatal: the cache refreshes itself within its 5-minute window.
+    }
+
+    toast.success("Account created. Welcome to GenTech!");
+    router.push(ROUTES.dashboard);
+    router.refresh();
   }
 
   const isSubmitting = form.formState.isSubmitting;
@@ -118,6 +129,26 @@ export function SignUpForm({ providers }: { providers: EnabledSocialProviders })
                     placeholder="••••••••"
                     {...field}
                   />
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name="region"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Your Region</FormLabel>
+                <FormControl>
+                  <select
+                    {...field}
+                    className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <option value="PAKISTAN">Pakistan</option>
+                    <option value="BAHRAIN">Bahrain</option>
+                  </select>
                 </FormControl>
                 <FormMessage />
               </FormItem>

@@ -6,11 +6,13 @@ import { z } from "zod";
 import { ROUTES } from "@/lib/constants";
 import { getCurrentUser } from "@/lib/session";
 import { prisma } from "@/lib/prisma";
+import { getRequestCountryLocale } from "@/lib/countries/server";
+import { validatePhoneForCountry } from "@/lib/validation/phone";
 
 const profileSchema = z.object({
   name: z.string().min(2, "Name must be at least 2 characters").max(80),
   bio: z.string().max(300).optional(),
-  phone: z.string().max(20).optional(),
+  phone: z.string().trim().max(24).optional(),
   city: z.string().max(80).optional(),
 });
 
@@ -30,6 +32,10 @@ export async function updateProfileAction(formData: FormData): Promise<ActionRes
   if (!parsed.success) {
     return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid input." };
   }
+
+  const { country } = await getRequestCountryLocale();
+  const phoneError = validatePhoneForCountry(parsed.data.phone, country);
+  if (phoneError) return { ok: false, error: phoneError };
 
   const { name, bio, phone, city } = parsed.data;
 

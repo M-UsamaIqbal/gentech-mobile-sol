@@ -11,7 +11,10 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Separator } from "@/components/ui/separator";
 import { AccountForm } from "./account-form";
 
-export const metadata: Metadata = { title: "My Profile" };
+export const metadata: Metadata = { 
+  title: "My Profile",
+  robots: { index: false, follow: false },
+};
 
 function initials(name: string) {
   return (

@@ -12,6 +12,8 @@ import {
 import { getCurrentUser } from "@/lib/session";
 import { getInspection } from "@/features/inspections/services/inspection.service";
 import { PaymentCheckout } from "@/features/inspections/components/payment-checkout";
+import { getPayFastConfiguredMethod } from "@/features/inspections/payments/payfast.provider";
+import { getPaymentProvider } from "@/features/inspections/payments";
 
 export const metadata: Metadata = { title: "Pay for inspection" };
 
@@ -39,6 +41,17 @@ export default async function InspectionPayPage({ params, searchParams }: PagePr
   if (request.paymentStatus === INSPECTION_PAYMENT_STATUSES.PAID) redirect(ROUTES.inspections);
 
   const title = request.listing?.title ?? request.deviceInfo ?? "Inspection";
+  const provider = getPaymentProvider();
+  const paymentMode =
+    provider?.id === "payfast"
+      ? "payfast"
+      : provider?.id === "sandbox"
+        ? "sandbox"
+        : "unavailable";
+  const configuredMethods =
+    paymentMode === "payfast"
+      ? (Object.values(PAYMENT_METHODS) as PaymentMethod[]).filter(getPayFastConfiguredMethod)
+      : (Object.values(PAYMENT_METHODS) as PaymentMethod[]);
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-10">
@@ -65,6 +78,9 @@ export default async function InspectionPayPage({ params, searchParams }: PagePr
         amount={request.feeAmount}
         currency={request.currency}
         initialMethod={parseMethod(method)}
+        paymentMode={paymentMode}
+        initialPaymentStatus={request.paymentStatus}
+        configuredMethods={configuredMethods}
       />
     </div>
   );

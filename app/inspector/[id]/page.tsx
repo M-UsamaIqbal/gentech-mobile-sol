@@ -3,13 +3,14 @@ import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 import { ArrowLeft } from "lucide-react";
 
-import { ROUTES, USER_ROLES } from "@/lib/constants";
+import { INSPECTION_PAYMENT_STATUSES, ROUTES, USER_ROLES } from "@/lib/constants";
 import { formatPrice } from "@/utils/format";
 import { getCurrentUser } from "@/lib/session";
 import { getInspection } from "@/features/inspections/services/inspection.service";
 import { SubmitReportForm } from "@/features/inspections/components/submit-report-form";
 import { InspectionReportView } from "@/features/inspections/components/inspection-report-view";
 import { InspectionStatusBadge } from "@/features/inspections/components/inspection-status-badge";
+import { canSubmitInspectionReport } from "@/features/inspections/lib/inspection-state";
 
 export const metadata: Metadata = { title: "Inspection report" };
 
@@ -60,10 +61,19 @@ export default async function InspectorReportPage({ params }: PageProps) {
           <h2 className="mb-4 text-lg font-semibold">Submitted report</h2>
           <InspectionReportView report={request.report} />
         </div>
-      ) : (
+      ) : canSubmitInspectionReport(request) ? (
         <div className="bg-card rounded-xl border p-5">
           <h2 className="mb-4 text-lg font-semibold">Complete the inspection</h2>
-          <SubmitReportForm requestId={request.id} />
+          <SubmitReportForm requestId={request.id} inspectionKind={request.inspectionKind} />
+        </div>
+      ) : (
+        <div className="bg-card rounded-xl border p-5">
+          <h2 className="mb-2 text-lg font-semibold">Report locked</h2>
+          <p className="text-muted-foreground text-sm">
+            {request.paymentStatus === INSPECTION_PAYMENT_STATUSES.PAID
+              ? "This request was cancelled or is no longer open, so a report cannot be submitted."
+              : "The inspection fee has not been paid yet. The report can be submitted once payment is confirmed."}
+          </p>
         </div>
       )}
     </div>

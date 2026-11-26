@@ -18,10 +18,12 @@ function initials(name: string) {
 export function SellerCard({
   seller,
   listingId,
+  listingTitle,
   isAuthenticated,
 }: {
   seller: ListingSeller;
   listingId: string;
+  listingTitle: string;
   isAuthenticated: boolean;
 }) {
   const memberSinceYear = seller.memberSince
@@ -68,7 +70,12 @@ export function SellerCard({
       </dl>
 
       <div className="mt-4">
-        <ContactSeller listingId={listingId} isAuthenticated={isAuthenticated} />
+        <ContactSeller
+          listingId={listingId}
+          listingTitle={listingTitle}
+          phone={seller.phone}
+          isAuthenticated={isAuthenticated}
+        />
       </div>
     </div>
   );

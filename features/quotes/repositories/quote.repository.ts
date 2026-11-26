@@ -35,9 +35,9 @@ const phoneModelSelect = {
   ptaStatus: true,
   basePricePkr: true,
   isActive: true,
-} satisfies Prisma.PhoneModelSelect;
+} satisfies Prisma.QuotePriceBookSelect;
 
-type PhoneModelRow = Prisma.PhoneModelGetPayload<{ select: typeof phoneModelSelect }>;
+type PhoneModelRow = Prisma.QuotePriceBookGetPayload<{ select: typeof phoneModelSelect }>;
 
 function toPhoneModelDto(row: PhoneModelRow): PhoneModelDto {
   return {
@@ -53,7 +53,7 @@ function toPhoneModelDto(row: PhoneModelRow): PhoneModelDto {
 
 /** Every price-book row (admin view), ordered for a readable table. */
 export async function listAllPhoneModels(): Promise<PhoneModelDto[]> {
-  const rows = await prisma.phoneModel.findMany({
+  const rows = await prisma.quotePriceBook.findMany({
     orderBy: [{ brand: "asc" }, { model: "asc" }, { storage: "asc" }, { ptaStatus: "asc" }],
     select: phoneModelSelect,
   });
@@ -62,7 +62,7 @@ export async function listAllPhoneModels(): Promise<PhoneModelDto[]> {
 
 /** Active rows, grouped into the cascading Brand → Model → Storage catalog. */
 export async function getActiveCatalog(): Promise<CatalogDto> {
-  const rows = await prisma.phoneModel.findMany({
+  const rows = await prisma.quotePriceBook.findMany({
     where: { isActive: true },
     orderBy: [{ brand: "asc" }, { model: "asc" }, { storage: "asc" }],
     select: phoneModelSelect,
@@ -99,7 +99,7 @@ export async function findPhoneModel(
   storage: string,
   ptaStatus: PtaStatus,
 ): Promise<PhoneModelDto | null> {
-  const row = await prisma.phoneModel.findUnique({
+  const row = await prisma.quotePriceBook.findUnique({
     where: {
       brand_model_storage_ptaStatus: { brand, model, storage, ptaStatus },
     },
@@ -116,7 +116,7 @@ export async function createPhoneModel(data: {
   basePricePkr: number;
   isActive?: boolean;
 }): Promise<void> {
-  await prisma.phoneModel.create({
+  await prisma.quotePriceBook.create({
     data: {
       brand: data.brand,
       model: data.model,
@@ -139,7 +139,7 @@ export async function updatePhoneModel(
     isActive?: boolean;
   },
 ): Promise<void> {
-  await prisma.phoneModel.update({
+  await prisma.quotePriceBook.update({
     where: { id },
     data: {
       brand: data.brand,
@@ -153,7 +153,7 @@ export async function updatePhoneModel(
 }
 
 export async function deletePhoneModel(id: string): Promise<void> {
-  await prisma.phoneModel.delete({ where: { id } });
+  await prisma.quotePriceBook.delete({ where: { id } });
 }
 
 // ---------------------------------------------------------------------------

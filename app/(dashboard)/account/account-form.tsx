@@ -61,7 +61,7 @@ export function AccountForm({ name, bio, phone, city }: Props) {
           <Input id="name" name="name" defaultValue={name} required minLength={2} maxLength={80} />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="phone">Phone number</Label>
+          <Label htmlFor="phone">Phone number for WhatsApp inquiries</Label>
           <Input
             id="phone"
             name="phone"
@@ -70,6 +70,9 @@ export function AccountForm({ name, bio, phone, city }: Props) {
             placeholder="+92 300 0000000"
             maxLength={20}
           />
+          <p className="text-muted-foreground text-xs">
+            Buyers can use this number to contact you from your active listings.
+          </p>
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="city">City</Label>

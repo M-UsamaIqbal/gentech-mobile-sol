@@ -1,9 +1,12 @@
 import { redirect } from "next/navigation";
 
-import { ROUTES } from "@/lib/constants";
-import { requireAdmin } from "@/features/admin/lib/require-admin";
+import { MobileAppNav } from "@/components/layout/mobile-app-nav";
 import { AdminNav } from "@/features/admin/components/admin-nav";
-import { SiteHeader } from "@/components/layout/site-header";
+import { AdminTopbar } from "@/features/admin/components/admin-topbar";
+import { requireAdmin } from "@/features/admin/lib/require-admin";
+import { ROUTES } from "@/lib/constants";
+
+export const dynamic = "force-dynamic";
 
 /**
  * Authoritative authorization boundary for all `/admin` routes. The edge proxy does
@@ -14,15 +17,13 @@ export default async function AdminLayout({ children }: { children: React.ReactN
   if (!admin) redirect(ROUTES.dashboard);
 
   return (
-    <div className="flex min-h-svh flex-col">
-      <SiteHeader />
-      <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-8">
-        <div className="mb-6 space-y-4">
-          <h1 className="text-2xl font-bold tracking-tight">Admin</h1>
-          <AdminNav />
-        </div>
-        {children}
-      </main>
+    <div className="dark flex min-h-svh flex-col bg-[#181818] md:flex-row">
+      <AdminNav />
+      <div className="min-w-0 flex-1">
+        <AdminTopbar name={admin.name} />
+        <main id="main-content" className="mx-auto w-full max-w-[1440px] px-4 py-5 sm:px-7 sm:py-7">{children}</main>
+      </div>
+      <MobileAppNav isAuthenticated />
     </div>
   );
 }

@@ -3,6 +3,7 @@ import type {
   InspectionPaymentStatus,
   InspectionStatus,
   InspectionVerdict,
+  InspectionKind,
   PaymentMethod,
 } from "@/lib/constants";
 
@@ -82,8 +83,10 @@ export interface InspectionRequestDto {
   paymentMethod: PaymentMethod | null;
   /** ISO timestamp when paid, else null. */
   paidAt: string | null;
-  /** Free-text phone description when the request isn't tied to a listing. */
+  /** Free-text device description when the request isn't tied to a listing. */
   deviceInfo: string | null;
+  /** Checklist family used for this request (legacy rows resolve to PHONE). */
+  inspectionKind: InspectionKind;
   contactName: string | null;
   contactPhone: string | null;
   city: string | null;

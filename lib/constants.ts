@@ -6,21 +6,45 @@
 import { env } from "@/lib/env";
 
 /**
- * Fallbacks mirror the defaults in `lib/env.ts`. They matter only when env
- * validation is skipped (e.g. `SKIP_ENV_VALIDATION=1` during a CI build), where
- * Zod defaults are not applied and the raw value may be `undefined`.
+ * The fallback matters only when env validation is skipped (e.g.
+ * `SKIP_ENV_VALIDATION=1` during a CI build), where Zod defaults are not applied.
  */
 const DEFAULT_APP_NAME = "GenTech";
-const DEFAULT_APP_URL = "http://localhost:3000";
 
 /** Application-level metadata. */
 export const APP = {
   name: env.NEXT_PUBLIC_APP_NAME ?? DEFAULT_APP_NAME,
-  url: env.NEXT_PUBLIC_APP_URL ?? DEFAULT_APP_URL,
   description: "Buy and sell mobile phones near you — fast, safe, and simple.",
   locale: "en-PK",
   defaultCurrency: "PKR",
 } as const;
+
+// ---------------------------------------------------------------------------
+// Country & Locale constants for multi-country localization.
+// ---------------------------------------------------------------------------
+
+/** Supported country codes. */
+export const COUNTRY_CODES = {
+  BAHRAIN: "BH",
+  PAKISTAN: "PK",
+} as const;
+
+export type CountryCode = (typeof COUNTRY_CODES)[keyof typeof COUNTRY_CODES];
+
+/** Supported locale codes. */
+export const LOCALES = {
+  ARABIC: "ar",
+  URDU: "ur",
+  ENGLISH: "en",
+} as const;
+
+export type LocaleCode = (typeof LOCALES)[keyof typeof LOCALES];
+
+/** Default country when no preference is set. */
+export const DEFAULT_COUNTRY: CountryCode = COUNTRY_CODES.PAKISTAN;
+
+/** Default locale when no preference is set. */
+export const DEFAULT_LOCALE: LocaleCode = LOCALES.ENGLISH;
 
 /**
  * User roles. A single account may hold buyer + seller capabilities; ADMIN is a
@@ -49,23 +73,38 @@ export const ROUTES = {
   // Account
   dashboard: "/dashboard",
   myListings: "/dashboard/listings",
+  favorites: "/dashboard/favorites",
   savedSearches: "/dashboard/saved-searches",
   messages: "/dashboard/messages",
+  orders: "/dashboard/orders",
   notifications: "/dashboard/notifications",
   inspections: "/dashboard/inspections",
   quotes: "/dashboard/quotes",
   account: "/account",
+  // Public utility pages
+  imeiCheck: "/imei-check",
+  comparison: "/compare",
+  valuation: "/valuation",
   // Inspection service (public)
   inspectionService: "/inspection",
   // Sell your phone — instant quote (public)
   sellPhone: "/sell-phone",
   // Inspector workspace
   inspector: "/inspector",
+  // Dealers
+  dealers: "/dealers",
+  dealerDashboard: "/dashboard/dealer",
+  dealerApply: "/dashboard/dealer/apply",
+  dealerProfile: "/dashboard/dealer/profile",
+  dealerBranches: "/dashboard/dealer/branches",
+  dealerInventory: "/dashboard/dealer/inventory",
   // Admin
   admin: "/admin",
   adminUsers: "/admin/users",
   adminListings: "/admin/listings",
   adminReports: "/admin/reports",
+  adminDealers: "/admin/dealers",
+  adminPromotions: "/admin/promotions",
   adminCategories: "/admin/categories",
   adminInspections: "/admin/inspections",
   adminQuotes: "/admin/quotes",
@@ -112,7 +151,9 @@ export const LISTING_CONDITION_LABELS: Record<ListingCondition, string> = {
 /** Listing lifecycle states — kept in sync with the Prisma `ListingStatus` enum. */
 export const LISTING_STATUSES = {
   DRAFT: "DRAFT",
+  PENDING_APPROVAL: "PENDING_APPROVAL",
   ACTIVE: "ACTIVE",
+  REJECTED: "REJECTED",
   SOLD: "SOLD",
   EXPIRED: "EXPIRED",
   REMOVED: "REMOVED",
@@ -123,7 +164,9 @@ export type ListingStatus = (typeof LISTING_STATUSES)[keyof typeof LISTING_STATU
 /** Human-readable labels for listing statuses. */
 export const LISTING_STATUS_LABELS: Record<ListingStatus, string> = {
   DRAFT: "Draft",
+  PENDING_APPROVAL: "Pending Approval",
   ACTIVE: "Active",
+  REJECTED: "Rejected",
   SOLD: "Sold",
   EXPIRED: "Expired",
   REMOVED: "Removed",
@@ -136,6 +179,7 @@ export const NOTIFICATION_TYPES = {
   LISTING_EXPIRED: "LISTING_EXPIRED",
   NEW_REVIEW: "NEW_REVIEW",
   PRICE_DROP: "PRICE_DROP",
+  SAVED_SEARCH_MATCH: "SAVED_SEARCH_MATCH",
   SYSTEM: "SYSTEM",
   INSPECTION_REQUESTED: "INSPECTION_REQUESTED",
   INSPECTION_SCHEDULED: "INSPECTION_SCHEDULED",
@@ -172,24 +216,6 @@ export const REPORT_REASON_LABELS: Record<string, string> = {
   OTHER: "Other",
 };
 
-/** Major Pakistani cities for the location selector. */
-export const PK_CITIES = [
-  "Karachi",
-  "Lahore",
-  "Islamabad",
-  "Rawalpindi",
-  "Faisalabad",
-  "Multan",
-  "Peshawar",
-  "Quetta",
-  "Gujranwala",
-  "Sialkot",
-  "Hyderabad",
-  "Bahawalpur",
-] as const;
-
-export type PkCity = (typeof PK_CITIES)[number];
-
 // ---------------------------------------------------------------------------
 // Inspection service — kept in sync with the Prisma inspection enums.
 // ---------------------------------------------------------------------------
@@ -220,6 +246,9 @@ export const INSPECTION_STATUS_LABELS: Record<InspectionStatus, string> = {
 /** Payment state of an inspection fee — Prisma `InspectionPaymentStatus` enum. */
 export const INSPECTION_PAYMENT_STATUSES = {
   UNPAID: "UNPAID",
+  AWAITING_CUSTOMER: "AWAITING_CUSTOMER",
+  PENDING: "PENDING",
+  PROCESSING: "PROCESSING",
   PAID: "PAID",
   REFUNDED: "REFUNDED",
   FAILED: "FAILED",
@@ -230,36 +259,13 @@ export type InspectionPaymentStatus =
 
 export const INSPECTION_PAYMENT_STATUS_LABELS: Record<InspectionPaymentStatus, string> = {
   UNPAID: "Unpaid",
+  AWAITING_CUSTOMER: "Awaiting payment confirmation",
+  PENDING: "Payment pending",
+  PROCESSING: "Processing payment",
   PAID: "Paid",
   REFUNDED: "Refunded",
   FAILED: "Failed",
 };
-
-/**
- * Phone OTP verification policy. A buyer must verify the number they enter on a
- * booking via a one-time code sent over WhatsApp/SMS. Kept here as the single
- * source of truth for the service, actions and UI copy.
- */
-export const OTP = {
-  /** Number of digits in the generated code. */
-  length: 6,
-  /** How long a freshly sent code stays usable. */
-  ttlMinutes: 10,
-  /** Max failed check attempts before the code is burned and a resend is needed. */
-  maxAttempts: 5,
-  /** Minimum gap between resends to the same number. */
-  resendCooldownSeconds: 30,
-  /** How long a successful verification counts toward a booking. */
-  validForMinutes: 30,
-} as const;
-
-/** Channels a one-time code can be delivered over. */
-export const OTP_CHANNELS = {
-  SMS: "sms",
-  WHATSAPP: "whatsapp",
-} as const;
-
-export type OtpChannel = (typeof OTP_CHANNELS)[keyof typeof OTP_CHANNELS];
 
 /** Supported payment methods (via the aggregator gateway). */
 export const PAYMENT_METHODS = {
@@ -309,11 +315,34 @@ export const INSPECTION_ITEM_RESULT_LABELS: Record<InspectionItemResult, string>
   NOT_APPLICABLE: "N/A",
 };
 
+/** Device families supported by the inspection workflow. */
+export const INSPECTION_KINDS = {
+  PHONE: "PHONE",
+  LAPTOP: "LAPTOP",
+} as const;
+
+export type InspectionKind = (typeof INSPECTION_KINDS)[keyof typeof INSPECTION_KINDS];
+
+export const INSPECTION_KIND_VALUES = Object.values(INSPECTION_KINDS) as [
+  InspectionKind,
+  ...InspectionKind[],
+];
+
+export const INSPECTION_KIND_LABELS: Record<InspectionKind, string> = {
+  PHONE: "Phone",
+  LAPTOP: "Laptop",
+};
+
+export interface InspectionChecklistGroup {
+  category: string;
+  items: readonly string[];
+}
+
 /**
- * Default checklist scaffold an inspector fills in per request. Grouped by the
- * phone component being inspected. Reused to pre-populate a blank report form.
+ * Default phone checklist scaffold an inspector fills in per request. Kept as the
+ * named export for backwards compatibility; use `INSPECTION_CHECKLISTS` for new code.
  */
-export const INSPECTION_CHECKLIST: ReadonlyArray<{ category: string; items: readonly string[] }> = [
+export const INSPECTION_CHECKLIST: ReadonlyArray<InspectionChecklistGroup> = [
   { category: "Display", items: ["Screen scratches", "Touch response", "Dead pixels / burn-in", "True Tone / brightness"] },
   { category: "Body & Frame", items: ["Dents & scratches", "Bent frame", "Buttons", "SIM tray"] },
   { category: "Battery", items: ["Battery health %", "Charging (wired)", "Charging (wireless)", "Drain under load"] },
@@ -323,11 +352,83 @@ export const INSPECTION_CHECKLIST: ReadonlyArray<{ category: string; items: read
   { category: "Software & Identity", items: ["IMEI check", "PTA approval", "iCloud / account lock", "OS version"] },
 ] as const;
 
+/** Laptop checklist — no IMEI/PTA; focuses on chassis, input, performance and ports. */
+export const LAPTOP_INSPECTION_CHECKLIST: ReadonlyArray<InspectionChecklistGroup> = [
+  { category: "Display", items: ["Screen scratches", "Dead pixels / backlight bleed", "Brightness & colour", "Webcam"] },
+  { category: "Chassis & Keyboard", items: ["Dents & scratches", "Hinge firmness", "Keyboard (all keys)", "Trackpad & gestures"] },
+  { category: "Performance", items: ["CPU / benchmark", "RAM recognition", "Storage health", "Thermals & fan noise"] },
+  { category: "Battery & Charging", items: ["Battery condition %", "Charging (adapter)", "Drain under load", "Power button"] },
+  { category: "Ports & Connectivity", items: ["USB / HDMI ports", "Wi-Fi", "Bluetooth", "Speakers & microphone"] },
+  { category: "OS & Security", items: ["OS version & activation", "BIOS / firmware password", "Find My Device / account lock", "Serial number check"] },
+] as const;
+
+export const INSPECTION_CHECKLISTS: Record<InspectionKind, ReadonlyArray<InspectionChecklistGroup>> = {
+  PHONE: INSPECTION_CHECKLIST,
+  LAPTOP: LAPTOP_INSPECTION_CHECKLIST,
+};
+
+/** Checklist used to pre-populate a blank report form for a device family. */
+export function getInspectionChecklist(kind: InspectionKind): ReadonlyArray<InspectionChecklistGroup> {
+  return INSPECTION_CHECKLISTS[kind] ?? INSPECTION_CHECKLIST;
+}
+
+/**
+ * PTA (Pakistan Telecommunication Authority) status for mobile devices.
+ */
+export const PTA_STATUS = {
+  PTA_APPROVED: "PTA_APPROVED",
+  NON_PTA: "NON_PTA",
+  CPID: "CPID",
+  FACTORY_UNLOCKED: "FACTORY_UNLOCKED",
+  CARRIER_LOCKED: "CARRIER_LOCKED",
+  UNKNOWN: "UNKNOWN",
+  VERIFICATION_PENDING: "VERIFICATION_PENDING",
+} as const;
+
+/**
+ * CPID (Compliance ID) status for mobile devices.
+ */
+export const CPID_STATUS = {
+  CPID_APPROVED: "CPID_APPROVED",
+  NON_CPID: "NON_CPID",
+  UNKNOWN: "UNKNOWN",
+} as const;
+
+/**
+ * Network type for mobile devices.
+ */
+export const NETWORK_TYPE = {
+  SINGLE_SIM: "SINGLE_SIM",
+  DUAL_SIM: "DUAL_SIM",
+  ESIM: "ESIM",
+  HYBRID: "HYBRID",
+} as const;
+
+/**
+ * Warranty type for mobile devices.
+ */
+export const WARRANTY_TYPE = {
+  NO_WARRANTY: "NO_WARRANTY",
+  MANUFACTURER: "MANUFACTURER",
+  SELLER: "SELLER",
+  THIRD_PARTY: "THIRD_PARTY",
+} as const;
+
+/**
+ * Storage options for mobile devices (in GB).
+ */
+export const STORAGE_OPTIONS = ["32", "64", "128", "256", "512"] as const;
+
+/**
+ * RAM options for mobile devices (in GB).
+ */
+export const RAM_OPTIONS = ["2", "3", "4", "6", "8", "12", "16"] as const;
+
 // ---------------------------------------------------------------------------
 // Sell Your Phone — instant quote. Kept in sync with the Prisma quote enums.
 // ---------------------------------------------------------------------------
 
-/** PTA status of a device — Prisma `PtaStatus` enum. English + Urdu labels. */
+/** PTA status of a device — Prisma `QuotePtaStatus` enum. English + Urdu labels. */
 export const PTA_STATUSES = {
   PTA: "PTA",
   NON_PTA: "NON_PTA",
@@ -418,3 +519,46 @@ export const QUOTE_SETTING_KEYS = {
   gradeMultiplierB: "grade_multiplier_b",
   gradeMultiplierC: "grade_multiplier_c",
 } as const;
+
+/** Major Pakistani cities for the location selector. */
+export const PK_CITIES = [
+  "Karachi",
+  "Lahore",
+  "Islamabad",
+  "Rawalpindi",
+  "Faisalabad",
+  "Multan",
+  "Peshawar",
+  "Quetta",
+  "Gujranwala",
+  "Sialkot",
+  "Hyderabad",
+  "Bahawalpur",
+] as const;
+
+export type PkCity = (typeof PK_CITIES)[number];
+
+/**
+ * One-time password policy for inspection booking. This is the single
+ * source of truth for the service, actions and UI copy.
+ */
+export const OTP = {
+  /** Number of digits in the generated code. */
+  length: 6,
+  /** How long a freshly sent code stays usable. */
+  ttlMinutes: 10,
+  /** Max failed check attempts before the code is burned and a resend is needed. */
+  maxAttempts: 5,
+  /** Minimum gap between resends to the same number. */
+  resendCooldownSeconds: 30,
+  /** How long a successful verification counts toward a booking. */
+  validForMinutes: 30,
+} as const;
+
+/** Channels a one-time code can be delivered over. */
+export const OTP_CHANNELS = {
+  SMS: "sms",
+  WHATSAPP: "whatsapp",
+} as const;
+
+export type OtpChannel = (typeof OTP_CHANNELS)[keyof typeof OTP_CHANNELS];

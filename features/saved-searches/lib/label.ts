@@ -31,5 +31,24 @@ export function buildSearchLabel(queryString: string): string {
   const max = params.get("maxPrice");
   if (min || max) parts.push(`PKR ${min || "0"}–${max || "∞"}`);
 
+  for (const key of [
+    "storage",
+    "ram",
+    "color",
+    "processor",
+    "operatingSystem",
+    "screenSize",
+    "connectivity",
+    "accessoryType",
+    "compatibility",
+    "batteryHealthMin",
+    "ptaStatus",
+    "cpidStatus",
+    "warranty",
+  ]) {
+    const value = params.get(key);
+    if (value) parts.push(key === "batteryHealthMin" ? `${value}%+` : value);
+  }
+
   return parts.length > 0 ? parts.join(" · ") : "All listings";
 }

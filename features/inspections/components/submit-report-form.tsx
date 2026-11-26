@@ -6,15 +6,19 @@ import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
 import {
-  INSPECTION_CHECKLIST,
   INSPECTION_ITEM_RESULT_LABELS,
   INSPECTION_ITEM_RESULTS,
+  INSPECTION_KINDS,
+  INSPECTION_KIND_LABELS,
   INSPECTION_VERDICT_LABELS,
   INSPECTION_VERDICTS,
   ROUTES,
+  getInspectionChecklist,
   type InspectionItemResult,
+  type InspectionKind,
   type InspectionVerdict,
 } from "@/lib/constants";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -33,20 +37,31 @@ interface ItemState {
 const RESULT_OPTIONS = Object.values(INSPECTION_ITEM_RESULTS);
 const VERDICT_OPTIONS = Object.values(INSPECTION_VERDICTS);
 
-function initialItems(): ItemState[] {
-  return INSPECTION_CHECKLIST.flatMap((group) =>
+function initialItems(kind: InspectionKind): ItemState[] {
+  return getInspectionChecklist(kind).flatMap((group) =>
     group.items.map((label) => ({
       category: group.category,
       label,
-      result: INSPECTION_ITEM_RESULTS.PASS as InspectionItemResult,
+      // Nothing is graded by default: a blank form must never produce an A.
+      result: INSPECTION_ITEM_RESULTS.NOT_APPLICABLE as InspectionItemResult,
       comment: "",
     })),
   );
 }
 
-export function SubmitReportForm({ requestId }: { requestId: string }) {
+interface Props {
+  requestId: string;
+  inspectionKind?: InspectionKind;
+}
+
+export function SubmitReportForm({
+  requestId,
+  inspectionKind = INSPECTION_KINDS.PHONE,
+}: Props) {
   const router = useRouter();
-  const [items, setItems] = React.useState<ItemState[]>(initialItems);
+  const isPhoneInspection = inspectionKind === INSPECTION_KINDS.PHONE;
+  const deviceLabel = INSPECTION_KIND_LABELS[inspectionKind].toLowerCase();
+  const [items, setItems] = React.useState<ItemState[]>(() => initialItems(inspectionKind));
   const [verdict, setVerdict] = React.useState<InspectionVerdict>(
     INSPECTION_VERDICTS.RECOMMENDED,
   );
@@ -64,13 +79,19 @@ export function SubmitReportForm({ requestId }: { requestId: string }) {
     const batteryRaw = String(form.get("batteryHealth") ?? "").trim();
     const ptaRaw = String(form.get("ptaApproved") ?? "");
 
+    if (!items.some((item) => item.result !== INSPECTION_ITEM_RESULTS.NOT_APPLICABLE)) {
+      toast.error("Grade at least one checklist item before submitting.");
+      return;
+    }
+
     setPending(true);
     const result = await submitReportAction({
       requestId,
       verdict,
       summary: String(form.get("summary") ?? "") || undefined,
-      imei: String(form.get("imei") ?? "") || undefined,
-      ptaApproved: ptaRaw === "" ? undefined : ptaRaw === "yes",
+      imei: isPhoneInspection ? String(form.get("imei") ?? "") || undefined : undefined,
+      ptaApproved:
+        isPhoneInspection && ptaRaw !== "" ? ptaRaw === "yes" : undefined,
       batteryHealth: batteryRaw === "" ? undefined : Number(batteryRaw),
       items: items.map((it) => ({
         category: it.category,
@@ -101,32 +122,47 @@ export function SubmitReportForm({ requestId }: { requestId: string }) {
 
   return (
     <form onSubmit={handleSubmit} className="space-y-8">
-      {/* Trust signals */}
-      <section className="grid gap-4 sm:grid-cols-3">
+      {/* Device-specific trust signals */}
+      <section className={cn("grid gap-4 sm:grid-cols-2", isPhoneInspection && "sm:grid-cols-3")}>
+        {isPhoneInspection ? (
+          <>
+            <div className="space-y-1.5">
+              <Label htmlFor="imei">IMEI</Label>
+              <Input
+                id="imei"
+                name="imei"
+                inputMode="numeric"
+                maxLength={15}
+                placeholder="15 digits (optional)"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="ptaApproved">PTA Approved</Label>
+              <select
+                id="ptaApproved"
+                name="ptaApproved"
+                defaultValue=""
+                className="border-input bg-background h-9 w-full rounded-lg border px-3 text-sm"
+              >
+                <option value="">Unknown</option>
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+              </select>
+            </div>
+          </>
+        ) : null}
         <div className="space-y-1.5">
-          <Label htmlFor="imei">IMEI</Label>
-          <Input id="imei" name="imei" maxLength={40} placeholder="Optional" />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="ptaApproved">PTA Approved</Label>
-          <select
-            id="ptaApproved"
-            name="ptaApproved"
-            defaultValue=""
-            className="border-input bg-background h-9 w-full rounded-lg border px-3 text-sm"
-          >
-            <option value="">Unknown</option>
-            <option value="yes">Yes</option>
-            <option value="no">No</option>
-          </select>
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="batteryHealth">Battery Health (%)</Label>
+          <Label htmlFor="batteryHealth">
+            {isPhoneInspection ? "Battery Health (%)" : "Battery Condition (%)"}
+          </Label>
           <Input
             id="batteryHealth"
             name="batteryHealth"
+            type="number"
             inputMode="numeric"
-            maxLength={3}
+            min={0}
+            max={100}
+            step={1}
             placeholder="0–100"
           />
         </div>
@@ -134,7 +170,12 @@ export function SubmitReportForm({ requestId }: { requestId: string }) {
 
       {/* Checklist */}
       <section className="space-y-5">
-        <h2 className="text-lg font-semibold">Checklist</h2>
+        <div>
+          <h2 className="text-lg font-semibold">{INSPECTION_KIND_LABELS[inspectionKind]} checklist</h2>
+          <p className="text-muted-foreground mt-1 text-sm">
+            Lines left as N/A are excluded from the score. Grade at least one item.
+          </p>
+        </div>
         {[...groups.entries()].map(([category, entries]) => (
           <div key={category}>
             <h3 className="mb-2 text-sm font-semibold">{category}</h3>
@@ -197,7 +238,7 @@ export function SubmitReportForm({ requestId }: { requestId: string }) {
             name="summary"
             rows={4}
             maxLength={2000}
-            placeholder="Summarise the phone's condition for the buyer…"
+            placeholder={`Summarise the ${deviceLabel}'s condition for the buyer…`}
           />
         </div>
       </section>

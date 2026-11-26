@@ -42,7 +42,7 @@ export function MessageBubble({
         ) : null}
         <div
           className={cn(
-            "mt-1 flex items-center gap-1 text-[10px]",
+            "mt-1 flex items-center gap-1 text-xs",
             isOwn ? "text-primary-foreground/70 justify-end" : "text-muted-foreground",
           )}
         >
