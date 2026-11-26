@@ -447,15 +447,12 @@ export const PTA_STATUS_LABELS: Record<PtaStatus, string> = {
 
 /** Buy-back quote lifecycle — Prisma `QuoteStatus` enum. */
 export const QUOTE_STATUSES = {
-  /** Submitted by the seller, awaiting manual admin review. */
   PENDING: "PENDING",
-  /** Admin approved + set an offer price; the seller can now accept. */
   ACTIVE: "ACTIVE",
   EXPIRED: "EXPIRED",
   ACCEPTED: "ACCEPTED",
   INSPECTED: "INSPECTED",
   PAID: "PAID",
-  /** Admin declined the request (reason in `declineReason`). */
   DECLINED: "DECLINED",
 } as const;
 

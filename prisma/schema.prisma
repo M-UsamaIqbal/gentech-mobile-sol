@@ -1828,14 +1828,14 @@ model Quote {
   pickupSlot    String?
   acceptedAt    DateTime?
 
-  // Admin review (manual quote): reason shown to the seller when a request is declined.
-  declineReason String?
-
   // Physical inspection outcome (admin/inspector).
   inspectionResult QuoteInspectionResult?
   inspectionReason String?
   adjustedPricePkr Decimal?               @db.Decimal(12, 2)
   inspectedAt      DateTime?
+
+  /// Admin's reason when a PENDING manual request is declined.
+  declineReason String?
 
   paidAt DateTime?
 

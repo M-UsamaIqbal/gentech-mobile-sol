@@ -10,16 +10,17 @@ import {
   type AcceptQuoteInput,
   type CreateQuoteInput,
 } from "@/features/quotes/schemas/quote";
-import { acceptMyQuote, createQuote } from "@/features/quotes/services/quote.service";
+import { acceptMyQuote, requestManualQuote, requote } from "@/features/quotes/services/quote.service";
 
 const SIGN_IN_REQUIRED = "Sign in to request a quote.";
 const GENERIC_ERROR = "Something went wrong. Please try again.";
 
 export type CreateQuoteActionResult =
-  | { ok: true; id: string }
+  | { ok: true; outcome: "quote"; id: string }
+  | { ok: true; outcome: "retake"; retakeSlots: number[]; reason: string }
   | { ok: false; error: string };
 
-/** Submit answers + photos → saves a request for manual admin review (no instant price). */
+/** Submit answers + photos → a PENDING request an admin reviews and prices by hand. */
 export async function createQuoteAction(
   input: CreateQuoteInput,
 ): Promise<CreateQuoteActionResult> {
@@ -32,11 +33,11 @@ export async function createQuoteAction(
   }
 
   try {
-    const quote = await createQuote(parsed.data, user.id);
+    const quote = await requestManualQuote(parsed.data, user.id);
     revalidatePath(ROUTES.quotes);
-    return { ok: true, id: quote.id };
+    return { ok: true, outcome: "quote", id: quote.id };
   } catch (error) {
-    console.error("[quotes] submit failed:", error);
+    console.error("[quotes] request failed:", error);
     return { ok: false, error: error instanceof Error ? error.message : GENERIC_ERROR };
   }
 }
@@ -62,5 +63,27 @@ export async function acceptQuoteAction(
   } catch (error) {
     console.error("[quotes] accept failed:", error);
     return { ok: false, error: GENERIC_ERROR };
+  }
+}
+
+/** Re-quote an expired quote at today's prices, reusing its answers + photos (Step 7). */
+export async function requoteAction(input: {
+  id: string;
+}): Promise<CreateQuoteActionResult> {
+  const user = await getCurrentUser();
+  if (!user) return { ok: false, error: SIGN_IN_REQUIRED };
+  if (!input?.id) return { ok: false, error: GENERIC_ERROR };
+
+  try {
+    const result = await requote(input.id, user.id);
+    if (!result) return { ok: false, error: "Original quote not found." };
+    if (result.kind === "retake") {
+      return { ok: true, outcome: "retake", retakeSlots: result.retakeSlots, reason: result.reason };
+    }
+    revalidatePath(ROUTES.quotes);
+    return { ok: true, outcome: "quote", id: result.quote.id };
+  } catch (error) {
+    console.error("[quotes] requote failed:", error);
+    return { ok: false, error: error instanceof Error ? error.message : GENERIC_ERROR };
   }
 }

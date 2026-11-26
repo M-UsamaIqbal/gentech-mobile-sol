@@ -12,7 +12,6 @@ import { LocalizedLink } from "@/components/localized-link";
 import { useLocalizedRouteInfo } from "@/lib/localized-routing";
 import type { CategoryItem } from "@/types/marketplace";
 import { Button, buttonVariants } from "@/components/ui/button";
-import { Logo } from "@/components/layout/logo";
 import { CategoryIcon } from "@/features/marketplace/components/category-icon";
 import { CountryLocaleSelector } from "@/components/country-locale-selector";
 

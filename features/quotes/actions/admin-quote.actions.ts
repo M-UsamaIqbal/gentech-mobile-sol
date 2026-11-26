@@ -150,7 +150,7 @@ export async function saveMultipliersAction(input: GradeMultipliersInput): Promi
   }
 }
 
-// --- Manual review: approve / decline a pending request --------------------
+// --- Manual review: approve / decline a PENDING request --------------------
 
 export async function approveQuoteAction(input: ApproveQuoteInput): Promise<ActionResult> {
   if (!(await requireAdmin())) return { ok: false, error: FORBIDDEN };
@@ -160,7 +160,7 @@ export async function approveQuoteAction(input: ApproveQuoteInput): Promise<Acti
   }
   try {
     const quote = await approveQuote(parsed.data.id, parsed.data.offerPricePkr);
-    if (!quote) return { ok: false, error: "This request can no longer be reviewed." };
+    if (!quote) return { ok: false, error: "This request is no longer pending." };
     revalidatePath(ROUTES.adminQuotes);
     revalidatePath(`${ROUTES.adminQuotes}/${parsed.data.id}`);
     revalidatePath(`${ROUTES.sellPhone}/${parsed.data.id}`);
@@ -179,7 +179,7 @@ export async function declineQuoteAction(input: DeclineQuoteInput): Promise<Acti
   }
   try {
     const quote = await declineQuote(parsed.data.id, parsed.data.reason);
-    if (!quote) return { ok: false, error: "This request can no longer be reviewed." };
+    if (!quote) return { ok: false, error: "This request is no longer pending." };
     revalidatePath(ROUTES.adminQuotes);
     revalidatePath(`${ROUTES.adminQuotes}/${parsed.data.id}`);
     revalidatePath(`${ROUTES.sellPhone}/${parsed.data.id}`);

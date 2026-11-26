@@ -3,6 +3,12 @@ import "server-only";
 import { env } from "@/lib/env";
 import { APP } from "@/lib/constants";
 
+export interface EmailAttachment {
+  filename: string;
+  /** Base64-encoded file content. */
+  content: string;
+}
+
 export interface SendEmailParams {
   to: string;
   subject: string;
@@ -10,6 +16,8 @@ export interface SendEmailParams {
   text: string;
   /** Optional HTML body; falls back to `text` wrapped in a <pre> if omitted. */
   html?: string;
+  /** Optional file attachments (e.g. a PDF quote). */
+  attachments?: EmailAttachment[];
 }
 
 const RESEND_ENDPOINT = "https://api.resend.com/emails";
@@ -23,7 +31,13 @@ const RESEND_ENDPOINT = "https://api.resend.com/emails";
  *
  * Returns `true` when the email was dispatched (or logged in dev), `false` on failure.
  */
-export async function sendEmail({ to, subject, text, html }: SendEmailParams): Promise<boolean> {
+export async function sendEmail({
+  to,
+  subject,
+  text,
+  html,
+  attachments,
+}: SendEmailParams): Promise<boolean> {
   const from = env.EMAIL_FROM ?? `${APP.name} <onboarding@resend.dev>`;
 
   if (!env.RESEND_API_KEY) {
@@ -31,7 +45,10 @@ export async function sendEmail({ to, subject, text, html }: SendEmailParams): P
       `\n📧 [email:dev] No RESEND_API_KEY set — logging instead of sending.\n` +
         `   To:      ${to}\n` +
         `   Subject: ${subject}\n` +
-        `   Body:    ${text}\n`,
+        `   Body:    ${text}\n` +
+        (attachments?.length
+          ? `   Files:   ${attachments.map((a) => a.filename).join(", ")}\n`
+          : ""),
     );
     return true;
   }
@@ -49,6 +66,7 @@ export async function sendEmail({ to, subject, text, html }: SendEmailParams): P
         subject,
         text,
         html: html ?? `<pre style="font-family:inherit">${text}</pre>`,
+        ...(attachments?.length ? { attachments } : {}),
       }),
     });
 

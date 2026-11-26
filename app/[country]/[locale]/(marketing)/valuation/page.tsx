@@ -6,6 +6,7 @@ import {
   getCountryFromParam,
   getLocaleFromParam,
 } from "@/lib/countries/server";
+import { getCountryName } from "@/lib/countries";
 import { ROUTES } from "@/lib/constants";
 import { withCountryLocalePrefix } from "@/lib/localized-path";
 import { localizedSeoMetadata } from "@/lib/seo/metadata";
@@ -31,7 +32,7 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
       locale: resolvedLocale,
     }),
     title: `${t("checkValue")} · GenTech`,
-    description: t("description"),
+    description: t("description", { country: getCountryName(countryCode, resolvedLocale) }),
   };
 }
 
@@ -78,7 +79,7 @@ export default async function ValuationPage({ params, searchParams }: PageProps)
     <div className="container mx-auto px-4 py-8">
       <div className="mb-8">
         <h1 className="mb-2 text-3xl font-bold">{tMarket("checkValue")}</h1>
-        <p className="text-muted-foreground">{tMarket("description")}</p>
+        <p className="text-muted-foreground">{tMarket("description", { country: getCountryName(countryCode, locale) })}</p>
       </div>
 
       <div className="grid gap-8 lg:grid-cols-2">
@@ -194,7 +195,7 @@ export default async function ValuationPage({ params, searchParams }: PageProps)
 
           <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-4">
             <h3 className="mb-2 font-semibold text-yellow-900">{tMarket("checkValue")}</h3>
-            <p className="mb-3 text-sm text-yellow-800">{tMarket("description")}</p>
+            <p className="mb-3 text-sm text-yellow-800">{tMarket("description", { country: getCountryName(countryCode, locale) })}</p>
             <Link
               href={createListingHref}
               className="inline-flex items-center rounded-lg bg-yellow-600 px-4 py-2 text-sm font-medium text-white"

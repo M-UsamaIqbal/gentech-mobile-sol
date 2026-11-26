@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Banknote, Camera, ClipboardList, MailCheck, Sparkles } from "lucide-react";
+import { Banknote, Camera, ClipboardList, Sparkles } from "lucide-react";
 
 import { getCurrentUser } from "@/lib/session";
 import { getCatalog } from "@/features/quotes/services/quote.service";
@@ -8,14 +8,14 @@ import { QuoteWizard } from "@/features/quotes/components/quote-wizard";
 export const metadata: Metadata = {
   title: "Sell Your Phone — Get a Quote",
   description:
-    "Tell us about your phone and upload 5 photos. Our team reviews it and emails you a firm offer — then we collect it from your door and pay on the spot.",
+    "Tell us about your phone and upload 5 photos. Our team reviews it and emails you a firm offer — then we pick it up.",
 };
 
 const STEPS = [
-  { icon: ClipboardList, title: "Tell us about your phone", body: "Model, PTA status and condition — a few quick questions." },
-  { icon: Camera, title: "Upload 5 guided photos", body: "Follow the samples so our team can assess it accurately." },
-  { icon: MailCheck, title: "We review & email you", body: "Our team checks it and sends a firm offer, usually within a day." },
-  { icon: Banknote, title: "Accept & we collect", body: "Accept your offer, we pick it up free and pay on the spot." },
+  { icon: ClipboardList, title: "Answer a few questions", body: "Tell us the model, PTA status and condition." },
+  { icon: Camera, title: "Upload 5 guided photos", body: "Follow the samples so we can review accurately." },
+  { icon: Sparkles, title: "We review your phone", body: "Our team checks your photos and answers." },
+  { icon: Banknote, title: "Get your offer by email", body: "We email you a firm offer, then arrange pickup." },
 ];
 
 export default async function SellPhonePage() {
@@ -26,14 +26,14 @@ export default async function SellPhonePage() {
       <section className="text-center">
         <span className="bg-primary/10 text-primary inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-sm font-medium">
           <Sparkles className="size-4" />
-          Free pickup · Pay on the spot
+          Get a Quote
         </span>
         <h1 className="mt-4 text-3xl font-bold tracking-tight sm:text-4xl">
           Sell your phone the easy way
         </h1>
         <p className="text-muted-foreground mx-auto mt-3 max-w-xl">
-          Tell us about your phone and upload five photos. Our team reviews it and emails you a firm
-          offer — then we collect it for free. چند سوالات کے جواب دیں، ہم آپ کو قیمت ای میل کریں گے۔
+          Answer a few questions and upload five photos. Our team reviews your phone and emails you a
+          firm offer, honoured at pickup. چند سوالات کے جواب دیں، ہم آپ کو قیمت ای میل کریں گے۔
         </p>
       </section>
 

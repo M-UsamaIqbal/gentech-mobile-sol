@@ -20,14 +20,22 @@ function isExpiredNow(q: QuoteDto): boolean {
   );
 }
 
+/** PENDING/DECLINED requests have no price; otherwise show the offer (or range). */
+function priceLabel(q: QuoteDto): string {
+  if (q.status === QUOTE_STATUSES.PENDING) return "Awaiting offer";
+  if (q.status === QUOTE_STATUSES.DECLINED) return "—";
+  if (q.priceMin === q.priceMax) return formatPrice(q.priceMax);
+  return `${formatPrice(q.priceMin)} – ${formatPrice(q.priceMax)}`;
+}
+
 export function MyQuotesList({ quotes }: { quotes: QuoteDto[] }) {
   if (quotes.length === 0) {
     return (
       <div className="bg-card rounded-xl border p-8 text-center">
         <Smartphone className="text-muted-foreground mx-auto size-8" />
-        <p className="mt-3 font-medium">No requests yet</p>
+        <p className="mt-3 font-medium">No quotes yet</p>
         <p className="text-muted-foreground mt-1 text-sm">
-          Send us your phone&apos;s details and photos — we&apos;ll email you a firm offer.
+          Request a price for a phone you want to sell.
         </p>
         <Link href={ROUTES.sellPhone} className={cn(buttonVariants(), "mt-4")}>
           Request a quote
@@ -55,22 +63,13 @@ export function MyQuotesList({ quotes }: { quotes: QuoteDto[] }) {
               </div>
               <p className="text-muted-foreground mt-0.5 truncate text-sm">
                 {q.brand} {q.model} · {q.storage}
+                {q.aiGrade ? ` · Grade ${q.aiGrade}` : ""}
               </p>
               <p className="text-muted-foreground text-xs">Created {formatDate(q.createdAt)}</p>
             </div>
             <div className="flex items-center gap-2 text-right">
               <div>
-                {q.status === QUOTE_STATUSES.PENDING ? (
-                  <p className="text-muted-foreground text-sm">Under review</p>
-                ) : q.status === QUOTE_STATUSES.DECLINED ? (
-                  <p className="text-muted-foreground text-sm">Declined</p>
-                ) : (
-                  <p className="font-semibold">
-                    {q.priceMin === q.priceMax
-                      ? formatPrice(q.priceMax)
-                      : `${formatPrice(q.priceMin)} – ${formatPrice(q.priceMax)}`}
-                  </p>
-                )}
+                <p className="font-semibold">{priceLabel(q)}</p>
               </div>
               <ChevronRight className="text-muted-foreground size-4 shrink-0" />
             </div>

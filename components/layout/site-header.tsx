@@ -13,7 +13,6 @@ import {
   getUnreadNotificationCount,
 } from "@/features/notifications/services/notification.service";
 import { buttonVariants } from "@/components/ui/button";
-import { Logo } from "@/components/layout/logo";
 import { ThemeToggle } from "@/components/layout/theme-toggle";
 import { CountryLocaleSelector } from "@/components/country-locale-selector";
 import { UserMenu } from "@/components/layout/user-menu";

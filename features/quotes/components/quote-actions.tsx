@@ -2,14 +2,15 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
-import { Check, Download, Link2, Loader2, Share2, Truck } from "lucide-react";
+import { Check, Download, Link2, Loader2, RefreshCw, Share2, Truck } from "lucide-react";
 import { toast } from "sonner";
 
+import { ROUTES } from "@/lib/constants";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { acceptQuoteAction } from "@/features/quotes/actions/quote.actions";
+import { acceptQuoteAction, requoteAction } from "@/features/quotes/actions/quote.actions";
 import type { QuoteDto } from "@/features/quotes/types";
 
 const SLOT_WINDOWS = [
@@ -151,5 +152,35 @@ export function QuoteShareBar({ quoteId }: { quoteId: string }) {
         <Share2 className="size-4" /> Share
       </Button>
     </div>
+  );
+}
+
+/** Re-quote an expired quote at today's prices (Step 7). */
+export function RequoteButton({ quoteId }: { quoteId: string }) {
+  const router = useRouter();
+  const [pending, setPending] = React.useState(false);
+
+  async function handleClick() {
+    setPending(true);
+    const result = await requoteAction({ id: quoteId });
+    setPending(false);
+    if (!result.ok) {
+      toast.error(result.error);
+      return;
+    }
+    if (result.outcome === "retake") {
+      toast.warning("Please start a fresh quote with new photos.");
+      router.push(ROUTES.sellPhone);
+      return;
+    }
+    toast.success("New quote generated at today's prices.");
+    router.push(`${ROUTES.sellPhone}/${result.id}`);
+  }
+
+  return (
+    <Button onClick={handleClick} disabled={pending} className="w-full sm:w-auto">
+      {pending ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
+      Requote at today&apos;s price
+    </Button>
   );
 }

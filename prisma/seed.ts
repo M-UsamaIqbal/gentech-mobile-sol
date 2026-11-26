@@ -1,5 +1,5 @@
 /**
- * Database seed — catalog **reference data only**.
+ * Database seed — catalog reference data.
  *
  * Seeds the phone, laptop, tablet and accessory category tree plus popular brands. Idempotent: safe to
  * run repeatedly (everything upserts by unique slug).
@@ -334,6 +334,25 @@ const GRADE_MULTIPLIERS: Array<{ key: string; value: number; label: string }> = 
 
 function roundTo500(n: number): number {
   return Math.round(n / 500) * 500;
+}
+
+/** Mirrors features/inspections/lib/grade.ts (inlined — seed can't import server-only). */
+function computeOverallScore(items: Array<{ result: ItemResult }>): number {
+  const weights = items
+    .map((i): number | null =>
+      i.result === "PASS" ? 100 : i.result === "MINOR_ISSUE" ? 60 : i.result === "MAJOR_ISSUE" ? 0 : null,
+    )
+    .filter((w): w is number => w !== null);
+  if (weights.length === 0) return 0;
+  return Math.round(weights.reduce((a, b) => a + b, 0) / weights.length);
+}
+
+function scoreToGrade(score: number): string {
+  if (score >= 90) return "A";
+  if (score >= 75) return "B";
+  if (score >= 60) return "C";
+  if (score >= 40) return "D";
+  return "F";
 }
 
 function slugify(value: string) {

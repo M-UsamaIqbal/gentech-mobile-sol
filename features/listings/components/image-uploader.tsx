@@ -68,39 +68,21 @@ export function ImageUploader({
     setUploading(true);
 
     try {
-      const uploadFolder = folder ?? "listings";
       const signRes = await fetch("/api/v1/uploads/sign", {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ folder: uploadFolder }),
+        ...(folder
+          ? { headers: { "content-type": "application/json" }, body: JSON.stringify({ folder }) }
+          : {}),
       });
-
-      // Cloudinary not configured → dev-only local fallback (same as the quote flow),
-      // so posting a listing with photos works without a Cloudinary account.
-      const useLocal = signRes.status === 503;
-      if (!useLocal && !signRes.ok) {
+      if (!signRes.ok) {
         const data = (await signRes.json().catch(() => null)) as { error?: string } | null;
         toast.error(data?.error ?? "Image uploads are not available right now.");
         return;
       }
-      const sign = useLocal ? null : ((await signRes.json()) as SignResponse);
+      const sign = (await signRes.json()) as SignResponse;
 
       const uploaded: UploadedImage[] = [];
       for (const file of selected) {
-        if (useLocal) {
-          const form = new FormData();
-          form.append("file", file);
-          form.append("folder", uploadFolder);
-          const res = await fetch("/api/v1/uploads/local", { method: "POST", body: form });
-          if (!res.ok) {
-            toast.error(`Failed to upload ${file.name}`);
-            continue;
-          }
-          const data = (await res.json()) as { secure_url: string; public_id: string };
-          uploaded.push({ url: data.secure_url, publicId: data.public_id });
-          continue;
-        }
-
         const form = new FormData();
         form.append("file", file);
         form.append("api_key", sign.apiKey);
@@ -110,7 +92,7 @@ export function ImageUploader({
         form.append("allowed_formats", sign.allowedFormats.join(","));
         form.append("resource_type", "image");
 
-        const res = await fetch(`https://api.cloudinary.com/v1_1/${sign!.cloudName}/auto/upload`, {
+        const res = await fetch(`https://api.cloudinary.com/v1_1/${sign.cloudName}/auto/upload`, {
           method: "POST",
           body: form,
         });

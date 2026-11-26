@@ -137,7 +137,7 @@ export default async function DashboardPage({ params }: PageProps) {
       "getInspected",
       "sellingOverview",
       "manageListings",
-    ].map((key) => [key, t(key)]),
+    ].map((key) => [key, key === "greeting" ? t(key, { name: "{name}" }) : t(key)]),
   );
 
   const signInHref = withCountryLocalePrefix(ROUTES.signIn, countryCode, locale);
